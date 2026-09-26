@@ -1,0 +1,35 @@
+# What one beat of a dungeon's mission puts at its place, by how deep in the dungeon the place lies.
+# dungeon.py (src/riftstone/dungeon.py, the level director) evaluates it for every beat of a mission; nyrc
+# compiles this file (nyr.json) into src/riftstone/rules/beats.py.
+#
+# Inputs   beat    1 fight, 2 ambush, 3 horde, 4 guardian, 5 boss
+#          depth   how far in the place lies: 0 at the door, 1 at the deepest place the mission reaches
+# Outputs  tier_lo, tier_hi   the enemy tiers the beat takes (rules/tiers.nyr gives each enemy its tier)
+#          total   enemies in all            points   how many stand at once (spawn points, at most 10)
+#          spread  centimetres between spawn points
+#          room    centimetres of open ground the place needs around it, at least (the enemy's own need, measured
+#                  where the game places it, bestiary.py, applies on top: Garm 2.3 m, Gorecyclopes 2.8 m)
+
+Fight := 1
+Ambush := 2
+Horde := 3
+Guardian := 4
+Boss := 5
+
+# A fight: a few common enemies near the door, more and tougher ones deeper in.
+[beat == Fight] => tier_lo <- 1, tier_hi <- 1 + floor(depth * 1.999), total <- 3 + floor(depth * 3.999),
+                   points <- 3 + floor(depth * 3.999), spread <- 250, room <- 180
+
+# An ambush: a pack waiting beside the way through (the director puts it just off the main path).
+[beat == Ambush] => tier_lo <- 1, tier_hi <- 2, total <- 4 + floor(depth * 2.999),
+                    points <- 4 + floor(depth * 2.999), spread <- 350, room <- 180
+
+# A horde: the game's own horde setting -- many common enemies refilled from eight spawn points.
+[beat == Horde] => tier_lo <- 1, tier_hi <- 1, total <- 20 + floor(depth * 20), points <- 8, spread <- 300,
+                   room <- 350
+
+# A guardian: one big monster holding the way.
+[beat == Guardian] => tier_lo <- 3, tier_hi <- 3, total <- 1, points <- 1, spread <- 250, room <- 300
+
+# The boss: the strongest enemy of the pool, at the deepest place with room for it.
+[beat == Boss] => tier_lo <- 4, tier_hi <- 4, total <- 1, points <- 1, spread <- 250, room <- 400

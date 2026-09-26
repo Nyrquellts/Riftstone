@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+/build/
+
+# Game data and evidence never go into git: seeds, findings and reports are
+# derived from the local installation and stay on this disk.
+fuzz/.seeds/
+fuzz/.tmp/
+fuzz/findings/
+fuzz/reports/
+reports/
+.corpus/
+
+# Mod projects hold game-derived resources (extracted/edited YAML), so they
+# stay on disk too -- never in git.
+mods/
+
+# Release zips (tools/make_release.py) and the prebuilt loader they carry.
+# Anchored with "/": an unanchored "loader/" would also hide native/loader/.
+/dist/
+/loader/
+
+# Native build output (out, out-msvc, out-build, any out-*)
+native/**/out/
+native/**/out-*/
+native/**/_deps/
+native/**/*.asi
+native/**/*.obj
+native/**/*.pdb
+native/**/*.ilk
+native/**/*.exp
+native/**/*.lib
+!native/**/deps/**/*.lib
+
+# Vendored third-party sources (reference only; kept on disk, not in git).
+# Their formats and addresses are re-implemented in src/ and proven on the corpus;
+# docs/vendor.md records what each is, its licence and its sha256.
+/vendor/
+
+# Editors
+.vscode/
+.idea/

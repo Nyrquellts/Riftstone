@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Riftstone</title>
+  <defs>
+    <linearGradient id="fang" x1="0" y1="0" x2=".45" y2="1">
+      <stop offset="0" stop-color="#f4f7fb"/>
+      <stop offset=".22" stop-color="#a7b2c1"/>
+      <stop offset=".42" stop-color="#eef2f7"/>
+      <stop offset=".62" stop-color="#596372"/>
+      <stop offset=".84" stop-color="#cdd6e0"/>
+      <stop offset="1" stop-color="#6b7684"/>
+    </linearGradient>
+    <linearGradient id="fangR" x1="1" y1="0" x2=".55" y2="1" href="#fang"/>
+    <linearGradient id="f1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#eef3f9"/><stop offset="1" stop-color="#7d8898"/></linearGradient>
+    <linearGradient id="f2" x1="1" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#b9c4d1"/><stop offset="1" stop-color="#404957"/></linearGradient>
+    <linearGradient id="f3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6c7888"/><stop offset="1" stop-color="#171b23"/></linearGradient>
+    <linearGradient id="f4" x1="1" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#353d4a"/><stop offset="1" stop-color="#0b0d12"/></linearGradient>
+    <radialGradient id="glow" cx=".5" cy=".45" r=".5"><stop offset="0" stop-color="#00f0ff" stop-opacity=".35"/><stop offset="1" stop-color="#00f0ff" stop-opacity="0"/></radialGradient>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="1.1"/></filter>
+  </defs>
+  <path d="M18 5C9 13 5.5 27 8.5 39C11 49 17 56 25 61.5C19.5 53 15.2 44 14 34C12.8 24 14.6 13 18 5Z" fill="url(#fang)"/>
+  <path d="M46 5C55 13 58.5 27 55.5 39C53 49 47 56 39 61.5C44.5 53 48.8 44 50 34C51.2 24 49.4 13 46 5Z" fill="url(#fangR)"/>
+  <ellipse cx="32" cy="30" rx="15" ry="22" fill="url(#glow)"/>
+  <path d="M32 3 20.5 25 32 27Z" fill="url(#f1)"/>
+  <path d="M32 3 32 27 43.5 25Z" fill="url(#f2)"/>
+  <path d="M20.5 25 32 59 32 27Z" fill="url(#f3)"/>
+  <path d="M32 27 32 59 43.5 25Z" fill="url(#f4)"/>
+  <path d="M32 3 43.5 25 32 59 20.5 25Z" fill="none" stroke="#e2e8f0" stroke-opacity=".45" stroke-width=".6" stroke-linejoin="round"/>
+  <path d="M32.4 8 30.6 17 33.4 24.5 30.4 33 33.2 41.5 31 50 32.2 55" fill="none" stroke="#00f0ff" stroke-width="3.4" stroke-opacity=".45" stroke-linejoin="round" filter="url(#soft)"/>
+  <path d="M32.4 8 30.6 17 33.4 24.5 30.4 33 33.2 41.5 31 50 32.2 55" fill="none" stroke="#7ff8ff" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

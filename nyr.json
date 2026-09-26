@@ -1,0 +1,9 @@
+{
+  "nyr": 1,
+  "outputs": [
+    {"source": "rules/horde.nyr", "target": "py", "output": "src/riftstone/rules/horde.py"},
+    {"source": "rules/tiers.nyr", "target": "py", "output": "src/riftstone/rules/tiers.py"},
+    {"source": "rules/beats.nyr", "target": "py", "output": "src/riftstone/rules/beats.py"},
+    {"source": "rules/waves.nyr", "target": "py", "output": "src/riftstone/rules/waves.py"}
+  ]
+}

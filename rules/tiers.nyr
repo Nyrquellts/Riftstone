@@ -1,0 +1,25 @@
+# An enemy's tier, from the game's own numbers.  bestiary.py (src/riftstone/bestiary.py) evaluates it for
+# every enemy it has measured; nyrc compiles this file (nyr.json) into src/riftstone/rules/tiers.py.
+#
+# Inputs   exp    the EXP in its parameter file (charparam\em\<id>_cmn.prp, the field 経験値); 0 when it has none
+#          boss   1 when the game flags at least half of its placements as a big monster (mBossFlag), else 0
+# Outputs  tier     1 common, 2 seasoned, 3 big, 4 apex
+#          critter  1 for wildlife worth less than a wolf (rats 3, spiders and snakes 10, boars 15): the level
+#                   director leaves those out of a dungeon unless asked for them by name
+
+Wolf := 50           # the least EXP a real fight gives (Wolves 50, Goblins 65)
+Seasoned := 400      # Hobgoblins (380) are still common; Saurians (410) and Direwolves (420) are not
+Big := 2000          # Skeleton Brutes 2,300, Cyclopes 4,000, Chimeras 7,700
+Apex := 10000        # Cockatrices 10,800, Hydras 16,000, Garm 29,000, Living Armor 35,000
+
+[exp < Seasoned] => tier <- 1
+[Seasoned <= exp < Big] => tier <- 2
+[Big <= exp < Apex] => tier <- 3
+[exp >= Apex] => tier <- 4
+
+# No parameter file, but the game treats it as a big monster (the drakes and wyrms, Death, liches, wights):
+# the last rule that holds wins, so this one overrides the first.
+[exp == 0 and boss == 1] => tier <- 4
+
+[0 < exp < Wolf] => critter <- 1
+[exp == 0 or exp >= Wolf] => critter <- 0
