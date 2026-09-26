@@ -1,0 +1,24 @@
+# How a wave of an enemy chain loads and comes back (riftstone waves, src/riftstone/waves.py).
+# waves.plan copies a vanilla group through encounter.plan, then applies these updates to the copy;
+# a field no rule sets keeps the copied group's value.  nyrc compiles this file (nyr.json) into
+# src/riftstone/rules/waves.py; tools\test_all.cmd fails when that file is out of date.
+#
+# Inputs   flag     the chain's lot flag for this wave, 0..127 (free in the stage: waves.free_flags)
+#          keep     the copied group's own lot flag (its first slot), or -1 when it has none
+# Outputs  group list (.gpl) fields, as waves.py's WAVE_FIELDS names them
+#
+# Evidence (docs/enemy-waves.md): a group with mLoadCondition.mLotFlag loads only while the current
+# stage has flag mDataLotFlag.mFlagNo, and with mLotFlag2 flag mFlagNo2 as well (0x00CC5710); a
+# kill record of respawn type 2 is erased when its group's lot flag goes off (0x004A7D10).
+
+WaveRespawn := 2        # a kill record tied to the group's lot flag: the wave comes back whole
+
+# Every wave: gated on its own flag, every placement spawns (no cap, no random pattern), and a kill
+# record the chain's end erases.  No delete condition: the chain clears a flag only once its wave is dead.
+[flag >= 0] => lot_flag <- 1, flag_no <- flag, delete_lot_flag <- 0, set_count_max <- -1,
+               rspn_type <- WaveRespawn, rspn_day <- 0, rspn_prob <- 0, rspn_prob_add <- 0,
+               rspn_force_rspn <- 0, random_division <- 0, random_pattern <- 0
+
+# The copied group's own lot flag (a quest's, say) stays a condition, in the second slot.
+[keep >= 0] => lot_flag2 <- 1, flag_no2 <- keep
+[keep < 0] => lot_flag2 <- 0, flag_no2 <- 0

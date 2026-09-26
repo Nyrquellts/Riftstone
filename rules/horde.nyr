@@ -1,0 +1,25 @@
+# How a new Dark Arisen enemy group spawns: its horde setting and its story window.
+# encounter.plan (src/riftstone/encounter.py) copies a vanilla group, then applies these updates to it;
+# a field no rule sets keeps the copied group's value.  nyrc compiles this file (nyr.json) into
+# src/riftstone/rules/horde.py; tools\test_all.cmd fails when that file is out of date.
+#
+# Inputs   total    enemies in all, 1..9999
+#          points   spawn points in the group's layout, 1..31 and at most total
+#          story    0 keep the copied group's window, 1 any, 2 before the Dragon, 3 after it
+# Outputs  group list (.gpl) fields, as encounter.py's _GPL_FIELD names them; S(Horde) marks a horde
+
+Horde := 1              # the signal: this group is a horde
+HordeRespawn := 5       # respawn type 5 with a spawn cap: that many in total from the spawn points
+Dragon := 7800          # the story flag the Dragon's defeat sets
+
+# More enemies than spawn points: the game's own horde setting (stage 330's group 35 brings 100
+# goblins from 7 spawn points), refilled until the cap, never on a day or a chance.
+[total > points] => S(Horde), set_count_max <- total, rspn_type <- HordeRespawn, rspn_day <- 0,
+                    rspn_prob <- 0, rspn_prob_add <- 0, rspn_force_rspn <- 0
+
+# Otherwise each spawn point spawns its enemy, with no cap.
+[total <= points] => set_count_max <- -1
+
+[story == 1] => appear_bgn <- 0, appear_end <- 0
+[story == 2] => appear_bgn <- 0, appear_end <- Dragon - 1
+[story == 3] => appear_bgn <- Dragon, appear_end <- 0

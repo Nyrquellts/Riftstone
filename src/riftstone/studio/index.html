@@ -1,0 +1,2264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Riftstone Studio</title>
+<link rel="icon" href="/static/mark.svg" type="image/svg+xml">
+<style>
+@font-face { font-family: "Riftstone Blade"; src: url("/static/fonts/riftstone-blade.woff2") format("woff2"); font-display: swap; }
+/* Riftstone: obsidian and rift cyan. Cyan marks what is live, selected or focused; ruby only a critical
+   marker, its words stay white. Two cut corners, flat centres, a chrome hairline. Nothing pulses. */
+:root {
+  --base: #08080c; --surface: #12131a; --hover: #191c26; --pressed: #202632; --well: #0c0d13;
+  --text: #e2e8f0; --muted: #949daf; --faint: #697386; --line: #282d39; --line2: #1c2029;
+  --cyan: #00f0ff; --cyan2: #7ff8ff; --ruby: #dc2626;
+  --display: "Riftstone Blade", "Yu Mincho", "Hiragino Mincho ProN", "Noto Serif JP", Georgia, serif;
+  --sans: "Segoe UI Variable Text", "Segoe UI", "Yu Gothic UI", "Noto Sans JP", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+  --chrome: linear-gradient(115deg, rgb(48 53 65 / .65) 0%, rgb(120 131 145 / .65) 18%, rgb(226 232 240 / .65) 29%,
+            rgb(89 99 114 / .65) 35%, rgb(36 42 53 / .65) 56%, rgb(167 178 193 / .65) 78%, rgb(53 61 74 / .65) 100%);
+  --chrome-hi: linear-gradient(115deg, rgb(48 53 65 / .85) 0%, rgb(120 131 145 / .85) 18%, rgb(226 232 240 / .85) 29%,
+            rgb(89 99 114 / .85) 35%, rgb(36 42 53 / .85) 56%, rgb(167 178 193 / .85) 78%, rgb(53 61 74 / .85) 100%);
+  --silver: linear-gradient(180deg, #ffffff 0%, #e4eaf1 36%, #8b97a7 58%, #dfe6ee 82%, #aab5c3 100%);
+  --cut: 12px; --cut2: 20px;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; color: var(--text); font: 14px/1.5 var(--sans); background: var(--base); }
+body::before { content: ""; position: fixed; inset: 0; pointer-events: none; z-index: -2;
+  background: radial-gradient(1000px 560px at 92% -12%, rgb(83 97 116 / .16), transparent 64%),
+              radial-gradient(760px 460px at -6% 108%, rgb(0 240 255 / .045), transparent 62%),
+              radial-gradient(900px 500px at 50% 120%, rgb(83 97 116 / .08), transparent 60%); }
+.masthead::before { content: ""; position: absolute; right: -60px; top: -150px; width: 520px; height: 520px; pointer-events: none;
+  background: url("/static/spiral.svg") center / contain no-repeat; opacity: .11; z-index: -1; }
+::selection { background: rgb(0 240 255 / .28); }
+a { color: var(--cyan2); }
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid rgb(0 240 255 / .85); outline-offset: 2px; }
+
+/* the frame: two cut corners, a chrome hairline, a flat centre */
+.card, .app { position: relative; isolation: isolate; background: var(--chrome);
+  clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut2)), calc(100% - var(--cut2)) 100%, 0 100%, 0 var(--cut)); }
+.card::before, .app::before { content: ""; position: absolute; inset: 1px; z-index: -1; background: var(--surface);
+  clip-path: polygon(calc(var(--cut) - .4px) 0, 100% 0, 100% calc(100% - var(--cut2) + .4px), calc(100% - var(--cut2) + .4px) 100%, 0 100%, 0 calc(var(--cut) - .4px)); }
+.card::after { content: ""; position: absolute; top: 0; left: 28px; width: 76px; height: 1px; background: var(--cyan); opacity: .16; pointer-events: none; }
+.card.sel::before { background: linear-gradient(90deg, rgb(0 240 255 / .7) 0 2px, transparent 2px), var(--surface); }
+.card.crit { background: linear-gradient(115deg, rgb(220 38 38 / .9) 0 22%, rgb(53 61 74 / .65) 38%), var(--chrome); }
+
+/* app shell */
+.app { --cut: 16px; --cut2: 28px; max-width: 1500px; margin: 12px auto; min-height: calc(100vh - 24px);
+  display: grid; grid-template-rows: auto auto auto 1fr auto; }
+.app::before { background: rgb(10 11 16 / .94); }
+.titlebar { display: flex; align-items: center; gap: 12px; height: 38px; padding: 0 24px 0 30px; border-bottom: 1px solid var(--line2);
+  font-size: 13px; color: var(--muted); letter-spacing: .02em; }
+.titlebar img { width: 18px; height: 18px; }
+.titlebar .ver { margin-left: auto; font: 12px var(--mono); color: var(--faint); }
+.masthead { position: relative; isolation: isolate; display: flex; align-items: center; gap: 28px; padding: 22px 34px 16px; flex-wrap: wrap;
+  overflow-x: clip; }   /* the spiral reaches past the right edge; without this the page scrolls sideways */
+.brand { font: 400 40px/1.1 var(--display); letter-spacing: .01em; white-space: nowrap; padding-bottom: 4px;
+  background: var(--silver); -webkit-background-clip: text; background-clip: text; color: transparent;
+  filter: drop-shadow(0 2px 0 rgb(0 0 0 / .75)); }
+.games { display: flex; align-self: stretch; align-items: center; gap: 6px; border-left: 1px solid var(--line); padding-left: 24px; }
+.gametab { position: relative; background: none; border: 0; color: var(--muted); font: 400 22px/1 var(--sans); letter-spacing: .1em;
+  padding: 12px 16px; cursor: pointer; }
+.gametab:hover { color: var(--text); }
+.gametab.active { color: var(--text); }
+.gametab.active::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: 0; height: 2px; background: var(--cyan);
+  box-shadow: 0 0 10px rgb(0 240 255 / .6); }
+.gametab.active::before { content: ""; position: absolute; left: 50%; bottom: -5px; width: 7px; height: 7px; margin-left: -4px;
+  border-right: 2px solid var(--cyan); border-bottom: 2px solid var(--cyan); transform: rotate(45deg); }
+.gametab:disabled { opacity: .3; cursor: default; }
+.pills { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.pill { display: inline-flex; align-items: center; gap: 7px; height: 26px; padding: 0 10px; border: 1px solid var(--line);
+  border-radius: 4px; font: 12px var(--mono); color: var(--muted); white-space: nowrap; background: rgb(12 13 19 / .6); }
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+.pill.ok .dot { background: var(--cyan); box-shadow: 0 0 8px rgb(0 240 255 / .8); }
+.pill.warn .dot { background: var(--text); }
+.pill.bad .dot { background: var(--ruby); box-shadow: 0 0 8px rgb(220 38 38 / .8); }
+.pill b { color: var(--text); font-weight: 600; }
+nav.tabs { display: flex; gap: 2px; padding: 0 22px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: thin; }
+.tab { position: relative; background: none; border: 0; color: var(--muted); font: 500 14px/1 var(--sans); letter-spacing: .02em;
+  padding: 15px 16px 14px; cursor: pointer; white-space: nowrap; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text); }
+.tab.active::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px; background: var(--cyan);
+  box-shadow: 0 0 10px rgb(0 240 255 / .55); }
+.tab .count { font: 11px var(--mono); margin-left: 6px; color: var(--faint); }
+main { padding: 26px 34px 34px; min-width: 0; }
+section.view { display: none; }
+section.view.active { display: block; }
+
+/* status bar */
+.statusbar { position: relative; display: flex; align-items: center; gap: 16px; min-height: 36px; padding: 0 40px 0 30px;
+  border-top: 1px solid var(--line2); font: 12px var(--mono); color: var(--muted); flex-wrap: wrap; }
+.statusbar .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-right: 8px; vertical-align: 0; }
+.statusbar .dot.on { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+.statusbar .sep { width: 1px; height: 14px; background: var(--line); }
+.statusbar .grow { flex: 1; }
+.statusbar summary { cursor: pointer; list-style: none; letter-spacing: .12em; text-transform: uppercase; }
+.statusbar details[open] summary { color: var(--text); }
+.statusbar .tiplink { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); text-decoration: none; letter-spacing: .04em; }
+.statusbar .tiplink:hover { color: var(--text); }
+.statusbar .tiplink svg { width: 14px; height: 14px; }
+.logpop { position: absolute; right: 30px; bottom: 40px; width: min(720px, calc(100% - 60px)); z-index: 30; padding: 14px 18px; }
+.logpop .log { max-height: 240px; overflow: auto; font: 12px/1.7 var(--mono); }
+.log .fail { color: #ff8c8c; } .log .ok { color: var(--text); } .log .warn { color: var(--muted); }
+
+/* shared bits */
+.h2 { font: 600 12px/1 var(--sans); letter-spacing: .32em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; }
+.display { font-family: var(--display); font-weight: 400; background: var(--silver); -webkit-background-clip: text; background-clip: text;
+  color: transparent; filter: drop-shadow(0 2px 0 rgb(0 0 0 / .7)); }
+.sub { color: var(--muted); font-size: 12.5px; }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+.muted { color: var(--muted); }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1; min-width: 0; }
+.empty { padding: 40px 20px; text-align: center; color: var(--muted); }
+.empty .big { font: 400 22px var(--sans); color: var(--text); margin-bottom: 6px; }
+.btn { --bc: 7px; --bc2: 10px; position: relative; isolation: isolate; display: inline-flex; align-items: center; justify-content: center;
+  gap: 8px; min-height: 38px; padding: 0 18px; border: 0; background: var(--chrome); color: var(--text); cursor: pointer;
+  font: 500 13.5px/1 var(--sans); letter-spacing: .02em; white-space: nowrap; text-decoration: none;
+  clip-path: polygon(var(--bc) 0, 100% 0, 100% calc(100% - var(--bc2)), calc(100% - var(--bc2)) 100%, 0 100%, 0 var(--bc)); }
+.btn::before { content: ""; position: absolute; inset: 1px; z-index: -1; background: var(--surface); transition: background .12s;
+  clip-path: polygon(calc(var(--bc) - .4px) 0, 100% 0, 100% calc(100% - var(--bc2) + .4px), calc(100% - var(--bc2) + .4px) 100%, 0 100%, 0 calc(var(--bc) - .4px)); }
+.btn:hover { background: var(--chrome-hi); }
+.btn:hover::before { background: var(--hover); }
+.btn:active::before { background: var(--pressed); }
+.btn:focus-visible { outline: none; background: linear-gradient(var(--cyan), var(--cyan)); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn.primary { background: linear-gradient(115deg, rgb(0 240 255 / .95), rgb(0 150 170 / .75) 55%, rgb(0 240 255 / .9)); color: #fff; }
+.btn.primary::before { background: linear-gradient(180deg, rgb(0 240 255 / .13), rgb(0 240 255 / .04)), var(--surface); }
+.btn.primary:hover::before { background: linear-gradient(180deg, rgb(0 240 255 / .2), rgb(0 240 255 / .07)), var(--hover); }
+.btn.danger { background: linear-gradient(115deg, rgb(220 38 38 / .95), rgb(110 20 20 / .7) 60%, rgb(220 38 38 / .8)); }
+.btn.ghost { background: transparent; }
+.btn.ghost::before { background: transparent; }
+.btn.ghost:hover::before { background: var(--hover); }
+.btn.small { --bc: 5px; --bc2: 7px; min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+.btn svg { width: 16px; height: 16px; }
+.input, .editorwrap select, select { width: 100%; height: 40px; padding: 0 12px; border-radius: 4px; border: 1px solid var(--line);
+  background: var(--well); outline: none; color: var(--text); }
+select { width: auto; }
+.input:focus, select:focus { border-color: transparent; outline: 2px solid rgb(0 240 255 / .85); outline-offset: 1px; }
+.badge { display: inline-flex; align-items: center; gap: 6px; height: 20px; padding: 0 8px; border-radius: 999px; border: 1px solid var(--line);
+  font: 600 10.5px/1 var(--sans); letter-spacing: .05em; color: var(--muted); white-space: nowrap; vertical-align: 1px; }
+.badge.on, .badge.gold { border-color: rgb(0 240 255 / .55); color: var(--text); }
+.badge.on::before, .badge.gold::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }
+.badge.yaml, .badge.adds { color: var(--cyan2); border-color: rgb(0 240 255 / .35); }
+.badge.changes { color: var(--text); border-color: #6d7888; }
+.badge.aside { border-style: dashed; }
+.badge.bad { color: #fff; border-color: rgb(220 38 38 / .85); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 12px 0 14px; }
+.chip { height: 28px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--muted);
+  font-size: 12.5px; cursor: pointer; }
+.chip:hover { color: var(--text); border-color: #3a4150; }
+.chip.on { color: var(--cyan2); border-color: rgb(0 240 255 / .6); background: rgb(0 240 255 / .07); }
+.switch { position: relative; width: 40px; height: 22px; flex: none; }
+.switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+.switch span { position: absolute; inset: 0; border-radius: 999px; background: #1a1d27; border: 1px solid var(--line); transition: .15s; cursor: pointer; }
+.switch span::before { content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; border-radius: 50%; background: var(--faint); transition: .15s; }
+.switch input:checked + span { background: rgb(0 240 255 / .16); border-color: rgb(0 240 255 / .7); }
+.switch input:checked + span::before { transform: translateX(18px); background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+.switch input:focus-visible + span { outline: 2px solid rgb(0 240 255 / .85); outline-offset: 2px; }
+.status { margin-top: 10px; padding: 10px 14px; border-radius: 4px; font-size: 13px; border: 1px solid var(--line); }
+.status.ok { border-color: rgb(0 240 255 / .4); }
+.status.bad { border-color: rgb(220 38 38 / .8); border-left-width: 3px; color: #fff; }
+.progress { height: 6px; background: #151822; border: 1px solid var(--line); overflow: hidden; margin-top: 14px; }
+.progress div { height: 100%; background: linear-gradient(90deg, #00b3c3, var(--cyan)); box-shadow: 0 0 10px rgb(0 240 255 / .5); transition: width .3s; }
+.spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid rgb(255 255 255 / .18); border-top-color: var(--cyan); animation: sp .8s linear infinite; }
+@keyframes sp { to { transform: rotate(360deg); } }
+.toasts { position: fixed; right: 24px; bottom: 24px; display: flex; flex-direction: column; gap: 10px; z-index: 60; max-width: 460px; }
+.toast { padding: 14px 18px; font-size: 13px; white-space: pre-wrap; }
+.toast.bad::before { background: linear-gradient(90deg, var(--ruby) 0 3px, transparent 3px), var(--surface); }
+.modal { position: fixed; inset: 0; background: rgb(4 5 8 / .72); display: none; place-items: center; z-index: 50; padding: 30px; }
+.modal.open { display: grid; }
+.modal .card { width: min(1000px, 100%); max-height: 85vh; display: flex; flex-direction: column; }
+.modal .mhead { display: flex; align-items: center; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+
+/* home */
+.eyebrow { font: 600 12px/1 var(--sans); letter-spacing: .45em; text-transform: uppercase; color: var(--muted); }
+.hero { font: 300 44px/1.15 var(--sans); margin: 10px 0 28px; letter-spacing: .005em; }
+.pads { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+.pad { padding: 30px 32px 26px; display: flex; flex-direction: column; min-height: 380px; }
+.padhead { display: flex; gap: 18px; align-items: flex-start; }
+.padicon { flex: none; width: 44px; height: 44px; color: #d4dce6; margin-top: 4px; }
+.padtitle { font-size: 48px; line-height: 1.05; }
+.padtitle .jp { font-size: 24px; margin-left: 10px; white-space: nowrap; }
+.padsub { color: var(--muted); font-size: 16px; margin-top: 6px; }
+.padnum { margin-left: auto; font: 11px var(--mono); color: var(--faint); }
+.padlist { margin-top: 26px; border-top: 1px solid var(--line); }
+.padrow { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 14px; align-items: center; min-height: 54px; padding: 0 8px;
+  border-bottom: 1px solid var(--line); font: 15px var(--mono); cursor: pointer; }
+.padrow:hover { background: var(--hover); }
+.padrow svg { width: 20px; height: 20px; color: #aeb9c7; }
+.padrow .chev { color: var(--muted); font: 20px var(--sans); }
+.padrow .note { font: 12px var(--sans); color: var(--muted); }
+.padlink { margin-top: auto; padding-top: 22px; display: inline-flex; align-items: center; gap: 12px; color: var(--text); font-size: 16px;
+  background: none; border: 0; cursor: pointer; padding-left: 0; }
+.padlink:hover { color: var(--cyan2); }
+.strip { margin-top: 24px; padding: 18px 28px; display: flex; align-items: center; gap: 22px; flex-wrap: wrap; }
+.strip .mk { width: 46px; height: 46px; }
+.strip .sep { width: 1px; align-self: stretch; background: var(--line); }
+.strip .pname { font: 300 26px/1.15 var(--sans); }
+.strip .pmeta { font: 13px var(--mono); color: var(--muted); margin-top: 4px; }
+@media (max-width: 1100px) { .pads { grid-template-columns: 1fr; } }
+
+/* mods: library and inspector */
+.explorer { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 24px; align-items: start; }
+.library { padding: 22px 0 14px; position: sticky; top: 12px; max-height: calc(100vh - 24px); display: flex; flex-direction: column; }
+.library .h2 { padding: 0 22px; }
+.libsearch { position: relative; margin: 0 22px 10px; }
+.libsearch svg { position: absolute; left: 12px; top: 50%; width: 16px; height: 16px; transform: translateY(-50%); color: var(--muted); }
+.libsearch .input { padding-left: 38px; }
+.libgroups { overflow: auto; flex: 1; min-height: 120px; }
+.libgroup > summary { list-style: none; display: flex; align-items: center; gap: 10px; padding: 11px 22px; cursor: pointer; color: var(--text);
+  font-size: 14px; }
+.libgroup > summary::before { content: ""; width: 0; height: 0; border-left: 5px solid var(--muted); border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent; transition: transform .12s; }
+.libgroup[open] > summary::before { transform: rotate(90deg); }
+.libgroup > summary .n { margin-left: auto; font: 11px var(--mono); color: var(--faint); }
+.librow { display: flex; align-items: center; gap: 10px; padding: 9px 22px 9px 34px; cursor: pointer; border-left: 2px solid transparent; }
+.librow:hover { background: var(--hover); }
+.librow.sel { background: #171a24; border-left-color: rgb(0 240 255 / .7); }
+.librow .lname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.librow .lkind { font: 10px var(--mono); color: var(--faint); letter-spacing: .06em; }
+.librow .lstate { font: 600 11px var(--mono); letter-spacing: .1em; color: var(--cyan); }
+.librow .lstate.off { color: var(--faint); }
+.librow .lstate.bad { color: #fff; }
+.libnew { display: flex; gap: 8px; padding: 12px 22px 4px; border-top: 1px solid var(--line); margin-top: 8px; }
+.libnew .input { height: 34px; }
+.insp { padding: 28px 32px; }
+.insp .ititle { font: 300 32px/1.1 var(--sans); overflow-wrap: anywhere; }
+.insp .isub { color: var(--muted); margin-top: 6px; font-size: 15px; }
+.subtabs { display: flex; gap: 4px; margin: 22px 0 20px; border-bottom: 1px solid var(--line); }
+.subtab { position: relative; background: none; border: 0; color: var(--muted); padding: 10px 16px 12px; cursor: pointer; font-size: 14px; }
+.subtab.active { color: var(--text); }
+.subtab.active::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px; height: 2px; background: var(--cyan); }
+.kvg { display: grid; grid-template-columns: minmax(160px, 240px) 1fr; gap: 14px 24px; font-size: 15px; align-items: baseline; }
+.kvg dt { color: var(--text); opacity: .86; }
+.kvg dd { margin: 0; font-family: var(--mono); color: var(--cyan); overflow-wrap: anywhere; }
+.kvg dd.plain { color: var(--text); font-family: var(--sans); }
+.kvg dd.off { color: var(--faint); }
+.hr { height: 1px; background: var(--line); margin: 22px 0; }
+.stepper { display: inline-flex; align-items: stretch; border: 1px solid #3a4150; height: 40px; }
+.stepper button { width: 40px; border: 0; background: var(--well); color: var(--text); font: 18px var(--sans); cursor: pointer; }
+.stepper button:hover { background: var(--hover); }
+.stepper input { width: 80px; border: 0; border-left: 1px solid #3a4150; border-right: 1px solid #3a4150; background: transparent;
+  text-align: center; color: var(--cyan); font: 18px var(--mono); outline: none; }
+.setting { display: grid; grid-template-columns: minmax(150px, 220px) minmax(0, 1fr) auto; gap: 8px 18px; align-items: center;
+  padding: 14px 0; border-bottom: 1px solid var(--line); }
+.setting .skey { font: 13px var(--mono); color: var(--text); }
+.setting .skey small { display: block; color: var(--faint); font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; }
+.setting .help { grid-column: 1 / -1; color: var(--muted); font-size: 12.5px; }
+.setting .input { height: 34px; max-width: 260px; font-family: var(--mono); }
+.logview { font: 12px/1.65 var(--mono); background: var(--well); border: 1px solid var(--line); padding: 12px 14px; max-height: 340px;
+  overflow: auto; white-space: pre-wrap; color: var(--muted); margin: 0; }
+.installbar { margin-top: 24px; padding: 16px 24px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.fm { margin-top: 0; }
+.fmcols { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.fmlist { max-height: 560px; overflow: auto; border: 1px solid var(--line); background: var(--well); }
+.fmrow { display: grid; grid-template-columns: 78px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 10px;
+  border-bottom: 1px solid var(--line2); cursor: pointer; font-size: 12.5px; }
+.fmrow:hover { background: var(--hover); }
+.fmrow.sel { background: #171a24; box-shadow: inset 2px 0 0 rgb(0 240 255 / .7); }
+.fmrow .fp { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.fmrow .fa { font-size: 11.5px; color: var(--muted); }
+.clash { color: #fff; }
+.fmview { border: 1px solid var(--line); background: var(--well); padding: 14px; position: sticky; top: 12px; }
+.fmview img, .skin .thumbs img { background: repeating-conic-gradient(#191c26 0 25%, #12131a 0 50%) 0 0 / 16px 16px; }
+.fmview img { display: block; max-width: 100%; height: auto; margin: 10px auto 4px; }
+.fmview pre { max-height: 320px; overflow: auto; margin: 10px 0 0; }
+.dest { display: flex; gap: 6px; min-width: 0; }
+.dest select { flex: 1; min-width: 0; height: 34px; }
+.dest .input { flex: 1; min-width: 0; height: 34px; }
+@media (max-width: 1100px) { .explorer, .fmcols { grid-template-columns: 1fr; } .library { position: static; max-height: 460px; } .fmview { position: static; } }
+
+/* assets (explore) */
+.explore { display: grid; grid-template-columns: minmax(0, 1fr) 480px; gap: 24px; align-items: start; }
+.searchbar { position: relative; }
+.searchbar svg { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); width: 17px; height: 17px; color: var(--muted); }
+.searchbar .input { padding-left: 42px; font-size: 15px; height: 48px; }
+.results { max-height: calc(100vh - 300px); overflow: auto; }
+.res { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 16px;
+  border-bottom: 1px solid var(--line2); cursor: pointer; }
+.res:hover { background: var(--hover); }
+.res.sel { background: #171a24; box-shadow: inset 2px 0 0 rgb(0 240 255 / .7); }
+.ico { width: 34px; height: 34px; display: grid; place-items: center; font: 700 10px var(--mono); letter-spacing: .02em; text-transform: uppercase;
+  border: 1px solid var(--line); color: var(--muted); clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 6px); background: var(--well); }
+.ico.param { color: var(--cyan2); } .ico.model { color: #c9d4e2; } .ico.tex { color: #a7b2c1; } .ico.motion { color: #e2e8f0; } .ico.fx { color: #7ff8ff; }
+.res .path { font-family: var(--mono); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.res .path b { color: var(--text); font-weight: 600; }
+.res .meta { text-align: right; font-size: 11.5px; color: var(--faint); white-space: nowrap; font-family: var(--mono); }
+.drawer { position: sticky; top: 12px; max-height: calc(100vh - 24px); display: flex; flex-direction: column; overflow: hidden; }
+.drawer .head { padding: 20px 20px 14px; border-bottom: 1px solid var(--line); }
+.drawer .title { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+.kv { display: grid; grid-template-columns: 92px 1fr; gap: 4px 10px; margin-top: 10px; font-size: 12.5px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; word-break: break-all; }
+.drawer .actions { padding: 12px 20px; border-bottom: 1px solid var(--line); }
+.drawer .actions input { height: 32px; background: var(--well); border: 1px solid var(--line); border-radius: 4px; padding: 0 10px; color: var(--text); }
+.drawer .preview { overflow: auto; flex: 1; min-height: 120px; }
+@media (max-width: 1100px) { .explore { grid-template-columns: 1fr; } .drawer { position: static; max-height: none; } }
+
+/* code */
+pre.code, .editor pre, .editor textarea { margin: 0; font: 12.5px/1.6 var(--mono); tab-size: 2; }
+pre.code { padding: 14px 18px; white-space: pre; }
+.k { color: #b9c8d8; } .n { color: #5fe6ef; } .s { color: #e2e8f0; } .b { color: #7ff8ff; }
+.c { color: var(--faint); font-style: italic; } .cls { color: #fff; font-weight: 600; } .p { color: var(--faint); }
+.lotmap { position: relative; flex: none; margin: 0 0 12px; border: 1px solid var(--line); background: var(--well); overflow: hidden; }
+.drawer .lotmap { margin: 0 16px 10px; }
+.lotmap svg { display: block; width: 100%; touch-action: none; user-select: none; }
+.lotmap .grid { stroke: var(--line2); stroke-width: 1; }
+.lotmap .spot { fill: var(--cyan); stroke: var(--base); stroke-width: 1.5; }
+.lotmap .spot.obj { fill: #788391; }
+.lotmap .spot.npc { fill: #e2e8f0; }
+.lotmap .drag .spot { cursor: grab; }
+.lotmap .drag .spot:hover, .lotmap .spot.active { fill: #fff; }
+.lotmap .face { stroke: #a7b2c1; stroke-width: 2; stroke-linecap: round; }
+.lotmap text { fill: var(--muted); font: 11px var(--mono); pointer-events: none; }
+.lotmap .legend { padding: 6px 10px 8px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.lotmap .maptools { display: flex; gap: 8px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+.lotmap .maptools .grow { flex: 1; }
+.lotmap .spot.sel { fill: #fff; stroke: var(--cyan); stroke-width: 2.5; }
+
+/* world */
+.world { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 24px; align-items: start; }
+.wside { position: sticky; top: 12px; max-height: calc(100vh - 24px); display: flex; flex-direction: column; overflow: hidden; }
+.wside .head { padding: 18px; border-bottom: 1px solid var(--line); }
+#wstages { overflow: auto; flex: 1; }
+.wst { padding: 10px 18px; border-bottom: 1px solid var(--line2); cursor: pointer; }
+.wst:hover { background: var(--hover); }
+.wst.sel { background: #171a24; box-shadow: inset 2px 0 0 rgb(0 240 255 / .7); }
+.wst.hit b { color: var(--cyan); }
+.wmap { position: relative; margin: 12px 0; border: 1px solid var(--line); background: var(--well); overflow: hidden; }
+.wmap canvas { display: block; width: 100%; height: 540px; cursor: crosshair; touch-action: none; }
+.wdrag { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0 8px; }
+.wdrag .input { height: 32px; padding: 0 10px; font-size: 12.5px; max-width: 220px; }
+.wdrag .chips { margin: 0; flex-basis: 100%; }
+.chip.drag { cursor: grab; }
+.chip.drag:active { cursor: grabbing; }
+.wmap .legend { padding: 7px 10px 9px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.wtip { position: absolute; pointer-events: none; padding: 5px 9px; background: rgb(8 8 12 / .94); border: 1px solid var(--line);
+  font: 12px var(--mono); color: var(--text); white-space: nowrap; display: none; }
+.wtoggles { display: flex; gap: 6px; flex-wrap: wrap; }
+.wtoggles .chip .sw { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }
+.wcols { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; }
+.wbox { border: 1px solid var(--line); background: var(--well); }
+.wbox .bh { padding: 10px 12px; border-bottom: 1px solid var(--line); font: 600 11px var(--sans); letter-spacing: .24em; text-transform: uppercase; color: var(--muted); }
+.wgroups { max-height: 430px; overflow: auto; }
+.wg { display: grid; grid-template-columns: 60px minmax(0, 1fr) auto; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--line2); cursor: pointer; font-size: 12.5px; }
+.wg:hover { background: var(--hover); }
+.wg.sel { background: #171a24; box-shadow: inset 2px 0 0 rgb(0 240 255 / .7); }
+.wg .num { font-family: var(--mono); color: var(--cyan); }
+.wform { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 8px 10px; align-items: center; padding: 12px; font-size: 13px; }
+.wform .input, .wform select { height: 34px; padding: 0 10px; font-size: 13px; width: 100%; }
+.wsel { padding: 10px 12px; font-size: 13px; border-top: 1px solid var(--line); }
+.wplan { padding: 10px 12px; border-top: 1px solid var(--line); font-size: 12.5px; }
+.wplan .warn { color: var(--text); }
+.wplan .warn::first-letter { color: var(--muted); }
+.wbox.wide { grid-column: 1 / -1; }
+.dbeats { width: 100%; border-collapse: collapse; margin: 8px 0 4px; }
+.dbeats td { padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line2); font-size: 12.5px; vertical-align: top; }
+.dbeats td.mono { color: var(--muted); width: 22px; }
+.wform label.check { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; }
+@media (max-width: 1100px) { .world { grid-template-columns: 1fr; } .wside { position: static; max-height: 380px; } .wcols { grid-template-columns: 1fr; } }
+
+/* skins */
+.skins { display: grid; grid-template-columns: 390px minmax(0, 1fr); gap: 24px; align-items: start; }
+.skinpics { display: grid; gap: 6px; }
+.skinpics label { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 8px; align-items: center; font-size: 12px; }
+.skinpics input[type=file] { min-width: 0; font-size: 12px; color: var(--muted); }
+.skingrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+.skin { padding: 16px; display: flex; flex-direction: column; gap: 9px; }
+.skin .thumbs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+.skin .thumbs img, .skin .thumbs .none { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; }
+.skin .thumbs .none { background: var(--pressed); }
+@media (max-width: 1100px) { .skins { grid-template-columns: 1fr; } }
+
+/* editor */
+.editorwrap { margin-top: 24px; }
+.editor { position: relative; display: grid; grid-template-columns: 56px 1fr; height: 62vh; overflow: hidden; border: 1px solid var(--line); background: var(--well); }
+.gutter { overflow: hidden; text-align: right; padding: 14px 10px 64px 0; color: var(--faint); font: 12.5px/1.6 var(--mono); border-right: 1px solid var(--line); user-select: none; }
+.gutter div.err { color: #fff; font-weight: 700; }
+.stack { position: relative; overflow: hidden; }
+.editor pre, .editor textarea { position: absolute; inset: 0; padding: 14px 16px; white-space: pre; overflow: auto; border: 0; }
+.editor pre { pointer-events: none; color: var(--text); }
+.editor textarea { background: transparent; color: transparent; caret-color: var(--cyan); resize: none; outline: none; }
+.editor .band { position: absolute; left: 0; right: 0; height: 20px; background: rgb(220 38 38 / .14); box-shadow: inset 3px 0 0 var(--ruby); pointer-events: none; }
+.edhelp { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line); background: var(--well); }
+.edhelp .sub { margin-top: 6px; white-space: pre-wrap; }
+#edhelpfield:empty { display: none; }
+#edhelpfield { padding-top: 8px; border-top: 1px dashed var(--line); }
+.edhelp.ja { font-family: "Yu Gothic UI", "Yu Gothic", "Meiryo", var(--sans); }
+.langtoggle { display: inline-flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+.langbtn { border: 0; background: none; color: var(--muted); padding: 6px 12px; cursor: pointer; font-weight: 600; font-size: 12px; }
+.langbtn:hover { color: var(--text); }
+.langbtn.active { color: var(--cyan2); background: rgb(0 240 255 / .08); }
+
+/* diagnostics */
+.diag { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 24px; align-items: start; }
+.dpanel { padding: 24px 30px 20px; }
+.dhead { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding-bottom: 14px; border-bottom: 1px solid var(--line);
+  font: 18px var(--sans); }
+.dhead .key { font: 13px var(--mono); color: var(--muted); }
+.drow { padding: 18px 0 16px; border-bottom: 1px solid var(--line); }
+.dline { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.dlabel { font: 12px var(--mono); letter-spacing: .2em; text-transform: uppercase; color: var(--muted); }
+.dval { font: 20px var(--mono); color: var(--text); }
+.dval small { font-size: 13px; color: var(--muted); }
+.dnote { display: flex; justify-content: space-between; font: 13px var(--mono); color: var(--muted); margin-top: 8px; }
+.meter { position: relative; height: 12px; margin-top: 12px; background: #141720; border: 1px solid var(--line); }
+.meter > i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, #00a9b8, var(--cyan)); box-shadow: 0 0 12px rgb(0 240 255 / .4); transition: width .4s; }
+.meter > b { position: absolute; top: -6px; bottom: -6px; width: 1px; background: rgb(0 240 255 / .7); }
+.meter > b.guard { background: #a7b2c1; }
+.meter.crit > i { background: linear-gradient(90deg, #7f1d1d, var(--ruby)); box-shadow: none; }
+.meter.unknown > i, .meter.unknown > b { display: none; }
+.pchips { display: flex; flex-wrap: wrap; gap: 10px; padding: 16px 0; border-bottom: 1px solid var(--line); }
+.pchip { font: 13px var(--mono); padding: 7px 12px; border: 1px solid #3a4150; border-radius: 4px; color: var(--text); }
+.pchip b { color: var(--cyan); font-weight: 600; }
+.pchip.off b { color: var(--faint); }
+.pchip.bad { border-color: rgb(220 38 38 / .85); }
+.pchip.bad b { color: #fff; }
+.dfoot { display: flex; justify-content: space-between; align-items: baseline; padding-top: 16px; font: 13px var(--mono); color: var(--muted); }
+.dfoot .fps { font-size: 22px; color: var(--cyan); }
+.critical { padding: 22px 26px; display: grid; grid-template-columns: 34px 1fr; gap: 6px 16px; }
+.critical svg { width: 30px; height: 36px; grid-row: span 2; }
+.critical .ct { font: 22px var(--mono); color: #fff; }
+.critical .cx { color: var(--text); }
+.terminal { padding: 22px 26px; font: 13px/1.8 var(--mono); }
+.terminal .fangs { font: 11px/1.05 var(--mono); color: #a7b2c1; white-space: pre; margin-bottom: 12px; }
+.terminal .tag { display: inline-block; width: 7.5em; color: var(--cyan); }
+.terminal .tag.bad { color: var(--ruby); }
+.terminal .tl { display: flex; gap: 10px; } .terminal .tl span:nth-child(2) { width: 11em; color: var(--text); } .terminal .tl span:last-child { color: var(--muted); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 16px; margin-top: 24px; }
+.tile { padding: 18px 20px; }
+.tile .label { font: 600 10.5px var(--sans); letter-spacing: .24em; text-transform: uppercase; color: var(--muted); }
+.tile .value { font: 20px var(--sans); margin-top: 8px; }
+.tile .value.ok { color: var(--cyan); } .tile .value.warn { color: var(--text); } .tile .value.bad { color: #fff; }
+.tile.badtile::before { background: linear-gradient(90deg, var(--ruby) 0 3px, transparent 3px), var(--surface); }
+.tile .note { margin-top: 4px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.gameactions { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 24px; }
+.gameactions .card { padding: 22px; }
+.gameactions p { color: var(--muted); margin: 0 0 14px; font-size: 13px; }
+.files { max-height: 180px; overflow: auto; border: 1px solid var(--line); background: var(--well); }
+.file { display: flex; gap: 8px; align-items: center; padding: 7px 10px; font-family: var(--mono); font-size: 12px; cursor: pointer; border-bottom: 1px solid var(--line2); color: var(--muted); }
+.file:last-child { border-bottom: 0; }
+.file:hover { color: var(--text); background: var(--hover); }
+.file.static { cursor: default; }
+@media (max-width: 1100px) { .diag { grid-template-columns: 1fr; } }
+
+/* guide */
+.guide { max-width: 900px; margin: 0 auto; }
+.guidebar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+.gtabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.gtab { height: 32px; padding: 0 14px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; font-weight: 600; font-size: 13px; }
+.gtab:hover { color: var(--text); }
+.gtab.active { color: var(--cyan2); border-color: rgb(0 240 255 / .6); background: rgb(0 240 255 / .07); }
+.guidebar .langtoggle { margin-left: auto; }
+.gtopic { display: none; }
+.gtopic.active { display: block; }
+.gtext { padding: 26px 30px; }
+.gtitle { margin: 0 0 14px; font-size: 32px; line-height: 1.15; }
+.gtext p { margin: 0 0 12px; }
+.gtext p:last-child { margin-bottom: 0; }
+.gtext ol, .gtext ul { margin: 0; padding-left: 22px; }
+.gtext li { margin: 0 0 9px; }
+.guide.lang-en .g-ja { display: none; }
+.guide.lang-ja .g-en { display: none; }
+.guide.lang-ja, .guide.lang-ja .gtext { font-family: "Yu Gothic UI", "Yu Gothic", "Meiryo", var(--sans); }
+@media (max-width: 760px) { main, .masthead { padding-left: 18px; padding-right: 18px; } .brand { font-size: 32px; } .hero { font-size: 32px; }
+  .padtitle { font-size: 38px; } .games { border-left: 0; padding-left: 0; } .app { margin: 0; } }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+  <symbol id="i-doc" viewBox="0 0 24 24"><path d="M6 2.5h8.5L19 7v14.5H6z M14.5 2.5V7H19 M9 11h7 M9 14.5h7 M9 18h4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+  <symbol id="i-cube" viewBox="0 0 24 24"><path d="M12 2.5 20.5 7v10L12 21.5 3.5 17V7z M3.5 7 12 11.5 20.5 7 M12 11.5v10 M7.8 4.8l8.5 4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M2.5 6.5v13h19v-11h-9l-2-2.5h-8z M2.5 9.5h19" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><path d="M2.5 5.5 8.5 3l7 2.5 6-2.5v15.5l-6 2.5-7-2.5-6 2.5z M8.5 3v15.5 M15.5 5.5V21" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+  <symbol id="i-skin" viewBox="0 0 24 24"><path d="M12 2.5c5 0 8.5 3.6 8.5 8.4 0 5.3-4.3 10.6-8.5 10.6S3.5 16.2 3.5 10.9C3.5 6.1 7 2.5 12 2.5z M8 9.5c1.3-1 2.7-1 4 0 1.3-1 2.7-1 4 0 M9 15c1.9 1.4 4.1 1.4 6 0" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+  <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2.5v5 M15 2.5v5 M6.5 7.5h11v4a5.5 5.5 0 0 1-11 0z M12 17v4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 1 0 0-7.6z M10.3 2.5h3.4l.6 2.6 2.2 1.2 2.5-.9 1.7 2.9-2 1.8v2.6l2 1.8-1.7 2.9-2.5-.9-2.2 1.2-.6 2.6h-3.4l-.6-2.6-2.2-1.2-2.5.9-1.7-2.9 2-1.8v-2.6l-2-1.8 1.7-2.9 2.5.9 2.2-1.2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z" fill="currentColor"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m15.5 15.5 5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-drop" viewBox="0 0 30 36"><path d="M15 2C11 9 4 15.5 4 23a11 11 0 0 0 22 0C26 15.5 19 9 15 2z" fill="#dc2626"/><path d="M10 23.5a5 5 0 0 0 4 4.8" fill="none" stroke="#ffb4b4" stroke-width="1.6" stroke-linecap="round" opacity=".8"/></symbol>
+  <symbol id="i-coffee" viewBox="0 0 24 24"><path d="M4.5 9h12v5.5a4 4 0 0 1-4 4H8.5a4 4 0 0 1-4-4z M16.5 10.5h2a2.5 2.5 0 0 1 0 5h-1.6 M8 3c-.9 1 .9 2 0 3 M12 3c-.9 1 .9 2 0 3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20.3 4.3 12.6a4.6 4.6 0 1 1 6.5-6.5l1.2 1.2 1.2-1.2a4.6 4.6 0 1 1 6.5 6.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+</svg>
+<div class="app">
+  <div class="titlebar"><img src="/static/mark.svg" alt=""><span>NryQ // Riftstone Studio</span><span class="ver" id="ver"></span></div>
+  <header class="masthead">
+    <div class="brand">Riftstone Studio</div>
+    <nav class="games" id="games" aria-label="Game">
+      <button class="gametab" data-kind="ddda" title="Dragon's Dogma: Dark Arisen">DDDA</button>
+      <button class="gametab" data-kind="ddo" title="Dragon's Dogma Online">DDON</button>
+    </nav>
+    <div class="pills" id="pills"></div>
+  </header>
+  <nav class="tabs" aria-label="Sections">
+    <button class="tab active" data-view="home">Home</button>
+    <button class="tab" data-view="mods">Mods <span class="count" id="modcount"></span></button>
+    <button class="tab" data-view="explore">Assets</button>
+    <button class="tab" data-view="world">World</button>
+    <button class="tab" data-view="skins">Monsters</button>
+    <button class="tab" data-view="game">Diagnostics</button>
+    <button class="tab" data-view="guide">Guide</button>
+  </nav>
+  <main>
+    <section class="view active" id="view-home">
+      <div class="eyebrow">Workspace</div>
+      <h1 class="hero">Build your next journey</h1>
+      <div class="pads">
+        <div class="card pad">
+          <div class="padhead"><svg class="padicon"><use href="#i-doc"/></svg>
+            <div><div class="padtitle display">Mods <span class="jp">モッド</span></div>
+              <div class="padsub">Manage your plugins and mods</div></div><span class="padnum">01</span></div>
+          <div class="padlist" id="homemods"></div>
+          <button class="padlink" data-go="mods">Open mods <span aria-hidden="true">&rarr;</span></button>
+        </div>
+        <div class="card pad">
+          <div class="padhead"><svg class="padicon"><use href="#i-cube"/></svg>
+            <div><div class="padtitle display">Assets <span class="jp">アセット</span></div>
+              <div class="padsub">Port assets and place encounters</div></div><span class="padnum">02</span></div>
+          <div class="padlist">
+            <div class="padrow" data-go="explore"><svg><use href="#i-cube"/></svg><span>Asset porting<div class="note" id="homeport">Find any resource; bring it into a mod or into the other game</div></span><span class="chev">&rsaquo;</span></div>
+            <div class="padrow" data-go="world"><svg><use href="#i-map"/></svg><span>Layouts &amp; encounters<div class="note">Every placement on one map; add a fight anywhere</div></span><span class="chev">&rsaquo;</span></div>
+            <div class="padrow" data-go="skins"><svg><use href="#i-skin"/></svg><span>Monsters<div class="note">Convert monsters between the games; skins for chosen enemies</div></span><span class="chev">&rsaquo;</span></div>
+          </div>
+          <button class="padlink" data-go="explore">Open assets <span aria-hidden="true">&rarr;</span></button>
+        </div>
+      </div>
+      <div class="card strip">
+        <img class="mk" src="/static/mark.svg" alt="">
+        <div><div class="pname" id="profname">Dragon's Dogma</div><div class="pmeta" id="profmeta"></div></div>
+        <span class="sep"></span>
+        <span class="grow"></span>
+        <button class="btn" data-go="mods">Edit profile</button>
+        <button class="btn primary" id="launchbtn"><svg><use href="#i-play"/></svg><span id="launchlabel">Launch</span></button>
+        <span class="sep"></span>
+        <button class="btn ghost" id="settingsbtn"><svg><use href="#i-gear"/></svg>Settings</button>
+      </div>
+    </section>
+
+    <section class="view" id="view-mods">
+      <div class="explorer">
+        <aside class="card library">
+          <div class="h2">Library</div>
+          <div class="libsearch"><svg><use href="#i-search"/></svg><input class="input" id="libq" placeholder="Search plugins and mods" autocomplete="off"></div>
+          <div class="libgroups" id="library"><div class="empty">Reading…</div></div>
+          <div class="libnew"><input class="input" id="newmod" placeholder="New mod name" autocomplete="off"><button class="btn small primary" id="create">Create</button></div>
+        </aside>
+        <div class="inspector">
+          <div class="card insp" id="inspector"><div class="empty"><div class="big">Pick something from the library</div>A plugin shows what it does, whether it is on and its settings; a mod shows its files.</div></div>
+          <div class="fm" id="fmwrap" hidden>
+            <div class="card insp" style="margin-top: 24px">
+              <div class="row" style="margin-bottom: 10px">
+                <div class="grow"><div class="h2" style="margin: 0 0 6px">Files of <span id="fmmod"></span></div><div class="sub" id="fmsum"></div></div>
+                <button class="btn small" id="fmzip">Download the mod (.zip)</button>
+                <button class="btn small ghost" id="fmclose">Close</button>
+              </div>
+              <div class="row" style="margin: 0 0 12px"><div class="chips" id="fmchips" style="margin: 0"></div>
+                <input class="input grow" id="fmq" placeholder="Filter by name: s01/, .tex, st443…" autocomplete="off" style="height: 32px; font-size: 12.5px; max-width: 320px"></div>
+              <div class="fmcols"><div class="fmlist" id="fmlist"></div><div class="fmview" id="fmview"><div class="empty">Pick a file to see it.</div></div></div>
+            </div>
+          </div>
+          <div class="editorwrap" id="editorwrap" hidden>
+            <div class="card insp">
+              <div class="row" style="margin-bottom: 12px">
+                <div class="grow"><div class="h2" style="margin: 0 0 6px">Editing</div><div class="mono muted" id="edpath"></div></div>
+                <button class="btn small ghost" id="edclose">Close</button>
+                <button class="btn small" id="edsave">Save <span class="muted">Ctrl+S</span></button>
+                <button class="btn small primary" id="edinstall">Save &amp; install</button>
+              </div>
+              <div class="lotmap" id="edmap" hidden></div>
+              <div class="editor"><div class="gutter" id="gutter"></div><div class="stack"><div class="band" id="band" hidden></div><pre id="hl"></pre><textarea id="ta" spellcheck="false" wrap="off"></textarea></div></div>
+              <div class="status" id="edstatus">Checking…</div>
+              <div class="edhelp" id="edhelp" hidden>
+                <div class="row"><b id="edhelptitle"></b><span class="grow"></span>
+                  <span class="langtoggle" role="group" aria-label="Language"><button class="langbtn" data-hl="en">EN</button><button class="langbtn" data-hl="ja">日本語</button></span></div>
+                <div class="sub" id="edhelpbody"></div>
+                <div class="sub" id="edhelpfield"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="card installbar" id="installbar">
+        <div class="grow"><b id="enabledline">No mods on</b><div class="sub">Switch mods on in the library, then install. Riftstone rebuilds only the archives your files touch and keeps the originals.</div></div>
+        <button class="btn primary" id="installbtn">Install</button>
+      </div>
+    </section>
+
+    <section class="view" id="view-explore">
+      <div class="explore">
+        <div>
+          <div class="searchbar">
+            <svg><use href="#i-search"/></svg>
+            <input class="input" id="q" placeholder="Search every resource in the game: goblin, em0100, status, fsm" autocomplete="off">
+          </div>
+          <div class="chips" id="chips"></div>
+          <div class="card" id="resultsCard"><div class="results" id="results"></div></div>
+        </div>
+        <div class="card drawer" id="drawer">
+          <div class="empty"><div class="big">Pick a resource</div>Its details, the archives that hold it and, for parameter files, the editable YAML appear here. Add it to a mod, or port it to the other game.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="view-world">
+      <div class="world">
+        <div class="card wside">
+          <div class="head">
+            <div class="h2" style="margin: 0 0 6px">The world</div>
+            <div class="sub" id="wtotals">Stages, their groups and every placement, mapped from your game.</div>
+            <input class="input" id="wfilter" placeholder="Filter: st424, Gran Soren, Proving…" autocomplete="off" style="margin-top: 10px">
+            <div class="row" style="margin-top: 8px; flex-wrap: nowrap"><input class="input grow" id="wfind" list="wenemylist" placeholder="Where does… (goblin, em0100)" autocomplete="off">
+              <button class="btn small" id="wfindbtn">Find</button></div>
+            <div id="wfound" class="sub" style="margin-top: 6px"></div>
+          </div>
+          <div id="wstages"><div class="empty">Open this tab to map the world.</div></div>
+        </div>
+        <div>
+          <div class="card" style="padding: 18px" id="wstage">
+            <div class="empty"><div class="big">Pick a stage</div>Its enemy, NPC and object groups and every placement appear here on a map. Click a dot to see what it is; click open ground to pick a spot for an encounter.</div>
+          </div>
+        </div>
+      </div>
+      <datalist id="wenemylist"></datalist>
+    </section>
+
+    <section class="view" id="view-skins">
+      <div class="card insp" id="monsters" style="margin-bottom: 24px">
+        <div class="row" style="align-items: flex-end">
+          <div class="grow"><div class="h2" style="margin: 0 0 6px">Between the games</div>
+            <div class="sub" id="mnsum">Which Online monster is which Dark Arisen monster, measured joint by joint on both games; the ones whose bodies match convert either way.</div></div>
+          <div class="chips" style="margin: 0" id="mndir"><button class="chip on" data-dir="ddo">Online &rarr; Dark Arisen</button><button class="chip" data-dir="ddda">Dark Arisen &rarr; Online</button></div>
+        </div>
+        <div class="row" style="margin: 14px 0 10px"><input class="input grow" id="mnq" placeholder="Filter: wolf, chimera, em0200…" autocomplete="off" style="max-width: 360px; height: 34px">
+          <div class="chips" id="mnv" style="margin: 0"></div></div>
+        <div class="fmlist" id="mnlist" style="max-height: 360px"><div class="empty">Open this tab to read both games' monsters.</div></div>
+        <div class="wplan" id="mnplan" hidden></div>
+      </div>
+      <div class="skins">
+        <div class="card" style="padding: 0">
+          <div class="wbox" style="border: 0; background: none">
+            <div class="bh">New skin</div>
+            <div class="wform">
+              <label>Enemy</label><select id="skfam"></select>
+              <label>Look</label><select id="sksrc"><option value="">my own pictures</option></select>
+              <label>Pictures</label><div class="skinpics" id="skpics"></div>
+              <label>Title</label><input class="input" id="sktitle" placeholder="White Chimera">
+              <label>Number</label><input class="input" id="sknum" type="number" min="1" max="99" placeholder="the next free one">
+              <label>Put it in</label><div id="skdest"></div>
+            </div>
+            <div class="row" style="padding: 0 12px 14px"><button class="btn small primary" id="skmake">Make skin</button>
+              <span class="sub grow">A skin only adds files: it never clashes with other mods.</span></div>
+            <div class="wplan" id="skout" hidden></div>
+          </div>
+        </div>
+        <div>
+          <div class="row" style="margin-bottom: 14px"><div class="grow"><div class="h2" style="margin: 0 0 6px">Skins</div>
+            <div class="sub">A skin is a new look for one enemy family. Placements wear it by number (the World tab's Skin field, or <span class="mono">riftstone encounter --skin N</span>); every other enemy of that kind stays as it is. Needs the <span class="mono">enemy_skins</span> plugin. How it looks in game: UNKNOWN until you try it.</div></div></div>
+          <div class="skingrid" id="skgrid"><div class="card empty" style="grid-column: 1/-1">Open this tab to list your skins.</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="view-game">
+      <div class="diag">
+        <div class="card dpanel" id="dpanel"></div>
+        <div>
+          <div class="card critical" id="dcrit" hidden></div>
+          <div class="card terminal" id="dterm"></div>
+        </div>
+      </div>
+      <div class="tiles" id="tiles"></div>
+      <div class="gameactions">
+        <div class="card">
+          <div class="h2">Loader</div>
+          <p id="loadertext">The Riftstone loader serves your mods' archives from <span class="mono">riftstone\overlay</span>, so the game's own files are never overwritten, loads the plugins, and writes a report if the game crashes. An existing dinput8.dll (e.g. DDDA Tweak) keeps working, chained.</p>
+          <div class="row"><button class="btn primary" id="loaderbtn">Install loader</button><button class="btn ghost" id="loadersettings">Settings</button></div>
+        </div>
+        <div class="card">
+          <div class="h2">Back to vanilla</div>
+          <p>Puts every archive Riftstone changed back to the original, verified byte for byte. Your mod projects are untouched.</p>
+          <div class="row"><button class="btn danger" id="restorebtn">Restore original files</button></div>
+        </div>
+        <div class="card">
+          <div class="h2">Reports</div>
+          <p>Written by the loader when the game crashes, stops with a fatal error or stops drawing frames: what went wrong, the engine objects involved, memory headroom, and the mods and files it touched. Click one for the explanation.</p>
+          <div id="crashes" class="files"></div>
+          <div class="row" id="safemoderow" hidden style="margin-top: 12px"><button class="btn primary" id="safemodebtn">Turn safe mode off</button></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="view-guide">
+      <div class="guide lang-en" id="guide">
+        <div class="guidebar">
+          <div class="gtabs" id="gtabs">
+            <button class="gtab active" data-topic="about"><span class="g-en">About</span><span class="g-ja">概要</span></button>
+            <button class="gtab" data-topic="start"><span class="g-en">Getting started</span><span class="g-ja">使い方</span></button>
+            <button class="gtab" data-topic="edit"><span class="g-en">What you can edit</span><span class="g-ja">編集できるもの</span></button>
+            <button class="gtab" data-topic="support"><span class="g-en">Support</span><span class="g-ja">支援</span></button>
+            <button class="gtab" data-topic="legal"><span class="g-en">Legal</span><span class="g-ja">法的事項</span></button>
+          </div>
+          <div class="langtoggle" id="langtoggle" role="group" aria-label="Language">
+            <button class="langbtn active" data-lang="en">EN</button>
+            <button class="langbtn" data-lang="ja">日本語</button>
+          </div>
+        </div>
+
+        <div class="gtopic active" id="g-about">
+          <div class="card gtext">
+            <h2 class="gtitle display"><span class="g-en">What Riftstone is</span><span class="g-ja">リフトストーンとは</span></h2>
+            <p class="g-en">Riftstone is a fan-made modding suite for <b>Dragon's Dogma: Dark Arisen</b> and <b>Dragon's Dogma Online</b>. It reads the games' own files and lets you change them — enemies, spawns, skins, items, text, textures and more — then rebuilds them <b>byte for byte</b>, so nothing else in a file changes. Every format is checked against every matching file in the game.</p>
+            <p class="g-en">The Riftstone loader runs your mods without overwriting the game's files, loads plugins (more enemies at once, less pop-in, enemy skins, save copies) and explains any crash. Press <b>F10</b> in game for the diagnostics panel.</p>
+            <p class="g-ja">リフトストーンは<b>『ドラゴンズドグマ:ダークアリズン』</b>と<b>『ドラゴンズドグマ オンライン』</b>のためのファン製 MOD ツールです。ゲーム自身のファイルを読み込み、敵・出現・スキン・アイテム・テキスト・テクスチャなどを編集し、<b>バイト単位でそのまま</b>組み直します。編集した箇所以外は一切変わりません。</p>
+            <p class="g-ja">リフトストーンのローダーはゲーム本体のファイルを上書きせずに MOD を読み込み、プラグイン（同時に出現する敵の増加、ポップインの軽減、敵スキン、セーブのコピー）を読み込み、クラッシュの原因を説明します。ゲーム中に <b>F10</b> で診断パネルを表示します。</p>
+          </div>
+        </div>
+
+        <div class="gtopic" id="g-start">
+          <div class="card gtext">
+            <h2 class="gtitle display"><span class="g-en">Getting started</span><span class="g-ja">使い方</span></h2>
+            <ol class="g-en">
+              <li><b>Diagnostics</b>: install the loader (Dark Arisen). Riftstone checks your game build first.</li>
+              <li><b>Mods</b>: switch plugins and mods on or off, change their settings, then <b>Install</b>.</li>
+              <li><b>Assets</b>: search any resource (try <span class="mono">goblin</span>, <span class="mono">em0100</span>, <span class="mono">status</span>), add it to a mod and edit it; or port it to the other game.</li>
+              <li><b>World</b>: pick a stage, click the map, and add an encounter (N of an enemy) the way the game builds its own hordes.</li>
+              <li><b>Launch</b> from Home. <b>Restore original files</b> on Diagnostics puts everything back, verified byte for byte.</li>
+            </ol>
+            <ol class="g-ja">
+              <li><b>Diagnostics</b>：ローダーをインストールします（ダークアリズン）。最初にゲームのビルドを確認します。</li>
+              <li><b>Mods</b>：プラグインと MOD のオン・オフや設定を変更し、<b>Install</b> します。</li>
+              <li><b>Assets</b>：任意のリソースを検索し（<span class="mono">goblin</span>、<span class="mono">em0100</span>、<span class="mono">status</span> など）、MOD に追加して編集するか、もう一方のゲームへ移します。</li>
+              <li><b>World</b>：ステージを選んでマップをクリックし、ゲーム本来の群れと同じ仕組みで遭遇（敵 N 体）を追加します。</li>
+              <li>Home から<b>起動</b>します。Diagnostics の <b>Restore original files</b> ですべてを元に戻し、バイト単位で検証します。</li>
+            </ol>
+          </div>
+        </div>
+
+        <div class="gtopic" id="g-edit">
+          <div class="card gtext">
+            <h2 class="gtitle display"><span class="g-en">What you can edit</span><span class="g-ja">編集できるもの</span></h2>
+            <ul class="g-en">
+              <li><b>Textures</b> — <span class="mono">.tex ↔ .dds / .png</span>, edit in any image tool; Frost, Lava, Abyssal and Weathered presets.</li>
+              <li><b>Enemy &amp; character stats</b> — <span class="mono">.prp</span>: attack, defence, magick, resistances, HP and size.</li>
+              <li><b>Spawns &amp; enemy groups</b> — every field of every placement, decoded with the game's own grammar; hordes and spawn caps.</li>
+              <li><b>World</b> — every stage, its groups and every placement on one map; encounters as new groups.</li>
+              <li><b>Skins</b> — chosen chimeras wear another look, such as Online's White and Shadow Chimeras.</li>
+              <li><b>Between the games</b> — textures, text, models with their materials, motions and collision port from one game to the other.</li>
+              <li><b>Items, text, materials, collision, AI</b> and more — each rebuilds byte for byte.</li>
+            </ul>
+            <ul class="g-ja">
+              <li><b>テクスチャ</b> — <span class="mono">.tex ↔ .dds / .png</span>。任意の画像ツールで編集。フロスト・溶岩・深淵・風化のプリセット。</li>
+              <li><b>敵・キャラクターのステータス</b> — <span class="mono">.prp</span>：攻撃・防御・魔法・耐性・HP・大きさ。</li>
+              <li><b>出現と敵グループ</b> — 全配置の全フィールドをゲーム自身の形式で解読。群れと出現数の上限。</li>
+              <li><b>ワールド</b> — 全ステージのグループと配置を1枚のマップで表示。新しいグループとして遭遇を追加。</li>
+              <li><b>スキン</b> — 選んだキメラに別の外見を。オンラインのホワイト・シャドウキメラなど。</li>
+              <li><b>ゲーム間の移植</b> — テクスチャ・テキスト・マテリアル付きモデル・モーション・コリジョンを一方のゲームからもう一方へ。</li>
+              <li><b>アイテム・テキスト・マテリアル・コリジョン・AI</b>など — すべてバイト単位で組み直します。</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="gtopic" id="g-support">
+          <div class="card gtext">
+            <h2 class="gtitle display"><span class="g-en">Support</span><span class="g-ja">支援</span></h2>
+            <p class="g-en">Riftstone is free and open-source, and always will be — no feature is locked, and there are no ads or pop-ups. If it has been useful and you would like to help, you can leave the developer, <b>NryQ</b>, a tip. It supports the time and upkeep behind these tools, and is not a purchase of any game or in-game content.</p>
+            <p class="g-ja">リフトストーンは無料のオープンソースで、これからもそうあり続けます。機能が制限されることはなく、広告やポップアップもありません。役に立ったと感じ、応援いただける場合は、開発者 <b>NryQ</b> にチップを送ることができます。これはツールにかける時間と維持への支援であり、ゲームやゲーム内コンテンツの購入ではありません。</p>
+            <div class="row" style="margin-top: 18px">
+              <a class="btn ghost" href="https://ko-fi.com/nryquellts" target="_blank" rel="noopener noreferrer"><svg><use href="#i-coffee"/></svg><span class="g-en">Support on Ko-fi</span><span class="g-ja">Ko-fi で支援</span></a>
+              <a class="btn ghost" href="https://www.patreon.com/c/NryQuellts" target="_blank" rel="noopener noreferrer"><svg><use href="#i-heart"/></svg><span class="g-en">Support on Patreon</span><span class="g-ja">Patreon で支援</span></a>
+            </div>
+          </div>
+        </div>
+
+        <div class="gtopic" id="g-legal">
+          <div class="card gtext">
+            <h2 class="gtitle display"><span class="g-en">Legal</span><span class="g-ja">法的事項</span></h2>
+            <p class="g-en"><b>Riftstone is an independent, open-source project.</b> It is not affiliated with, endorsed by, sponsored by, or produced by Capcom Co., Ltd. "Dragon's Dogma", "Dragon's Dogma Online" and "Capcom" are trademarks or registered trademarks of Capcom Co., Ltd. All game assets remain the property of their respective owners.</p>
+            <p class="g-en">Riftstone contains <b>no game data</b>. It reads and rewrites the files of a copy of the game <b>you own</b>, on your own computer, and never bypasses any protection. Use it only with a legally purchased copy. A mod you share is your responsibility: share your own changes, and never redistribute the game itself.</p>
+            <p class="g-en">Riftstone is released under the MIT License. The Riftstone Blade display font is under the SIL Open Font License 1.1. The full notices are in <span class="mono">LICENSE</span> and <span class="mono">THIRD-PARTY-NOTICES.md</span> next to Riftstone.</p>
+            <p class="g-ja"><b>リフトストーンは独立したオープンソースのプロジェクトです。</b>株式会社カプコンとの提携・承認・後援・制作の関係は一切ありません。「ドラゴンズドグマ」「ドラゴンズドグマ オンライン」「カプコン」は株式会社カプコンの商標または登録商標です。ゲームの素材の権利はすべてそれぞれの権利者に帰属します。</p>
+            <p class="g-ja">リフトストーンに<b>ゲームデータは含まれていません</b>。<b>お手持ちの</b>ゲームのファイルをご自身のコンピューター上で読み書きするだけで、保護技術の回避は一切行いません。正規に購入したコピーでのみ使用してください。共有する MOD はご自身の責任で扱い、共有するのはご自身の変更のみとし、ゲーム本体を再配布しないでください。</p>
+            <p class="g-ja">リフトストーンは MIT ライセンスで公開されています。表示用フォント Riftstone Blade は SIL Open Font License 1.1 です。全文は <span class="mono">LICENSE</span> と <span class="mono">THIRD-PARTY-NOTICES.md</span> にあります。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <footer class="statusbar">
+    <span id="ddostatus"><span class="dot"></span>DDON local: <span id="ddostate">not on this PC</span></span>
+    <span class="grow"></span>
+    <span id="gamedir"></span>
+    <span class="sep"></span>
+    <a class="tiplink" href="https://ko-fi.com/nryquellts" target="_blank" rel="noopener noreferrer" title="Support NryQ's open-source tools on Ko-fi"><svg><use href="#i-coffee"/></svg>Support NryQ</a>
+    <span class="sep"></span>
+    <details id="logbox"><summary>Activity</summary><div class="card logpop"><div class="log" id="log"></div></div></details>
+  </footer>
+</div>
+<div class="toasts" id="toasts"></div>
+<div class="modal" id="modal"><div class="card"><div class="mhead"><div class="grow h2" id="modaltitle" style="margin: 0"></div><button class="btn small ghost" id="modalclose">Close</button></div><pre class="code" id="modalbody" style="overflow: auto"></pre></div></div>
+
+<script>
+"use strict";
+const TOKEN = "__RIFTSTONE_TOKEN__";
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const human = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(1) + " MB";
+let S = { state: null, sel: null, type: "", mods: [], editing: null, dirty: false, lastText: "", lotSel: null, dest: {} };
+
+async function api(path, body) {
+  const opt = { method: body ? "POST" : "GET", headers: { "X-Riftstone-Token": TOKEN } };
+  if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const r = await fetch("/api/" + path, opt);
+  const j = await r.json().catch(() => ({ error: "bad response" }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function toast(msg, kind = "ok", ms = 5200) {
+  const t = document.createElement("div");
+  t.className = "toast " + kind; t.textContent = msg;
+  $("#toasts").appendChild(t); setTimeout(() => t.remove(), ms);
+}
+async function busy(btn, fn) {
+  const html = btn.innerHTML; btn.disabled = true; btn.innerHTML = '<span class="spin"></span>' + html;
+  try { return await fn(); } catch (e) { toast(e.message, "bad", 9000); }
+  finally { if (btn.querySelector(".spin")) { btn.innerHTML = html; btn.disabled = false; } }  // unless the action re-rendered it
+}
+
+/* ---------- tabs ---------- */
+function go(view) {
+  const b = document.querySelector(`.tab[data-view="${view}"]`);
+  if (b) b.click();
+}
+document.querySelectorAll(".tab").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x === b));
+  document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + b.dataset.view));
+  try { sessionStorage.setItem("riftstone.view", b.dataset.view); } catch (e) {}
+  if (b.dataset.view === "world") worldOpen().then(() => { if (W.st) drawWorld(); });
+  if (b.dataset.view === "skins") { skinsOpen(); monstersOpen(); }
+  if (b.dataset.view === "mods") libraryOpen();
+  if (b.dataset.view === "game") renderLive();
+});
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-go]");
+  if (t) { e.preventDefault(); go(t.dataset.go); }
+});
+
+/* ---------- guide: topic tabs + language toggle ---------- */
+document.querySelectorAll(".gtab").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".gtab").forEach(x => x.classList.toggle("active", x === b));
+  document.querySelectorAll(".gtopic").forEach(t => t.classList.toggle("active", t.id === "g-" + b.dataset.topic));
+});
+document.querySelectorAll(".langbtn").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".langbtn").forEach(x => x.classList.toggle("active", x === b));
+  const g = document.getElementById("guide");
+  g.classList.toggle("lang-en", b.dataset.lang === "en");
+  g.classList.toggle("lang-ja", b.dataset.lang === "ja");
+  try { localStorage.setItem("riftstone.lang", b.dataset.lang); } catch (e) {}
+});
+try {
+  const savedLang = localStorage.getItem("riftstone.lang");
+  if (savedLang === "ja") document.querySelector('.langbtn[data-lang="ja"]').click();
+} catch (e) {}
+
+/* ---------- state ---------- */
+function pill(kind, label, value) { return `<span class="pill ${kind}"><span class="dot"></span>${esc(label)}${value ? " <b>" + esc(value) + "</b>" : ""}</span>`; }
+async function refresh() {
+  let st;
+  try { st = await api("state"); } catch (e) { return; }
+  S.state = st; S.mods = st.mods;
+  const g = st.game, ix = st.index;
+  let p = "";
+  if (!g) p += pill("bad", "Game not found");
+  else {
+    p += pill(g.build_verified ? "ok" : "warn", "Build", g.build_verified ? String(g.build).replace(/\D+/g, "") : "unverified");
+    if (g.loader_supported) p += pill(g.loader ? "ok" : "", "Loader", g.loader ? (g.loader_version.installed || "on") : "off");
+    p += pill(g.running ? "ok" : "", "Game", g.running ? "running" : "closed");
+  }
+  if (!ix.ready) p += pill(ix.error ? "bad" : "warn", "Index", ix.error ? "failed" : `${ix.done}/${ix.total || "…"}`);
+  // Re-render only what changed, so a click never lands on an element being replaced.
+  const changed = (key, value) => { const j = JSON.stringify(value); if (S["sig_" + key] === j) return false; S["sig_" + key] = j; return true; };
+  if (changed("pills", p)) $("#pills").innerHTML = p;
+  if (changed("games", st.games)) renderSwitch(st.games || []);
+  $("#modcount").textContent = st.mods.length ? String(st.mods.length) : "";
+  $("#ver").textContent = "v" + st.version;
+  if (changed("mods", [st.mods, g && g.plugins, g && g.loader_version, g && g.kind])) { renderHome(); renderMods(); }
+  if (changed("game", st.game)) renderGame();
+  if (changed("status", [st.ddo_server, g && g.root, g && g.kind, g && g.running])) { renderStatus(st); renderHome(); }
+  if (changed("log", st.activity)) renderLog(st.activity);
+  if (ix.ready && !S.typesLoaded) loadTypes();
+  if (!ix.ready) renderIndexing(ix);
+}
+function renderIndexing(ix) {
+  if ($("#q").value) return;
+  const pct = ix.total ? Math.round(100 * ix.done / ix.total) : 0;
+  $("#results").innerHTML = `<div class="empty"><div class="big">Reading the game's archives</div>Riftstone indexes every resource once (about half a minute); after that search is instant.<div class="progress" style="max-width: 360px; margin: 16px auto 0"><div style="width: ${pct}%"></div></div></div>`;
+}
+function renderLog(items) {
+  $("#log").innerHTML = items.slice().reverse().map(a => `<div class="${a.level}">${esc(a.t)}  ${esc(a.msg)}</div>`).join("") || '<div class="muted">Nothing yet.</div>';
+}
+
+/* ---------- explore ---------- */
+const CAT = ext => /^(statusparam|shl|fsm|lvl|joblvl|stm|ajp|eap|sap|prp|rst|plexp|pjp|cnsshake|ablparam|pldefendparam|aiplactparam|itemlv|ssq|gop|prt|lcm|cql|cpl|sce|stp|ltg|mlm|qr|shp|smx|ik|rpn|rpi|oba|wfp|sds|srd)$/.test(ext) ? "param"
+  : /^(mod|mrl|sbc|ocl|ccl|ctc|chn|rbd|dwm|jex)$/.test(ext) ? "model" : /^(tex|rtex|gui|gfd)$/.test(ext) ? "tex"
+  : /^(lmt|fca|rdd)$/.test(ext) ? "motion" : /^(efl|epv|ean|efs|e2d|sdl)$/.test(ext) ? "fx" : "";
+async function loadTypes() {
+  S.typesLoaded = true;
+  try {
+    const t = await api("types");
+    const pick = ["statusparam", "shl", "fsm", "ajp", "eap", "prp", "stm", "mod", "tex", "lmt", "efl", "gmd"];
+    const have = new Set(t.types.map(x => x.ext));
+    $("#chips").innerHTML = `<button class="chip on" data-t="">All</button>` + pick.filter(x => have.has(x)).map(x => `<button class="chip" data-t="${x}">.${x}</button>`).join("");
+    document.querySelectorAll(".chip").forEach(c => c.onclick = () => { S.type = c.dataset.t; document.querySelectorAll(".chip").forEach(x => x.classList.toggle("on", x === c)); search(); });
+    const total = t.types.reduce((a, x) => a + x.count, 0);
+    if (!$("#q").value) $("#results").innerHTML = `<div class="empty"><div class="big">${total.toLocaleString()} resources, one search box</div>Type part of a name or an extension (<span class="mono">shl</span>, <span class="mono">em0100.shl</span>). Parameter files (green) open as editable YAML.</div>`;
+  } catch (e) { S.typesLoaded = false; }
+}
+let searchTimer = 0, searchSeq = 0;
+$("#q").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(search, 180); });
+async function search() {
+  const q = $("#q").value.trim();
+  if (!q && !S.type) { $("#results").innerHTML = ""; return; }
+  const seq = ++searchSeq;
+  try {
+    const r = await api(`search?q=${encodeURIComponent(q)}&type=${encodeURIComponent(S.type)}&limit=300`);
+    if (seq !== searchSeq) return;
+    if (!r.results.length) { $("#results").innerHTML = `<div class="empty"><div class="big">Nothing matches</div>Try a shorter piece of the name.</div>`; return; }
+    $("#results").innerHTML = r.results.map((x, i) => {
+      const parts = x.path.split("/"); const last = parts.pop();
+      const cat = CAT(x.ext);
+      return `<div class="res" data-i="${i}"><div class="ico ${cat}">${esc(x.ext.slice(0, 4))}</div>
+        <div style="min-width: 0"><div class="path">${esc(parts.join("/"))}${parts.length ? "/" : ""}<b>${esc(last)}</b></div>
+        <div class="sub">${esc(x.class)} ${x.yaml ? '<span class="badge yaml">YAML</span>' : ""}</div></div>
+        <div class="meta">${human(x.size)}<br>${x.archives} archive${x.archives === 1 ? "" : "s"}</div></div>`;
+    }).join("");
+    document.querySelectorAll(".res").forEach(el => el.onclick = () => { document.querySelectorAll(".res").forEach(x => x.classList.toggle("sel", x === el)); openResource(r.results[+el.dataset.i]); });
+  } catch (e) { $("#results").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+async function openResource(x) {
+  S.sel = x;
+  const d = $("#drawer");
+  d.innerHTML = `<div class="head"><div class="title">${esc(x.path)}</div><div class="empty" style="padding: 20px">Loading…</div></div>`;
+  try {
+    const r = await api("resource?path=" + encodeURIComponent(x.path));
+    if (S.sel !== x) return;
+    const kind = S.state && S.state.game && S.state.game.kind;
+    const mods = S.mods.filter(m => !m.error && (!m.game || !kind || m.game === kind));
+    const arcs = r.archives.slice(0, 8).map(a => `<div>${esc(a)}</div>`).join("") + (r.archives.length > 8 ? `<div class="muted">+${r.archives.length - 8} more</div>` : "");
+    d.innerHTML = `<div class="head"><div class="title">${esc(r.path)}</div>
+      <dl class="kv"><dt>Class</dt><dd>${esc(r.class)} ${r.yaml ? '<span class="badge yaml">editable YAML</span>' : ""}</dd>
+      <dt>Size</dt><dd>${human(r.size)}${r.objects ? " · " + r.objects + " objects" : ""}</dd>
+      <dt>Archives</dt><dd class="mono">${arcs}</dd></dl></div>
+      <div class="actions row">${mods.length ? `<select id="addto">${mods.map(m => `<option>${esc(m.name)}</option>`).join("")}</select>
+        <button class="btn primary small" id="addbtn">Add to mod</button>` : `<span class="sub">Create a mod on the Mods tab to edit this.</span>`}
+        <span class="sub grow">${r.archives.length > 1 ? "Applies to all " + r.archives.length + " archives." : ""}</span></div>
+      ${portRow(r)}
+      ${r.view ? `<div class="actions row"><button class="btn small primary" id="v-read">Readable</button><button class="btn small" id="v-yaml">YAML</button>
+        <span class="sub grow">State machine: states, actions and conditions. Ids match the YAML.</span></div>` : ""}
+      <div class="lotmap" id="pvmap" hidden></div>
+      <div class="preview" id="pv">${r.view ? `<pre class="code">${esc(r.view)}</pre>` : r.yaml ? `<pre class="code">${highlight(r.yaml)}</pre>` : `<div class="empty">Binary resource (magic <span class="mono">${esc(r.magic)}</span>).<br>Add it to a mod to replace it with your own file.</div>`}</div>`;
+    if (r.yaml && /^riftstone: lot\//m.test(r.yaml.slice(0, 4096))) renderLotMap($("#pvmap"), r.yaml, null, 250);
+    if (r.view) {
+      const show = (readable) => {
+        $("#pv").innerHTML = readable ? `<pre class="code">${esc(r.view)}</pre>` : `<pre class="code">${highlight(r.yaml)}</pre>`;
+        $("#v-read").classList.toggle("primary", readable); $("#v-yaml").classList.toggle("primary", !readable);
+      };
+      $("#v-read").onclick = () => show(true); $("#v-yaml").onclick = () => show(false);
+    }
+    const nb = $("#portnewbtn");
+    if (nb) nb.onclick = () => busy(nb, async () => {
+      const name = $("#portnew").value.trim();
+      if (!name) { toast("Give the mod a name", "bad"); return; }
+      await api("mods/new", { name, game: nb.dataset.kind });
+      toast(`Created ${name}`); await refresh(); openResource(S.sel);
+    });
+    const pb = $("#portbtn");
+    if (pb) pb.onclick = () => busy(pb, async () => {
+      const mod = $("#portto").value, as = $("#portas").value.trim();
+      const res = await api("port", { mod, path: r.path, as: as || null });
+      $("#modaltitle").textContent = `Ported into ${mod}`;
+      $("#modalbody").textContent = res.files.map(f => "+ " + f).join("\n") + "\n\n" + res.notes.join("\n")
+        + "\n\nStructure checked; how it looks in game is UNKNOWN until you play it.";
+      $("#modal").classList.add("open"); await refresh();
+    });
+    const b = $("#addbtn");
+    if (b) b.onclick = () => busy(b, async () => {
+      const mod = $("#addto").value;
+      const res = await api("mods/extract", { mod, path: r.path });
+      toast(`Added to ${mod}: ${res.file}`); await refresh();
+      if (res.file.endsWith(".yaml")) { $('.tab[data-view="mods"]').click(); openEditor(mod, res.file); }
+    });
+  } catch (e) { d.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+
+/* ---------- YAML highlighting ---------- */
+function highlight(text) {
+  return text.split("\n").map(line => {
+    const m = line.match(/^(\s*)(- )?("(?:[^"\\]|\\.)*"|[^:#][^:]*?)(:)( .*)?$/);
+    if (/^\s*#/.test(line)) return `<span class="c">${esc(line)}</span>`;
+    if (m && !/^\s*- \[/.test(line)) {
+      const [, ind, dash, key, colon, rest] = m;
+      const isClass = key.trim() === "_class";
+      return esc(ind) + (dash ? '<span class="p">- </span>' : "") + `<span class="${isClass ? "cls" : "k"}">${esc(key)}</span><span class="p">${colon}</span>` + (rest ? value(rest, isClass) : "");
+    }
+    const d = line.match(/^(\s*)(- )(.*)$/);
+    if (d) return esc(d[1]) + '<span class="p">- </span>' + value(d[3], false);
+    return esc(line);
+  }).join("\n");
+}
+function value(v, isClass) {
+  if (isClass) return `<span class="cls">${esc(v)}</span>`;
+  return esc(v).replace(/(&quot;(?:[^&]|&(?!quot;))*?&quot;)|(\b(?:true|false|null)\b)|(-?\b\d+(?:\.\d+)?(?:e-?\d+)?\b|\.inf|\.nan|nan:0x[0-9a-f]+)|(#.*$)/gi,
+    (all, s, b, n, c) => s ? `<span class="s">${s}</span>` : b ? `<span class="b">${b}</span>` : n ? `<span class="n">${n}</span>` : `<span class="c">${c}</span>`);
+}
+
+/* ---------- mods: the library (the loader, its plugins, your mods) and the inspector ---------- */
+const L = { plugins: null, loader: null, peak: null, supported: false, sel: null, tab: "overview", q: "" };
+// The settings worth a control of their own on a plugin's overview; every key is on its Settings tab too.
+const QUICK = {
+  enemy_cap: [["enemy_cap", "slots", "Slot limit", "stepper", 10, 64, 1, "Enemies active at once. The game's own limit is 10; more cost CPU for their AI in big fights."]],
+  lod_tuner: [["lod", "Enabled", "Tuning", "switch", 0, 0, 0, "Off keeps the game's own distances."],
+              ["lod", "PopPixels", "Full detail until", "stepper", 0, 256, 4, "Scenery keeps full detail until it is about this many pixels tall on screen."]],
+  inclination_lock: [["lock", "Mode", "Mode", "choice", ["freeze", "commands", "off"], 0, 0, "freeze: your main pawn's inclinations never drift. commands: only the Go!/Help!/Come! orders stop moving them."]],
+  save_backup: [["backup", "Enabled", "Copies", "switch", 0, 0, 0, "Copies your save while you play."],
+                ["backup", "Keep", "Newest kept", "stepper", 1, 200, 1, "How many of the newest copies to keep (512 KB each)."]],
+  free_sprint: [["sprint", "Mode", "Free sprinting", "choice", ["out_of_battle", "always", "off"], 0, 0, "out_of_battle: sprinting costs no stamina while the game is not in battle, and what it always did in battle. always: it never costs stamina."],
+                ["sprint", "Who", "For", "choice", ["party", "arisen"], 0, 0, "party: you and your pawns. arisen: only you."]],
+  draw_distance: [["draw", "Enabled", "Distances", "switch", 0, 0, 0, "Off keeps the game's own distances."],
+                  ["draw", "Objects", "Objects", "stepper", 0, 20, 1, "Overworld objects (props, doors, chests, gathering spots) show and move within 25 m (small) or 1 km (large) times this, at any View Range. 3 is FARTHEST's; 0 the game's."],
+                  ["draw", "Grass", "Grass", "stepper", 0, 3, 1, "Grass fades out at 70 m times this. 3 is FARTHEST's and the most on offer; 0 the game's."]],
+  six_skill_warrior: [["warrior", "Mode", "Warrior skills", "choice", ["six", "off"], 0, 0, "six: a Warrior (you or a pawn) equips six skills like a staff; the second row fires with the secondary-weapon skill button. off: the game's three."]],
+  loader: [["fps", "max_fps", "Frame-rate limit", "stepper", 0, 360, 5, "The options menu's Variable frame rate becomes this many fps (0: the game's 150)."],
+           ["render", "shadow_map_size", "Sun shadows", "choice", ["0", "2048", "4096", "8192"], 0, 0, "Shadow map size with ShadowQuality HIGH (0: the game's 2048). Bigger is sharper and costs video memory."],
+           ["overlay", "key", "Diagnostics panel key", "choice", ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"], 0, 0, "Shows and hides the in-game panel."],
+           ["window", "borderless", "Borderless window", "switch", 0, 0, 0, "With the game set to windowed: no frame, covering the monitor."],
+           ["window", "background_run", "Keep running when alt-tabbed", "switch", 0, 0, 0, "Windowed or borderless only."]],
+};
+const kindName = k => k === "ddo" ? "DDON" : "DDDA";
+function modOther(m) { const g = S.state && S.state.game; return !!(m.game && g && m.game !== g.kind); }
+function installedMods() { return S.mods.filter(m => m.enabled && !m.error && !modOther(m)).map(m => m.name); }
+function enabledNames() { return installedMods(); }
+async function libraryOpen() {
+  const g = S.state && S.state.game;
+  if (g && g.loader_supported) {
+    try { const r = await api("plugins"); L.plugins = r.plugins; L.loader = r.loader; L.peak = r.enemy_peak; L.supported = r.supported; }
+    catch (e) { L.plugins = []; L.loader = null; }
+  } else { L.plugins = []; L.loader = null; L.supported = false; }
+  renderMods();
+}
+function libItems() {
+  const g = S.state && S.state.game, out = [];
+  if (g && g.loader_supported) {
+    const v = g.loader_version || {};
+    out.push({ key: "loader", kind: "loader", label: "Riftstone loader", group: g.loader ? "installed" : "available",
+               state: g.loader ? (v.installed && v.available && v.installed !== v.available ? "UPDATE" : "ACTIVE") : "OFF" });
+  }
+  for (const p of L.plugins || []) {
+    const state = !p.installed ? "AVAILABLE" : !p.enabled ? "OFF" : p.live === "failed" ? "FAILED" : p.update ? "UPDATE" : "ACTIVE";
+    out.push({ key: "p:" + p.name, kind: "plugin", label: p.name, title: p.title, group: p.installed ? "installed" : "available", state, p });
+  }
+  for (const m of S.mods) {
+    const state = m.error ? "ERROR" : modOther(m) ? kindName(m.game) : m.enabled ? "ACTIVE" : "OFF";
+    out.push({ key: "m:" + m.name, kind: "mod", label: m.title || m.name, group: modOther(m) ? "other" : m.enabled ? "installed" : "available", state, m });
+  }
+  return out;
+}
+function renderMods() {
+  const items = libItems(), q = ($("#libq").value || "").trim().toLowerCase();
+  const pick = it => !q || (it.label + " " + (it.title || "") + " " + it.kind).toLowerCase().includes(q);
+  const other = S.state && S.state.game ? (S.state.game.kind === "ddo" ? "Dark Arisen" : "Online") : "the other game";
+  const groups = [["installed", "Installed"], ["available", "Available"], ["other", `For ${other}`]];
+  const row = it => `<div class="librow ${L.sel === it.key ? "sel" : ""}" data-key="${esc(it.key)}" title="${esc(it.title || it.label)}">
+      <span class="lname">${esc(it.label)}</span><span class="lkind">${it.kind === "mod" ? "MOD" : it.kind === "loader" ? "CORE" : ""}</span>
+      <span class="lstate ${/OFF|AVAILABLE/.test(it.state) ? "off" : /FAILED|ERROR/.test(it.state) ? "bad" : ""}">${it.state}</span></div>`;
+  const open = JSON.parse(sessionStorage.getItem("riftstone.libopen") || '{"installed":true,"available":true}');
+  $("#library").innerHTML = groups.map(([k, t]) => {
+    const rows = items.filter(it => it.group === k && pick(it));
+    if (!rows.length && k === "other") return "";
+    return `<details class="libgroup" data-g="${k}" ${open[k] !== false ? "open" : ""}><summary>${t}<span class="n">${rows.length}</span></summary>
+      ${rows.map(row).join("") || `<div class="sub" style="padding: 4px 22px 10px 34px">${q ? "Nothing matches." : k === "installed" ? "Nothing installed yet." : "Nothing more here."}</div>`}</details>`;
+  }).join("");
+  $("#library").querySelectorAll(".libgroup").forEach(d => d.ontoggle = () => {
+    const o = JSON.parse(sessionStorage.getItem("riftstone.libopen") || "{}"); o[d.dataset.g] = d.open;
+    try { sessionStorage.setItem("riftstone.libopen", JSON.stringify(o)); } catch (e) {}
+  });
+  $("#library").querySelectorAll(".librow").forEach(el => el.onclick = () => { L.sel = el.dataset.key; L.tab = "overview"; renderMods(); });
+  if (!L.sel && items.length) L.sel = (items.find(it => it.group === "installed") || items[0]).key;
+  renderInspector(items.find(it => it.key === L.sel));
+  updateInstallBar();
+}
+$("#libq").addEventListener("input", renderMods);
+function updateInstallBar() {
+  const inst = installedMods(), b = $("#installbtn");
+  const plugins = (S.state && S.state.game && S.state.game.plugins || []).filter(p => p.enabled).length;
+  $("#enabledline").textContent = (inst.length ? `${inst.length} mod${inst.length === 1 ? "" : "s"} installed: ${inst.join(", ")}` : "No mods installed")
+    + (S.state && S.state.game && S.state.game.loader_supported ? ` · ${plugins} plugin${plugins === 1 ? "" : "s"} on` : "");
+  b.textContent = inst.length ? "Rebuild & reinstall" : "Nothing to install"; b.disabled = !inst.length; b.className = "btn primary";
+}
+$("#create").onclick = () => busy($("#create"), async () => {
+  const name = $("#newmod").value.trim(); if (!name) { toast("Give the mod a name first", "warn"); return; }
+  await api("mods/new", { name }); $("#newmod").value = ""; toast(`Created ${name}`); L.sel = "m:" + name; await refresh();
+});
+$("#newmod").addEventListener("keydown", e => { if (e.key === "Enter") $("#create").click(); });
+async function installSet(mods, what) {
+  const r = await api("install", { mods });
+  let msg = what || r.message;
+  if (r.conflicts && r.conflicts.length) msg += `\n${r.conflicts.length} clash(es): the later mod wins - ` + r.conflicts.slice(0, 3).map(c => `${c.resource} (${c.winner} over ${c.loser})`).join(", ");
+  toast(msg, r.conflicts && r.conflicts.length ? "warn" : "ok", 8000); await refresh();
+}
+async function installEnabled() { await installSet(installedMods()); }
+$("#installbtn").onclick = () => busy($("#installbtn"), () => installEnabled());
+
+function settingOf(list, section, key) {
+  return (list || []).find(s => s.section.toLowerCase() === section.toLowerCase() && s.key.toLowerCase() === key.toLowerCase());
+}
+function quickControl(owner, list, q, i) {
+  const [section, key, label, kind, a, b, step, help] = q, cur = settingOf(list, section, key);
+  if (!cur) return "";
+  const id = `q-${i}`;
+  let ctl;
+  if (kind === "stepper") ctl = `<span class="stepper"><button data-step="-${step}" data-for="${id}">&minus;</button><input id="${id}" value="${esc(cur.value)}" inputmode="numeric"><button data-step="${step}" data-for="${id}">+</button></span>`;
+  else if (kind === "switch") ctl = `<label class="switch"><input type="checkbox" id="${id}" ${cur.value === "1" ? "checked" : ""}><span></span></label>`;
+  else ctl = `<select id="${id}">${a.map(o => `<option ${String(o).toLowerCase() === String(cur.value).toLowerCase() ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+  return `<div class="setting" data-q="${i}"><div class="skey">${esc(label)}<small>${esc(section)} / ${esc(cur.key)}</small></div><div>${ctl}</div>
+    <button class="btn small" data-save="${i}" data-owner="${esc(owner)}" data-sec="${esc(section)}" data-key="${esc(cur.key)}" data-kind="${kind}" data-lo="${a}" data-hi="${b}">Save change</button>
+    <div class="help">${esc(help)}</div></div>`;
+}
+function wireSettings(box) {
+  box.querySelectorAll("[data-step]").forEach(btn => btn.onclick = () => {
+    const inp = $("#" + btn.dataset.for), n = parseFloat(inp.value) || 0;
+    inp.value = String(Math.round((n + parseFloat(btn.dataset.step)) * 100) / 100);
+  });
+  box.querySelectorAll("[data-save]").forEach(btn => btn.onclick = () => busy(btn, async () => {
+    const i = btn.dataset.save, inp = box.querySelector(`#q-${i}, #s-${i}`);
+    const value = inp.type === "checkbox" ? (inp.checked ? "1" : "0") : inp.value.trim();
+    const r = await api("plugins/set", { name: btn.dataset.owner, section: btn.dataset.sec, key: btn.dataset.key, value });
+    toast(`${btn.dataset.owner}: ${r.key} = ${r.value}. Changes apply on the next game start.`);
+    await libraryOpen();
+  }));
+}
+function allSettings(owner, list) {
+  if (!list || !list.length) return `<div class="empty">No settings file.</div>`;
+  let sec = null;
+  return list.map((s, i) => {
+    const head = s.section !== sec ? `<div class="h2" style="margin: 22px 0 4px">[${esc(sec = s.section)}]</div>` : "";
+    return head + `<div class="setting"><div class="skey">${esc(s.key)}</div><div><input class="input" id="s-${i}" value="${esc(s.value)}"></div>
+      <button class="btn small" data-save="${i}" data-owner="${esc(owner)}" data-sec="${esc(s.section)}" data-key="${esc(s.key)}">Save</button>
+      ${s.help ? `<div class="help">${esc(s.help)}</div>` : ""}</div>`;
+  }).join("");
+}
+function subtabs(tabs) {
+  return `<div class="subtabs">${tabs.map(([k, t]) => `<button class="subtab ${L.tab === k ? "active" : ""}" data-tab="${k}">${t}</button>`).join("")}</div>`;
+}
+function renderInspector(it) {
+  const box = $("#inspector"), g = S.state && S.state.game;
+  if (!it) { box.innerHTML = `<div class="empty"><div class="big">Nothing here yet</div>${g ? "Create a mod below the library, or install the loader on the Diagnostics tab." : "Riftstone did not find the game."}</div>`; return; }
+  let html = "";
+  if (it.kind === "mod") {
+    const m = it.m, inst = m.enabled, other = modOther(m);
+    html = `<div class="ititle">${esc(m.title || m.name)}</div><div class="isub">${esc(m.description || "A mod project: files at engine paths, built into the game's archives when installed.")}</div>
+      ${subtabs([["overview", "Overview"]])}
+      <dl class="kvg">
+        <dt>State</dt><dd class="${inst ? "" : "off"}">${m.error ? "ERROR" : inst ? "INSTALLED" : "NOT INSTALLED"}</dd>
+        <dt>Game</dt><dd class="plain">${m.game === "ddo" ? "Dragon's Dogma Online" : "Dragon's Dogma: Dark Arisen"}${other ? " (switch game at the top to install it)" : ""}</dd>
+        <dt>Version</dt><dd class="plain">${esc(m.version || "-")}${m.author ? " · " + esc(m.author) : ""}</dd>
+        <dt>Files</dt><dd class="plain">${m.files.length} file${m.files.length === 1 ? "" : "s"}</dd>
+      </dl>
+      ${m.error ? `<div class="status bad">${esc(m.error)}</div>` : ""}
+      <div class="hr"></div>
+      <div class="row">
+        ${other || m.error ? "" : inst ? `<button class="btn" id="m-remove">Remove from the game</button>` : `<button class="btn primary" id="m-install">Install</button>`}
+        <button class="btn" id="m-files" ${m.error ? "disabled" : ""}>Files</button>
+        <button class="btn ghost" id="m-folder">Open folder</button>
+      </div>`;
+    box.innerHTML = html;
+    const ins = $("#m-install"), rem = $("#m-remove");
+    if (ins) ins.onclick = () => busy(ins, () => installSet([...new Set([...installedMods(), m.name])], `Installed ${m.name}`));
+    if (rem) rem.onclick = () => busy(rem, () => installSet(installedMods().filter(n => n !== m.name), `Removed ${m.name} from the game`));
+    $("#m-files").onclick = () => openFiles(m.name);
+    $("#m-folder").onclick = () => api("open", { mod: m.name }).catch(e => toast(e.message, "bad"));
+    return;
+  }
+  const isLoader = it.kind === "loader", p = it.p || {}, owner = isLoader ? "loader" : p.name;
+  const settings = isLoader ? (L.loader && L.loader.settings) : p.settings;
+  const tabs = isLoader ? [["overview", "Overview"], ["settings", "Settings"]] : [["overview", "Overview"], ["settings", "Settings"], ["log", "Log"]];
+  if (!tabs.some(t => t[0] === L.tab)) L.tab = "overview";
+  const title = isLoader ? "Riftstone loader" : (p.title || p.name), sub = isLoader
+    ? "Serves your mods without touching the game's files, loads the plugins, draws the F10 diagnostics panel and explains crashes."
+    : (p.summary || "A native plugin the loader loads when the game starts.");
+  html = `<div class="ititle">${esc(title)}</div><div class="isub">${esc(sub)}</div>${subtabs(tabs)}`;
+  if (L.tab === "overview") {
+    if (isLoader) {
+      const v = (g && g.loader_version) || {};
+      const outdated = g.loader && v.installed && v.available && v.installed !== v.available;
+      html += `<dl class="kvg">
+        <dt>State</dt><dd class="${g.loader ? "" : "off"}">${g.loader ? "INSTALLED" : "NOT INSTALLED"}</dd>
+        <dt>Installed version</dt><dd>${esc(v.installed || "-")}</dd>
+        <dt>This Riftstone has</dt><dd>${esc(v.available || "not built")}</dd>
+        <dt>Mods are served from</dt><dd class="plain">${g.mode === "overlay" ? "riftstone\\overlay (the game's files stay untouched)" : "the game's folder, originals kept"}</dd></dl>
+        <div class="hr"></div>
+        <div class="row">${!g.loader ? `<button class="btn primary" id="l-install">Install loader</button>`
+          : outdated ? `<button class="btn primary" id="l-install">Update to ${esc(v.available)}</button>` : ""}
+          ${g.loader ? `<button class="btn ghost" id="l-remove">Remove loader</button>` : ""}
+          <span class="sub grow">${g.running ? "Close the game first: the loader starts with it." : "Your settings are kept on update."}</span></div>`;
+    } else {
+      const live = p.live ? p.live.toUpperCase() : null;
+      html += `<dl class="kvg">
+        <dt>Plugin state</dt><dd class="${p.installed && p.enabled ? "" : "off"}">${!p.installed ? "NOT INSTALLED" : p.enabled ? "ENABLED" : "OFF"}</dd>
+        <dt>In the running game</dt><dd class="${live === "LOADED" ? "" : "off"}">${live || (g && g.running ? "NOT LOADED" : "GAME CLOSED")}</dd>`;
+      if (p.name === "enemy_cap") {
+        const lv = S.live || {};
+        html += `<dt>Active slots</dt><dd>${lv.running && lv.enemies_active != null ? `${lv.enemies_active} / ${lv.enemy_slots != null ? lv.enemy_slots : "?"}` : "UNKNOWN"}</dd>
+          <dt>Peak occupancy</dt><dd>${lv.enemy_peak != null ? lv.enemy_peak : L.peak != null ? L.peak + " (last session)" : "UNKNOWN"}</dd>`;
+      }
+      html += `<dt>File</dt><dd class="plain mono">${esc(p.file)}${p.update ? " · a newer build is here" : ""}</dd></dl><div class="hr"></div>`;
+      html += (QUICK[p.name] || []).map((q, i) => quickControl(owner, settings, q, i)).join("");
+      if ((QUICK[p.name] || []).length) html += `<div class="sub" style="margin-top: 10px">Changes apply on the next game start.</div><div class="hr"></div>`;
+      html += `<div class="row">${!p.installed ? `<button class="btn primary" id="p-add">Install plugin</button>`
+        : `<label class="row" style="gap: 10px"><span>On</span><span class="switch"><input type="checkbox" id="p-on" ${p.enabled ? "checked" : ""}><span></span></span></label>
+           ${p.update ? `<button class="btn" id="p-add">Update plugin</button>` : ""}`}
+        <span class="sub grow">${g && g.running ? "Close the game to switch plugins on or off." : "Plugins load once, when the game starts."}</span></div>`;
+    }
+    if (isLoader) html += `<div class="hr"></div>` + (QUICK.loader.map((q, i) => quickControl("loader", settings, q, i)).join("") || "")
+      + `<div class="sub" style="margin-top: 10px">Changes apply on the next game start. Every other setting is on the Settings tab.</div>`;
+  } else if (L.tab === "settings") {
+    html += `<div class="sub">${isLoader ? "riftstone_loader.ini, next to the game" : esc(p.name + ".ini, next to the plugin")}. Comments and layout are kept; the game reads the file when it starts.</div>` + allSettings(owner, settings);
+  } else {
+    html += `<pre class="logview">${esc((p.log || []).join("\n") || "No log yet: the plugin writes riftstone\\logs\\" + p.name + ".log when the game starts.")}</pre>`;
+  }
+  box.innerHTML = html;
+  box.querySelectorAll(".subtab").forEach(b => b.onclick = () => { L.tab = b.dataset.tab; renderInspector(it); });
+  wireSettings(box);
+  const li = $("#l-install"), lr = $("#l-remove"), pa = $("#p-add"), po = $("#p-on");
+  if (li) li.onclick = () => busy(li, async () => { const r = await api("loader", { action: "install" }); toast(r.updated ? "Loader updated; your settings are kept" : "Loader installed" + (r.chained ? `; your previous dinput8.dll is chained as ${r.chained}` : "")); await refresh(); await libraryOpen(); });
+  if (lr) lr.onclick = () => { if (confirm("Remove the loader? Mods move back into the game's folder (originals kept); plugins stop loading.")) busy(lr, async () => { await api("loader", { action: "remove" }); toast("Loader removed"); await refresh(); await libraryOpen(); }); };
+  if (pa) pa.onclick = () => busy(pa, async () => { await api("plugins/add", { name: p.name }); toast(`${p.name} installed; it loads at the next game start`); await refresh(); await libraryOpen(); });
+  if (po) po.onchange = () => busy(po.closest("label"), async () => {
+    try { await api("plugins/toggle", { name: p.name, on: po.checked }); toast(`${p.name} ${po.checked ? "on" : "off"}: from the next game start`); }
+    catch (e) { po.checked = !po.checked; throw e; }
+    await refresh(); await libraryOpen();
+  });
+}
+
+/* ---------- home ---------- */
+function renderHome() {
+  const st = S.state, g = st && st.game;
+  const plugins = (g && g.plugins) || [], installed = S.mods.filter(m => m.enabled && !modOther(m));
+  const rows = [];
+  if (g && g.loader_supported) rows.push(`<div class="padrow" data-go="mods"><svg><use href="#i-plug"/></svg><span>riftstone loader</span>${g.loader ? '<span class="badge on">Active</span>' : '<span class="badge">Not installed</span>'}</div>`);
+  plugins.forEach(p => rows.push(`<div class="padrow" data-go="mods"><svg><use href="#i-plug"/></svg><span>${esc(p.name)}</span>${p.enabled ? '<span class="badge on">Active</span>' : '<span class="badge">Off</span>'}</div>`));
+  installed.forEach(m => rows.push(`<div class="padrow" data-go="mods"><svg><use href="#i-doc"/></svg><span>${esc(m.name)}</span><span class="badge on">Installed</span></div>`));
+  const shown = rows.length > 6 ? 5 : rows.length;
+  $("#homemods").innerHTML = rows.slice(0, shown).join("") + (rows.length > shown ? `<div class="padrow" data-go="mods"><span></span><span class="sub">and ${rows.length - shown} more</span><span class="chev">&rsaquo;</span></div>` : "")
+    || `<div class="padrow" data-go="mods"><svg><use href="#i-doc"/></svg><span class="sub">No plugins or mods installed yet</span><span class="chev">&rsaquo;</span></div>`;
+  const kind = g ? kindName(g.kind) : "";
+  $("#profname").textContent = g ? `${kind} / Default` : "Game not found";
+  const modsLine = `${installed.length} mod${installed.length === 1 ? "" : "s"} installed`;
+  $("#profmeta").textContent = !g ? "start Studio with --game \"C:\\path\\to\\the\\game\""
+    : g.loader_supported ? `${plugins.filter(p => p.enabled).length} active plugins · ${modsLine}`
+    : `${modsLine} · local server ${st.ddo_server && st.ddo_server.running ? "online" : "offline"}`;
+  $("#launchlabel").textContent = g ? (g.running ? `${kind} is running` : `Launch ${kind}`) : "Launch";
+  $("#launchbtn").disabled = !g || g.running;
+}
+$("#launchbtn").onclick = () => busy($("#launchbtn"), async () => {
+  const r = await api("launch", {});
+  toast(r.how === "steam" ? "Starting Dark Arisen through Steam" : "Play Solo starts the local server, then the game");
+  setTimeout(refresh, 2500);
+});
+$("#settingsbtn").onclick = () => {
+  const g = S.state && S.state.game;
+  if (g && g.loader_supported) { L.sel = "loader"; L.tab = "overview"; go("mods"); } else go("game");
+};
+function renderStatus(st) {
+  const d = st.ddo_server;
+  $("#ddostatus").querySelector(".dot").classList.toggle("on", !!(d && d.running));
+  $("#ddostate").textContent = d == null ? "not on this PC" : d.running ? "online" : "offline";
+  const g = st.game;
+  if (g) {
+    const parts = g.root.split(/[\\/]/).filter(Boolean);
+    $("#gamedir").textContent = "Game directory: " + (parts.length > 2 ? "…\\" + parts.slice(-2).join("\\") : g.root);
+    $("#gamedir").title = g.root;
+  } else $("#gamedir").textContent = "Game directory: not found";
+}
+
+/* ---------- layout map (.lot): top-down view of placements, drag to move ---------- */
+function lotPlacements(text) {
+  // reads the layout YAML Riftstone writes: lot/2 records ("  - id:", then class/mName/mPosition/mAngle
+  // lines) and the older lot/1 placements ("  - name:", then position/rotation).  Records without a
+  // position (AI sensor targets) are not drawn, but keep their number so Duplicate/Remove hit the right one.
+  const out = [], lines = text.split("\n"); let cur = null;
+  const num = s => s.replace(/#.*$/, "").split(",").map(v => parseFloat(v));
+  lines.forEach((l, i) => {
+    let m;
+    if ((m = /^  - id: (-?\d+)/.exec(l))) { cur = { n: out.length, id: +m[1], name: "", cls: "", line: -1, pos: null, ry: 0, key: "mPosition" }; out.push(cur); }
+    else if ((m = /^  - name: "(.*)"\s*$/.exec(l))) { cur = { n: out.length, name: m[1], cls: "", line: -1, pos: null, ry: 0, key: "position" }; out.push(cur); }
+    else if (cur && (m = /^    class: (\S+)/.exec(l))) { cur.cls = m[1]; }
+    else if (cur && (m = /^    mName: "(.*)"/.exec(l))) { cur.name = m[1]; }
+    else if (cur && (m = /^    (?:mPosition|position): \[(.*)\]/.exec(l))) { cur.pos = num(m[1]); cur.line = i; }
+    else if (cur && (m = /^    (?:mAngle|rotation): \[(.*)\]/.exec(l))) { cur.ry = num(m[1])[1] || 0; }
+    else if (/^\S/.test(l)) cur = null;
+  });
+  return out.filter(p => p.pos && p.pos.length === 3 && p.pos.every(Number.isFinite));
+}
+function spotKind(p) {
+  if (/^cSetInfoEnemy/.test(p.cls) || (!p.cls && /^em/.test(p.name))) return "";
+  return p.cls === "cSetInfoNpc" ? "npc" : "obj";
+}
+function renderLotMap(box, text, onMove, H = 340) {
+  const ps = lotPlacements(text);
+  if (!ps.length) { box.hidden = true; return; }
+  box.hidden = false;
+  const W = Math.round(box.getBoundingClientRect().width) || 640, pad = 40;
+  let x0 = Math.min(...ps.map(p => p.pos[0])), x1 = Math.max(...ps.map(p => p.pos[0]));
+  let z0 = Math.min(...ps.map(p => p.pos[2])), z1 = Math.max(...ps.map(p => p.pos[2]));
+  const span = Math.max(x1 - x0, z1 - z0, 200), cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+  const k = Math.min(W - 2 * pad, H - 2 * pad) / span;
+  const sx = x => W / 2 + (x - cx) * k, sz = z => H / 2 + (z - cz) * k;
+  const step = Math.pow(10, Math.floor(Math.log10(span / 4)));
+  let grid = "";
+  for (let g = Math.ceil((cx - W / 2 / k) / step) * step; g < cx + W / 2 / k; g += step) grid += `<line class="grid" x1="${sx(g)}" y1="0" x2="${sx(g)}" y2="${H}"/>`;
+  for (let g = Math.ceil((cz - H / 2 / k) / step) * step; g < cz + H / 2 / k; g += step) grid += `<line class="grid" x1="0" y1="${sz(g)}" x2="${W}" y2="${sz(g)}"/>`;
+  const found = onMove && S.lotSel != null ? ps.findIndex(p => p.n === S.lotSel) : -1;
+  const sel = found >= 0 ? found : null;
+  const dots = ps.map((p, i) => {
+    const x = sx(p.pos[0]), y = sz(p.pos[2]), fx = x + Math.sin(p.ry) * 14, fy = y + Math.cos(p.ry) * 14;
+    return `<g data-i="${i}"><line class="face" x1="${x}" y1="${y}" x2="${fx}" y2="${fy}"/>
+      <circle class="spot ${spotKind(p)} ${i === sel ? "sel" : ""}" cx="${x}" cy="${y}" r="7"/>
+      <text x="${x + 10}" y="${y - 8}">${esc(p.name)}</text></g>`;
+  }).join("");
+  const tools = onMove ? `<div class="maptools"><span class="grow">${sel == null ? "Click a placement to select it; drag to move it."
+      : `Selected: <b>${esc(ps[sel].name)}</b> (record ${ps[sel].n}) at x ${ps[sel].pos[0]}, z ${ps[sel].pos[2]}`}</span>
+      <button class="btn small" id="mapdup" ${sel == null ? "disabled" : ""}>Duplicate</button>
+      <button class="btn small" id="maprm" ${sel == null ? "disabled" : ""}>Remove</button></div>` : "";
+  box.innerHTML = `${tools}<svg viewBox="0 0 ${W} ${H}" style="height:${H}px" class="${onMove ? "drag" : ""}">${grid}${dots}</svg>
+    <div class="legend">${ps.length} placement${ps.length === 1 ? "" : "s"} seen from above - red: enemies, green: NPCs and
+    hostile humans, blue: objects - grid ${step.toLocaleString()} units${onMove ? " - drag a dot to move it" : ""}</div>`;
+  if (!onMove) return;
+  if (sel != null) {
+    const p = ps[sel];
+    $("#mapdup").onclick = () => busy($("#mapdup"), () => layoutOp("copy", p.n, [p.pos[0] + 300, p.pos[1], p.pos[2] + 300]));
+    $("#maprm").onclick = () => { if (confirm(`Remove record ${p.n} (${p.name})?`)) busy($("#maprm"), () => layoutOp("remove", p.n)); };
+  }
+  const svg = box.querySelector("svg");
+  svg.querySelectorAll("g[data-i]").forEach(g => {
+    g.addEventListener("pointerdown", e => {
+      const p = ps[+g.dataset.i], start = [e.clientX, e.clientY], scale = svg.getBoundingClientRect().width / W;
+      S.lotSel = p.n;
+      const dot = g.querySelector(".spot"); dot.classList.add("active"); g.setPointerCapture(e.pointerId);
+      const move = ev => {
+        const dx = (ev.clientX - start[0]) / scale / k, dz = (ev.clientY - start[1]) / scale / k;
+        g.setAttribute("transform", `translate(${dx * k} ${dz * k})`);
+        g.dataset.nx = (p.pos[0] + dx).toFixed(3); g.dataset.nz = (p.pos[2] + dz).toFixed(3);
+      };
+      const up = () => {
+        g.removeEventListener("pointermove", move); dot.classList.remove("active");
+        if (g.dataset.nx !== undefined) onMove(p, +g.dataset.nx, +g.dataset.nz);
+        else editorMap();                         // a click: show the selection
+      };
+      g.addEventListener("pointermove", move); g.addEventListener("pointerup", up, { once: true });
+    });
+  });
+}
+function moveInEditor(p, x, z) {
+  const lines = ta.value.split("\n");
+  if (!/^    (?:mPosition|position): \[/.test(lines[p.line] || "")) return;
+  lines[p.line] = `    ${p.key}: [${x}, ${p.pos[1]}, ${z}]`;
+  ta.value = lines.join("\n"); ta.dispatchEvent(new Event("input"));
+  toast(`Moved ${p.name} to x ${x}, z ${z} (save to keep it)`);
+}
+async function layoutOp(op, number, at) {
+  const r = await api("lot", { text: ta.value, op, number, at });
+  ta.value = r.text; ta.dispatchEvent(new Event("input"));
+  S.lotSel = op === "copy" ? r.count - 1 : null;
+  editorMap();
+  toast(op === "copy" ? `Added record ${r.count - 1}, a copy of ${number} - drag it where you want it, then save`
+                      : `Removed record ${number} - save to keep it`);
+}
+let mapTimer = 0;
+function editorMap() {
+  const box = $("#edmap");
+  if (!/^riftstone: lot\//m.test(ta.value.slice(0, 4096))) { box.hidden = true; return; }
+  renderLotMap(box, ta.value, moveInEditor);
+}
+
+/* ---------- world: every stage, its groups and placements on one map; encounters ---------- */
+const W = { stages: null, st: null, show: { e: true, n: true, p: true, t: false, s: false }, hl: null, name: null,
+            sel: null, spot: null, plan: null, view: null, drag: null };
+const WCOLOR = { e: "#00f0ff", n: "#e2e8f0", p: "#8d99a8", t: "#6f8fd6", s: "#3d4452" };
+const WTYPE = { e: "enemies", n: "NPCs & humans", p: "objects", t: "sensor targets", s: "static models" };
+const stName = n => "st" + String(n).padStart(3, "0");
+async function worldOpen() {
+  if (W.stages || W.loading) return;
+  W.loading = true;
+  $("#wstages").innerHTML = `<div class="empty"><div class="big">Mapping the world</div>Reading every group list and layout in your game (a few seconds, once).</div>`;
+  try {
+    const r = await api("world");
+    W.stages = r.stages; W.enemies = r.enemies;
+    const t = r.totals;
+    $("#wtotals").textContent = `${t.stages} stages · ${t.groups.toLocaleString()} groups · ${t.layouts.toLocaleString()} layouts · ${t.placements.toLocaleString()} placements · ${t.enemies} enemies`;
+    $("#wenemylist").innerHTML = r.enemies.map(e => `<option value="${esc(e.id)}">${esc(e.name)} · ${e.placements} placed</option>`).join("");
+    renderStageList();
+  } catch (e) { $("#wstages").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  finally { W.loading = false; }
+}
+function renderStageList() {
+  if (!W.stages) return;
+  const f = $("#wfilter").value.trim().toLowerCase();
+  const hits = W.found ? new Set(W.found.spawns.map(s => s.stage)) : null;
+  const rows = W.stages.filter(s => !f || stName(s.stage).includes(f) || s.rooms.join(" | ").toLowerCase().includes(f));
+  $("#wstages").innerHTML = rows.map(s => `<div class="wst ${W.st && W.st.stage === s.stage ? "sel" : ""} ${hits && hits.has(s.stage) ? "hit" : ""}" data-s="${s.stage}">
+      <div class="row"><b class="mono">${stName(s.stage)}</b><span class="sub grow" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap">${esc(s.rooms.slice(0, 3).join(", "))}${s.rooms.length > 3 ? " …" : ""}</span></div>
+      <div class="sub">${Object.entries(s.groups).map(([t, n]) => `${t} ${n}`).join(" · ") || "no groups"} · ${s.placements.toLocaleString()} placed</div></div>`).join("")
+    || `<div class="empty">No stage matches</div>`;
+  document.querySelectorAll(".wst").forEach(el => el.onclick = () => loadStage(+el.dataset.s));
+}
+$("#wfilter").addEventListener("input", renderStageList);
+$("#wfindbtn").onclick = () => busy($("#wfindbtn"), worldFind);
+$("#wfind").addEventListener("keydown", e => { if (e.key === "Enter") busy($("#wfindbtn"), worldFind); });
+async function worldFind() {
+  const q = $("#wfind").value.trim();
+  if (!q) { W.found = null; W.name = null; $("#wfound").textContent = ""; renderStageList(); if (W.st) drawWorld(); return; }
+  const r = await api("world/enemy?q=" + encodeURIComponent(q));
+  W.found = r; W.name = r.id;
+  const per = {}; r.spawns.forEach(s => per[s.stage] = (per[s.stage] || 0) + s.count);
+  $("#wfound").innerHTML = `<b>${esc(r.id)}</b> ${esc(r.name)}: ${r.placements} placed in ${Object.keys(per).length} stage(s) -- `
+    + Object.entries(per).map(([s, n]) => `<a href="#" data-s="${s}">${stName(s)}</a> ${n}`).join(", ");
+  document.querySelectorAll("#wfound a").forEach(a => a.onclick = ev => { ev.preventDefault(); loadStage(+a.dataset.s); });
+  renderStageList();
+  if (W.st) drawWorld();
+}
+async function loadStage(n) {
+  const r = await api("world/stage?n=" + n);
+  W.st = r; W.hl = null; W.sel = null; W.plan = null; W.spot = null; W.view = null; W.dungeon = null;
+  renderStageList(); renderStage();
+}
+function renderStage() {
+  const r = W.st, counts = {};
+  r.points.forEach(p => { const t = r.layouts[p[3]].type; counts[t] = (counts[t] || 0) + 1; });
+  const eg =r.groups.filter(g => g.type === "e").sort((a, b) => (a.dlc - b.dlc) || (a.number - b.number));
+  const unitName = u => { const x = r.names.find(n => n.id === u); return x && x.name ? x.name : ""; };
+  const story = g => (g.appear[0] || g.appear[1]) ? `scn ${g.appear[0]}..${g.appear[1] || "on"}` : "always";
+  $("#wstage").innerHTML = `<div class="row"><div class="grow"><div class="h2" style="margin: 0">${stName(r.stage)}</div>
+      <div class="sub">${esc(r.rooms.join(", ")) || "no named rooms"}</div></div>
+      <div class="wtoggles">${Object.keys(WTYPE).map(t => `<button class="chip ${W.show[t] ? "on" : ""}" data-t="${t}"><span class="sw" style="background:${WCOLOR[t]}"></span>${WTYPE[t]} ${counts[t] || 0}</button>`).join("")}</div></div>
+    <div class="wdrag"><span class="sub">Drag an enemy onto the map to plan an encounter there:</span>
+      <input class="input" id="wdragq" placeholder="filter: goblin, em0100…" autocomplete="off">
+      <div class="chips" id="wdragchips"></div></div>
+    <div class="wmap"><canvas id="wcanvas"></canvas><div class="wtip" id="wtip"></div>
+      <div class="legend" id="wlegend">Scroll to zoom, drag to pan. Click a dot to see it; click open ground to pick a spot for an encounter.</div></div>
+    <div class="wcols">
+      <div class="wbox"><div class="bh">Enemy groups (${eg.length}; free numbers from ${r.free.length ? r.free[0] : "none"})</div>
+        <div class="wgroups">${eg.map((g, i) => `<div class="wg" data-i="${i}"><div class="num">${g.dlc ? "DLC " : ""}#${g.number}</div>
+          <div>${g.units.map(u => `<span class="mono">${esc(u)}</span> ${esc(unitName(u))}`).join(", ") || '<span class="muted">no units</span>'}
+            <div class="sub">${g.count_max < 0 ? "every placement once" : `<b>${g.count_max}</b> in total`} · respawn ${g.respawn} · ${story(g)}${g.link != null ? ` · after group ${g.link}` : ""}</div></div>
+          <div class="sub">${g.cells.length} cell${g.cells.length === 1 ? "" : "s"}</div></div>`).join("") || '<div class="empty">No enemy groups in this stage.</div>'}</div>
+        <div class="wsel" id="wsel"><span class="muted">Nothing selected.</span></div></div>
+      <div class="wbox"><div class="bh">Encounter: N of an enemy as a new group</div>
+        <div class="wform">
+          <label>Put it in</label><div id="edestbox">${destPicker("edest")}</div>
+          <label>Enemy</label><input class="input" id="eenemy" list="wenemylist" placeholder="goblin, em0100…" value="${esc(W.name || "")}">
+          <label>How many</label><input class="input" id="ecount" type="number" min="1" max="9999" value="100">
+          <label>At once</label><input class="input" id="eonce" type="number" min="1" max="31" value="10" title="spawn points; the game keeps 10 enemies active, the enemy_cap plugin 30">
+          <label>Spacing</label><input class="input" id="espread" type="number" min="1" max="5000" value="250">
+          <label>When</label><select id="estory"><option value="">like the nearby group</option><option value="any">any time</option><option value="pre">before the Dragon</option><option value="post">after the Dragon</option></select>
+          <label>Hours</label><input class="input" id="ehours" placeholder="like the copied group, or 4,19 / 20,3" title="the first and the last whole hour of the day the group exists (20,3 runs past midnight)">
+          <label>Copy group</label><input class="input" id="elike" type="number" min="0" max="294" placeholder="the nearest one" title="the group whose areas, story window and load conditions (e.g. a post-game random set) the new group copies">
+          <label>Skin</label><input class="input" id="eskin" inputmode="numeric" placeholder="none, 1, or 1,2 in turn" title="a skin number from the Skins tab (chimera only), or several the placements wear in turn">
+          <label>Where</label><div class="mono" id="espot">click the map, or a group</div>
+        </div>
+        <div class="row" style="padding: 0 12px 12px"><button class="btn small" id="eplan">Plan</button>
+          <button class="btn small primary" id="ewrite">Write to mod</button>
+          <span class="sub grow">The game's own horde: a spawn cap refilled from the spawn points.</span></div>
+        <div class="wplan" id="eplanout" hidden></div></div>
+      <div class="wbox wide"><div class="bh">Dungeon: a whole mission on this stage</div>
+        <div class="wform">
+          <label>Put it in</label><div id="ddestbox">${destPicker("ddest")}</div>
+          <label>Seed</label><input class="input" id="dseed" type="number" min="0" value="0" title="the same seed gives the same dungeon; another seed, another">
+          <label>Enemies</label><select id="dpool"><option value="stage">this stage's own (and those of stages sharing its ground)</option><option value="game">every walker in the game</option></select>
+          <label>Leave out</label><input class="input" id="dexclude" placeholder="none, or e.g. death, leapworms" title="enemies never to choose">
+          <label>Lot flags</label><label class="check"><input type="checkbox" id="dkeep"> keep the copied groups' lot flags (then an encounter appears only while its flag is set)</label>
+        </div>
+        <div class="row" style="padding: 0 12px 12px"><button class="btn small" id="dplan">Plan</button>
+          <button class="btn small primary" id="dwrite">Write to mod</button>
+          <span class="sub grow">Fights, a horde, a guardian and a boss laid on the stage's walkable ground (its navigation mesh), every spawn point checked. How it plays: UNKNOWN until you try it.</span></div>
+        <div class="wplan" id="dplanout" hidden></div></div>
+    </div>`;
+  document.querySelectorAll(".wtoggles .chip").forEach(c => c.onclick = () => { W.show[c.dataset.t] = !W.show[c.dataset.t]; c.classList.toggle("on", W.show[c.dataset.t]); drawWorld(); });
+  document.querySelectorAll(".wg").forEach(el => el.onclick = () => {
+    const g = eg[+el.dataset.i];
+    document.querySelectorAll(".wg").forEach(x => x.classList.toggle("sel", x === el));
+    W.hl = { type: "e", number: g.number }; W.spot = { group: g.number }; W.plan = null;
+    $("#espot").textContent = `the middle of group ${g.number}`;
+    drawWorld();
+  });
+  $("#eplan").onclick = () => busy($("#eplan"), () => encounterGo(true));
+  $("#ewrite").onclick = () => busy($("#ewrite"), () => encounterGo(false));
+  wireDest("edest");
+  $("#dplan").onclick = () => busy($("#dplan"), () => dungeonGo(true));
+  $("#dwrite").onclick = () => busy($("#dwrite"), () => dungeonGo(false));
+  wireDest("ddest");
+  $("#wdragq").addEventListener("input", renderDragChips); renderDragChips();
+  setupWorldCanvas(); drawWorld();
+}
+function renderDragChips() {
+  const f = ($("#wdragq") ? $("#wdragq").value : "").trim().toLowerCase();
+  const all = (W.enemies || []).filter(e => !f || e.id.toLowerCase().includes(f) || (e.name || "").toLowerCase().includes(f));
+  const here = new Set(W.st ? W.st.names.map(n => n.id) : []);
+  all.sort((a, b) => (here.has(b.id) - here.has(a.id)) || (b.placements - a.placements));
+  $("#wdragchips").innerHTML = all.slice(0, 30).map(e => `<span class="chip drag" draggable="true" data-en="${esc(e.id)}"
+      title="${esc(e.id)} · ${e.placements} placed in the game${here.has(e.id) ? " · already in this stage" : ""}">${esc(e.name || e.id)}</span>`).join("")
+    || `<span class="sub">No enemy matches</span>`;
+  document.querySelectorAll("#wdragchips [data-en]").forEach(el =>
+    el.addEventListener("dragstart", ev => { ev.dataTransfer.setData("text/x-riftstone-enemy", el.dataset.en); ev.dataTransfer.effectAllowed = "copy"; }));
+}
+function worldPoints() {
+  const r = W.st;
+  return r.points.filter(p => W.show[r.layouts[p[3]].type]);
+}
+function fitView() {
+  const pts = W.st.points.filter(p => W.show[W.st.layouts[p[3]].type]);
+  const use = pts.length ? pts : W.st.points;
+  if (!use.length) return { cx: 0, cz: 0, k: 0.01 };
+  const xs = use.map(p => p[0]).sort((a, b) => a - b), zs = use.map(p => p[1]).sort((a, b) => a - b);
+  const q = (a, f) => a[Math.min(a.length - 1, Math.max(0, Math.floor(f * (a.length - 1))))];
+  const x0 = q(xs, .01), x1 = q(xs, .99), z0 = q(zs, .01), z1 = q(zs, .99);
+  const c = $("#wcanvas"), W_ = c.clientWidth, H_ = c.clientHeight;
+  return { cx: (x0 + x1) / 2, cz: (z0 + z1) / 2, k: Math.min((W_ - 60) / Math.max(x1 - x0, 200), (H_ - 60) / Math.max(z1 - z0, 200)) };
+}
+function drawWorld() {
+  const c = $("#wcanvas");
+  if (!c || !W.st) return;
+  const dpr = window.devicePixelRatio || 1, Wd = c.clientWidth, Hd = c.clientHeight;
+  if (!Wd) return;
+  c.width = Wd * dpr; c.height = Hd * dpr;
+  const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (!W.view) W.view = fitView();
+  const v = W.view, sx = x => Wd / 2 + (x - v.cx) * v.k, sz = z => Hd / 2 + (z - v.cz) * v.k;
+  g.clearRect(0, 0, Wd, Hd);
+  const span = Wd / v.k, step = Math.pow(10, Math.floor(Math.log10(span / 5)));
+  g.strokeStyle = "rgba(148,157,175,.08)"; g.lineWidth = 1; g.beginPath();
+  for (let x = Math.ceil((v.cx - Wd / 2 / v.k) / step) * step; x < v.cx + Wd / 2 / v.k; x += step) { g.moveTo(sx(x), 0); g.lineTo(sx(x), Hd); }
+  for (let z = Math.ceil((v.cz - Hd / 2 / v.k) / step) * step; z < v.cz + Hd / 2 / v.k; z += step) { g.moveTo(0, sz(z)); g.lineTo(Wd, sz(z)); }
+  g.stroke();
+  const r = W.st, nameIx = W.name ? r.names.findIndex(n => n.id === W.name) : -1;
+  const pts = worldPoints(), size = Math.max(2.5, Math.min(7, v.k * 80));
+  for (const p of pts) {
+    const lay = r.layouts[p[3]];
+    const on = (!W.hl || (lay.type === W.hl.type && lay.number === W.hl.number)) && (nameIx < 0 || p[5] === nameIx);
+    g.globalAlpha = on ? .9 : .16; g.fillStyle = WCOLOR[lay.type];
+    const x = sx(p[0]), y = sz(p[1]);
+    if (x < -10 || y < -10 || x > Wd + 10 || y > Hd + 10) continue;
+    g.fillRect(x - size / 2, y - size / 2, size, size);
+  }
+  g.globalAlpha = 1;
+  if (W.sel) { g.strokeStyle = "#7ff8ff"; g.lineWidth = 2; g.beginPath(); g.arc(sx(W.sel[0]), sz(W.sel[1]), 8, 0, 7); g.stroke(); }
+  if (W.plan) {
+    g.fillStyle = "#ffffff";
+    for (const s of W.plan.spawn_points) { g.beginPath(); g.arc(sx(s[0]), sz(s[2]), 4.5, 0, 7); g.fill(); }
+  }
+  if (W.spot && W.spot.xyz) {
+    const x = sx(W.spot.xyz[0]), y = sz(W.spot.xyz[2]);
+    g.strokeStyle = "#7ff8ff"; g.lineWidth = 2; g.beginPath(); g.moveTo(x - 9, y); g.lineTo(x + 9, y); g.moveTo(x, y - 9); g.lineTo(x, y + 9); g.stroke();
+  }
+  if (W.dungeon && W.dungeon.stage === r.stage) {       // a planned dungeon: spawn points, doors, numbered places
+    g.fillStyle = "#e2e8f0";
+    for (const b of W.dungeon.beats) for (const s of b.spawn_points) { g.beginPath(); g.arc(sx(s[0]), sz(s[2]), 3, 0, 7); g.fill(); }
+    g.strokeStyle = "#8d99a8"; g.lineWidth = 1.5;
+    for (const d of W.dungeon.doors) g.strokeRect(sx(d[0]) - 6, sz(d[2]) - 6, 12, 12);
+    g.font = "600 11px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+    g.textAlign = "center"; g.textBaseline = "middle";
+    W.dungeon.beats.forEach((b, i) => {
+      const x = sx(b.at[0]), y = sz(b.at[2]);
+      g.fillStyle = "rgba(8,8,12,.88)"; g.beginPath(); g.arc(x, y, 10, 0, 7); g.fill();
+      g.strokeStyle = "#e2e8f0"; g.lineWidth = 1.5; g.stroke();
+      g.fillStyle = "#ffffff"; g.fillText(String(i + 1), x, y + 0.5);
+    });
+    g.textAlign = "start"; g.textBaseline = "alphabetic";
+  }
+  $("#wlegend").textContent = `${pts.length.toLocaleString()} placements shown, seen from above · grid ${step.toLocaleString()} units · scroll to zoom, drag to pan · click a dot to see it, open ground to pick a spot`;
+}
+function nearestPoint(mx, my, radius = 7) {
+  const v = W.view, c = $("#wcanvas"), Wd = c.clientWidth, Hd = c.clientHeight;
+  let best = null, bd = radius * radius;
+  for (const p of worldPoints()) {
+    const dx = Wd / 2 + (p[0] - v.cx) * v.k - mx, dy = Hd / 2 + (p[1] - v.cz) * v.k - my, d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+function describePoint(p) {
+  const r = W.st, lay = r.layouts[p[3]], nm = r.names[p[5]];
+  return { lay, nm, text: `${nm.id}${nm.name ? " " + nm.name : ""} · ${lay.type === "s" ? "static" : WTYPE[lay.type] + " group " + lay.number} · record ${p[4]}` };
+}
+function setupWorldCanvas() {
+  const c = $("#wcanvas"), tip = $("#wtip");
+  const toWorld = (mx, my) => [W.view.cx + (mx - c.clientWidth / 2) / W.view.k, W.view.cz + (my - c.clientHeight / 2) / W.view.k];
+  c.addEventListener("wheel", e => {
+    e.preventDefault();
+    const b = c.getBoundingClientRect(), mx = e.clientX - b.left, my = e.clientY - b.top, [wx, wz] = toWorld(mx, my);
+    const f = e.deltaY < 0 ? 1.25 : 0.8;
+    W.view.k *= f; W.view.cx = wx - (mx - c.clientWidth / 2) / W.view.k; W.view.cz = wz - (my - c.clientHeight / 2) / W.view.k;
+    drawWorld();
+  }, { passive: false });
+  c.addEventListener("pointerdown", e => { W.drag = { x: e.clientX, y: e.clientY, cx: W.view.cx, cz: W.view.cz, moved: false }; c.setPointerCapture(e.pointerId); });
+  c.addEventListener("pointermove", e => {
+    const b = c.getBoundingClientRect(), mx = e.clientX - b.left, my = e.clientY - b.top;
+    if (W.drag) {
+      const dx = e.clientX - W.drag.x, dy = e.clientY - W.drag.y;
+      if (Math.abs(dx) + Math.abs(dy) > 3) W.drag.moved = true;
+      if (W.drag.moved) { W.view.cx = W.drag.cx - dx / W.view.k; W.view.cz = W.drag.cz - dy / W.view.k; drawWorld(); tip.style.display = "none"; return; }
+    }
+    const p = nearestPoint(mx, my);
+    if (p) { tip.textContent = describePoint(p).text; tip.style.left = (mx + 14) + "px"; tip.style.top = (my + 10) + "px"; tip.style.display = "block"; }
+    else tip.style.display = "none";
+  });
+  c.addEventListener("pointerup", e => {
+    const drag = W.drag; W.drag = null;
+    if (drag && drag.moved) return;
+    const b = c.getBoundingClientRect(), mx = e.clientX - b.left, my = e.clientY - b.top;
+    const p = nearestPoint(mx, my);
+    if (p) { selectPoint(p); return; }
+    const [wx, wz] = toWorld(mx, my), near = nearestPoint(mx, my, 1e9);
+    W.spot = { xyz: [Math.round(wx), near ? near[2] : 0, Math.round(wz)] }; W.plan = null;
+    $("#espot").textContent = `[${W.spot.xyz.join(", ")}]  (height from the nearest placement)`;
+    drawWorld();
+  });
+  c.addEventListener("pointerleave", () => { tip.style.display = "none"; });
+  // an enemy chip dropped on the map: that enemy, at that spot, planned at once (nothing written yet)
+  c.addEventListener("dragover", e => { if (e.dataTransfer.types.includes("text/x-riftstone-enemy")) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } });
+  c.addEventListener("drop", e => {
+    const id = e.dataTransfer.getData("text/x-riftstone-enemy");
+    if (!id) return;
+    e.preventDefault();
+    const b = c.getBoundingClientRect(), mx = e.clientX - b.left, my = e.clientY - b.top;
+    const [wx, wz] = toWorld(mx, my), near = nearestPoint(mx, my, 1e9);
+    W.spot = { xyz: [Math.round(wx), near ? near[2] : 0, Math.round(wz)] }; W.plan = null;
+    $("#espot").textContent = `[${W.spot.xyz.join(", ")}]  (height from the nearest placement)`;
+    $("#eenemy").value = id; W.name = id;
+    drawWorld();
+    busy($("#eplan"), () => encounterGo(true));
+  });
+}
+function selectPoint(p) {
+  W.sel = p;
+  const d = describePoint(p);
+  $("#wsel").innerHTML = `<div><b>${esc(d.nm.id)}</b> ${esc(d.nm.name)} <span class="sub">at [${Math.round(p[0])}, ${Math.round(p[2])}, ${Math.round(p[1])}]</span></div>
+    <div class="sub mono" style="word-break: break-all">${esc(d.lay.path)} · record ${p[4]}</div>
+    <div class="row" style="margin-top: 8px"><button class="btn small" id="wopen">Open layout</button>
+      ${d.lay.type !== "s" ? `<button class="btn small" id="wgroup">Show group ${d.lay.number}</button>` : ""}
+      <button class="btn small" id="wspot">Encounter here</button></div>`;
+  $("#wopen").onclick = () => { $('.tab[data-view="explore"]').click(); openResource({ path: d.lay.path }); };
+  if ($("#wgroup")) $("#wgroup").onclick = () => { W.hl = { type: d.lay.type, number: d.lay.number }; drawWorld(); };
+  $("#wspot").onclick = () => { W.spot = { xyz: [Math.round(p[0]), Math.round(p[2]), Math.round(p[1])] }; W.plan = null;
+    $("#espot").textContent = `[${W.spot.xyz.join(", ")}]  (at ${d.nm.id})`; drawWorld(); };
+  drawWorld();
+}
+async function encounterGo(dry) {
+  if (!W.spot) throw new Error("pick a spot: click the map, a group, or a placement's Encounter here");
+  const opt = id => $(id).value.trim() === "" ? null : +$(id).value;
+  const body = { ...destBody("edest"), stage: W.st.stage, enemy: $("#eenemy").value.trim(), count: +$("#ecount").value,
+                 at_once: +$("#eonce").value, spread: +$("#espread").value, story: $("#estory").value || null,
+                 like: opt("#elike"), skin: $("#eskin").value.trim() || null, hours: $("#ehours").value.trim() || null,
+                 at: W.spot.group != null ? "group:" + W.spot.group : W.spot.xyz, dry_run: dry };
+  if (!body.enemy) throw new Error("say which enemy");
+  const r = await api("encounter", body);
+  W.plan = r;
+  const box = $("#eplanout"); box.hidden = false;
+  box.innerHTML = `<div><b>${r.total} × ${esc(r.enemy)} ${esc(r.enemy_name)}</b> as new group <b>#${r.group}</b>, ${r.points} spawn point${r.points === 1 ? "" : "s"}${r.horde ? " (a horde: refilled up to the total)" : ""}${r.skin != null ? `, wearing skin ${r.skin}` : ""}</div>
+    <div class="sub">a copy of group ${r.template_group} (${r.template_distance} units away) · ${esc(r.layout)} · ${r.archives.length} archive(s)</div>
+    ${r.notes.map(n => `<div class="warn">▲ ${esc(n)}</div>`).join("")}
+    <div class="${r.clashes.length ? "clash" : "sub"}" style="margin-top: 4px">${r.clashes.length ? "▲ " : ""}${esc(r.note)}</div>
+    ${r.written.length ? `<div style="margin-top: 6px">Written into <b>${esc(r.mod)}</b>${r.new_mod ? " (a new mod)" : ""}:</div>${r.written.map(f => `<div class="mono sub">${esc(f)}</div>`).join("")}`
+      : `<div class="sub" style="margin-top: 6px">Plan only: nothing written${r.new_mod ? `, and the mod ${esc(r.mod)} is made only when you write` : ""}. The gold dots are the spawn points.</div>`}`;
+  drawWorld();
+  if (!dry) {
+    toast(`Encounter written into ${r.mod}. Install it from the Mods tab.`); await refresh();
+    if (r.new_mod) { S.dest.edest = r.mod; $("#edestbox").innerHTML = destPicker("edest", r.mod); wireDest("edest"); }
+  }
+}
+async function dungeonGo(dry) {
+  const body = { ...destBody("ddest"), stage: W.st.stage, seed: Math.max(0, Math.floor(+$("#dseed").value || 0)),
+                 pool: $("#dpool").value, exclude: $("#dexclude").value.trim(), keep_lot_flags: $("#dkeep").checked,
+                 dry_run: dry };
+  const r = await api("dungeon", body);
+  W.dungeon = r; W.plan = null;
+  const box = $("#dplanout"); box.hidden = false;
+  const p = r.proof;
+  box.innerHTML = `<div><b>${esc(r.mission)}</b> <span class="sub">seed ${r.seed} · ${r.places} places · the main path ${r.deepest} m${r.nav_stage !== r.stage ? ` · stage ${r.nav_stage}'s ground` : ""}</span></div>
+    <table class="dbeats">${r.beats.map((b, i) => `<tr><td class="mono">${i + 1}</td><td>${b.side ? "side " : ""}${esc(b.kind)}</td>
+      <td>${esc(b.name || b.enemy)} <span class="sub">${esc(b.enemy)} · tier ${b.tier}</span></td>
+      <td>×${b.total}${b.points !== b.total ? ` <span class="sub">from ${b.points} points</span>` : ""}</td>
+      <td class="sub">${b.depth} m in · ${b.room} m room${b.place ? " · " + esc(b.place) : ""}</td></tr>`).join("")}</table>
+    <div class="sub">Checked: ${p.on_mesh} of ${p.points} spawn points on the walkable ground, ${p.in_region} reached on foot from the doors (the farthest ${p.farthest} m in).</div>
+    ${p.problems.map(n => `<div class="clash">▲ ${esc(n)}</div>`).join("")}
+    ${r.notes.map(n => `<div class="warn">▲ ${esc(n)}</div>`).join("")}
+    ${r.clashes.length ? `<div class="clash" style="margin-top: 4px">▲ ${esc(r.clashes.join(", "))} also change${r.clashes.length === 1 ? "s" : ""} this stage's group list: installed together, the later mod's list wins and the other's groups disappear.</div>` : ""}
+    ${r.written.length ? `<div style="margin-top: 6px">Written into <b>${esc(r.mod)}</b>${r.new_mod ? " (a new mod)" : ""}: ${r.beats.length} encounters, ${r.written.length} files.</div>`
+      : `<div class="sub" style="margin-top: 6px">Plan only: nothing written${r.new_mod ? `, and the mod ${esc(r.mod)} is made only when you write` : ""}. On the map: the numbered places, the doors (squares) and every spawn point.</div>`}`;
+  drawWorld();
+  if (!dry) {
+    toast(`Dungeon written into ${r.mod}. Install it from the Mods tab.`); await refresh();
+    if (r.new_mod) { S.dest.ddest = r.mod; $("#ddestbox").innerHTML = destPicker("ddest", r.mod); wireDest("ddest"); }
+  }
+}
+window.addEventListener("resize", () => { if (W.st && document.getElementById("view-world").classList.contains("active")) drawWorld(); });
+
+/* ---------- files in and out of the browser ---------- */
+function saveDownload(r) {
+  const bin = atob(r.b64), u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  const url = URL.createObjectURL(new Blob([u8], { type: r.mime }));
+  const a = document.createElement("a"); a.href = url; a.download = r.name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+async function fileB64(file) {
+  if (file.size > 40 * 1024 * 1024) throw new Error(`${file.name} is larger than 40 MB`);
+  const u8 = new Uint8Array(await file.arrayBuffer());
+  let s = "";
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function pickFile(accept) {
+  return new Promise(res => {
+    const i = document.createElement("input"); i.type = "file"; i.accept = accept;
+    i.onchange = () => res(i.files[0] || null); i.addEventListener("cancel", () => res(null));
+    i.click();
+  });
+}
+
+/* ---------- where produced files go: one of your mods, or a new, separate one ---------- */
+function destPicker(id, pick, kind) {
+  const mods = S.mods.filter(m => !m.error && (!kind || (m.game || "ddda") === kind));
+  let cur = pick != null ? pick : S.dest[id] != null ? S.dest[id] : mods.length ? mods[0].name : "";
+  if (cur && !mods.some(m => m.name === cur)) cur = "";
+  return `<div class="dest"><select id="${id}">${mods.map(m => `<option value="${esc(m.name)}" ${m.name === cur ? "selected" : ""}>${esc(m.name)}</option>`).join("")}
+      <option value="" ${cur === "" ? "selected" : ""}>+ a new, separate mod…</option></select>
+    <input class="input" id="${id}-new" placeholder="new mod name" autocomplete="off" ${cur === "" ? "" : "hidden"}></div>`;
+}
+function wireDest(id) {
+  const s = $("#" + id), n = $("#" + id + "-new");
+  if (!s) return;
+  s.onchange = () => { S.dest[id] = s.value; n.hidden = s.value !== ""; if (!n.hidden) n.focus(); };
+}
+function destBody(id) {
+  const s = $("#" + id);
+  if (s && s.value) return { mod: s.value };
+  const name = ($("#" + id + "-new") || { value: "" }).value.trim();
+  if (!name) throw new Error("name the new mod, or pick one of yours");
+  return { new_mod: name };
+}
+
+/* ---------- a mod's files: what each does, preview, download, replace, set aside ---------- */
+let F = { mod: null, rows: [], sel: null, filter: "", hist: 0 };
+const qs = o => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+async function openFiles(mod, rel, q) {
+  if (F.mod !== mod) { F.filter = ""; F.sel = null; $("#fmq").value = ""; }
+  if (q != null) { $("#fmq").value = q; F.filter = ""; }
+  F.mod = mod;
+  $("#fmwrap").hidden = false; $("#fmmod").textContent = mod;
+  $("#fmlist").innerHTML = `<div class="empty">Reading…</div>`;
+  try { await loadFiles(); } catch (e) { $("#fmlist").innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  if (rel) selectFile(rel); else if (!F.sel) $("#fmview").innerHTML = `<div class="empty">Pick a file to see it.</div>`;
+  $("#fmwrap").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+async function loadFiles() {
+  const r = await api("files/list?" + qs({ mod: F.mod }));
+  F.rows = r.files; F.hist = r.history;
+  renderFiles();
+}
+function fileBadge(f) {
+  if (f.aside) return `<span class="badge aside">set aside</span>`;
+  return f.status === "adds" ? `<span class="badge adds">adds</span>` : f.status === "changes" ? `<span class="badge changes">changes</span>` : `<span class="badge">other</span>`;
+}
+function renderFiles() {
+  const rows = F.rows, count = k => rows.filter(k).length;
+  const live = f => !f.aside, shared = f => live(f) && f.also.length;
+  const nAdds = count(f => live(f) && f.status === "adds"), nCh = count(f => live(f) && f.status === "changes"), nAside = count(f => f.aside);
+  $("#fmsum").innerHTML = `${rows.length} file${rows.length === 1 ? "" : "s"}: <b>${nAdds}</b> ${nAdds === 1 ? "adds a new thing" : "add new things"} (never clash) · <b>${nCh}</b> ${nCh === 1 ? "changes a game file" : "change game files"} (another mod changing the same one clashes) · <b>${nAside}</b> set aside (kept, not built)`
+    + (count(shared) ? ` · <span class="clash"><b>${count(shared)}</b> also in another mod</span>` : "") + (F.hist ? ` · ${F.hist} replaced version${F.hist === 1 ? "" : "s"} kept in aside/_history` : "");
+  const chips = [["", "All"], ["adds", "Adds"], ["changes", "Changes"], ["aside", "Set aside"], ["shared", "Also in another mod"]];
+  $("#fmchips").innerHTML = chips.map(([k, l]) => `<button class="chip ${F.filter === k ? "on" : ""}" data-f="${k}">${l}</button>`).join("");
+  $("#fmchips").querySelectorAll(".chip").forEach(c => c.onclick = () => { F.filter = c.dataset.f; renderFiles(); });
+  const text = $("#fmq").value.trim().toLowerCase();
+  const keep = f => (!text || f.rel.toLowerCase().includes(text)) && (!F.filter || (F.filter === "aside" ? f.aside : F.filter === "shared" ? shared(f) : live(f) && f.status === F.filter));
+  $("#fmlist").innerHTML = rows.filter(keep).map(f => {
+    const where = f.status === "other" ? "" : f.archive ? `${f.status === "adds" ? "new in" : "in"} ${f.archive}.arc` : f.status === "changes" ? `every archive holding it (${f.archives})` : "new, in every archive";
+    return `<div class="fmrow ${F.sel === f.rel ? "sel" : ""}" data-rel="${esc(f.rel)}">${fileBadge(f)}
+      <div style="min-width: 0"><div class="fp">${esc(f.rel)}</div><div class="fa">${esc(where)}${f.also.length ? ` · <span class="clash">also in ${esc(f.also.join(", "))}</span>` : ""}</div></div>
+      <div class="fa">${human(f.size)}</div></div>`;
+  }).join("") || `<div class="empty">No file matches.</div>`;
+  $("#fmlist").querySelectorAll(".fmrow").forEach(el => el.onclick = () => selectFile(el.dataset.rel));
+}
+$("#fmq").addEventListener("input", () => { if (F.mod) renderFiles(); });
+function fileWhat(f) {
+  const res = f.resource ? `<span class="mono">${esc(f.resource)}.${esc(f.type)}</span>` : "";
+  if (f.aside) return "Set aside: kept in the mod but not built, so the game does not see it.";
+  if (f.status === "adds") return `Adds ${res}, which the game does not have${f.archive ? `, to ${esc(f.archive)}.arc` : ""}. New things never clash with other mods${f.also.length ? " (unless another mod adds the very same name)" : ""}.`;
+  if (f.status === "changes") return `Changes the game's ${res}${f.archive ? ` in ${esc(f.archive)}.arc` : ` in every archive holding it (${f.archives})`}. Another mod that changes it too clashes with this one: the later mod's copy wins.`;
+  return "Not a game resource (a note or the mod's own record); the build leaves it alone.";
+}
+async function selectFile(rel) {
+  F.sel = rel;
+  $("#fmlist").querySelectorAll(".fmrow").forEach(el => el.classList.toggle("sel", el.dataset.rel === rel));
+  const f = F.rows.find(x => x.rel === rel), v = $("#fmview");
+  if (!f) { v.innerHTML = `<div class="empty">That file is gone.</div>`; return; }
+  v.innerHTML = `<div class="empty">Loading…</div>`;
+  let p;
+  try { p = await api("files/preview?" + qs({ mod: F.mod, rel })); } catch (e) { v.innerHTML = `<div class="status bad">${esc(e.message)}</div>`; return; }
+  if (F.sel !== rel) return;
+  const yaml = /\.yaml$/i.test(rel), tex = p.kind === "texture";
+  let body;
+  if (tex) body = `<img src="${p.png}" alt="" width="${p.shown[0]}" height="${p.shown[1]}"><div class="sub" style="text-align: center">${p.width}×${p.height} · ${esc(p.codec)} · ${p.mips} mip${p.mips === 1 ? "" : "s"} · ${human(p.size)}</div>`;
+  else if (p.kind === "text" || p.kind === "material") body = `<pre class="code">${yaml ? highlight(p.text) : esc(p.text)}</pre>`;
+  else body = `<div class="sub" style="margin-top: 10px">A binary file (it starts <span class="mono">${esc(p.magic)}</span>), ${human(p.size)}.</div>`;
+  const accept = tex ? (p.from_png ? ".png,.dds,.tex" : ".dds,.tex") : yaml ? ".yaml,.yml,.txt" : /\.mrl$/i.test(rel) ? ".mrl" : "";
+  v.innerHTML = `<div class="mono" style="overflow-wrap: anywhere">${esc(rel)}</div>
+    <div class="sub" style="margin-top: 4px">${fileWhat(f)}</div>
+    ${f.also.length ? `<div class="status bad">Also in ${esc(f.also.join(", "))}: installed together, the later mod's copy wins.</div>` : ""}
+    ${body}
+    <div class="row" style="margin-top: 10px">
+      ${yaml && !f.aside ? `<button class="btn small primary" data-a="edit">Edit</button>` : ""}
+      ${tex ? `<button class="btn small" data-a="png">Download .png</button><button class="btn small" data-a="dds">.dds</button><button class="btn small" data-a="raw">.tex</button>` : `<button class="btn small" data-a="raw">Download</button>`}
+      ${f.aside ? "" : `<button class="btn small" data-a="replace">Replace…</button>`}
+      <button class="btn small ghost" data-a="${f.aside ? "back" : "aside"}">${f.aside ? "Bring back" : "Put aside"}</button>
+    </div>
+    ${tex && !f.aside ? `<div class="sub" style="margin-top: 8px">${p.from_png ? "Edit the .png in any paint program and Replace it here: it goes back in as this kind of texture (a power-of-two size up to 4096)." : "This kind of texture goes back in as .dds or .tex (a .png cannot be turned back into it)."} The old one is kept in aside/_history.</div>` : ""}
+    ${tex && p.from_png && !f.aside ? `<div class="row" style="margin-top: 8px; flex-wrap: wrap"><span class="sub">Preset:</span>${Object.entries(PRESETS).map(([k, v]) => `<button class="btn small" data-p="${k}" title="${esc(v[1] + " / " + v[2])}">${esc(v[0])}</button>`).join("")}</div>` : ""}`;
+  v.querySelectorAll("[data-p]").forEach(b => b.onclick = () => busy(b, () => presetFile(f, b.dataset.p)));
+  v.querySelectorAll("[data-a]").forEach(b => b.onclick = () => {
+    const a = b.dataset.a;
+    if (a === "edit") { openEditor(F.mod, rel); return; }
+    if (a === "replace") { pickFile(accept).then(file => file && busy(b, () => replaceFile(f, file))); return; }
+    busy(b, () => a === "aside" || a === "back" ? asideFile(f, a === "back") : downloadFile(f, a));
+  });
+}
+async function downloadFile(f, as) {
+  const r = await api("files/download?" + qs({ mod: F.mod, rel: f.rel, as }));
+  saveDownload(r); toast(`Downloaded ${r.name} (${human(r.bytes)})`);
+}
+const PRESETS = {
+  frost: ["Frost", "Icy blue-white tint with rime speckles", "氷のような青白い色調と霜の斑点"],
+  lava: ["Lava", "Dark basalt with glowing cracks (painted, not emissive)", "暗い玄武岩と光るひび割れ（発光ではなく描画）"],
+  abyssal: ["Abyssal", "Deep purple darkness with faint bioluminescent veins", "深い紫の闇とかすかに光る筋"],
+  weathered: ["Weathered", "Faded colours, grime and worn edges", "色あせ、汚れ、擦り切れた縁"],
+};
+async function presetFile(f, preset) {
+  const r = await api("files/preset", { mod: F.mod, rel: f.rel, preset });
+  toast(`${PRESETS[preset][0]} applied to ${f.rel.split("/").pop()}.\nThe old one is kept in ${r.kept}.`, "ok", 8000);
+  await loadFiles(); selectFile(f.rel); refresh();
+}
+async function replaceFile(f, file) {
+  const r = await api("files/replace", { mod: F.mod, rel: f.rel, b64: await fileB64(file) });
+  toast(`Replaced ${f.rel.split("/").pop()} with ${file.name}: ${r.note}.\nThe old one is kept in ${r.kept}.`, "ok", 8000);
+  await loadFiles(); selectFile(f.rel); refresh();
+  if (S.editing && S.editing.mod === F.mod && S.editing.rel === f.rel) { S.dirty = false; openEditor(F.mod, f.rel); }
+}
+async function asideFile(f, back) {
+  if (!back && S.editing && S.editing.mod === F.mod && S.editing.rel === f.rel) {
+    if (S.dirty && !confirm("The file is open with unsaved changes. Put it aside anyway?")) return;
+    S.dirty = false; S.editing = null; $("#editorwrap").hidden = true;
+  }
+  const r = await api("files/aside", { mod: F.mod, rel: f.rel, back });
+  toast(back ? `Brought back ${r.rel}: it is built again.` : `Put aside: kept in the mod, not built.${r.warn ? "\n" + r.warn : ""}`, r.warn ? "warn" : "ok", r.warn ? 10000 : 5200);
+  await loadFiles(); selectFile(r.rel); refresh();
+}
+$("#fmzip").onclick = () => busy($("#fmzip"), async () => {
+  const r = await api("files/export?" + qs({ mod: F.mod }));
+  saveDownload(r); toast(`Downloaded ${r.name} (${human(r.bytes)}): the whole mod, to keep or share.`);
+});
+$("#fmclose").onclick = () => { $("#fmwrap").hidden = true; F.mod = null; F.sel = null; };
+
+/* ---------- monsters between the games (census, verdicts, conversion) ---------- */
+const MN = { data: null, dir: "ddo", verdict: "same body", sel: null, loading: false };
+const VBADGE = { "same body": "adds", "same skeleton": "changes", "partial": "", "none": "aside" };
+const GAMEN = { ddo: "Online", ddda: "Dark Arisen" };
+async function monstersOpen() {
+  if (MN.data || MN.loading) return;
+  MN.loading = true;
+  $("#mnlist").innerHTML = `<div class="empty"><div class="big">Reading both games' monsters</div>Every enemy body of Dark Arisen and Online, compared joint by joint. The first time takes a while; after that it opens at once.</div>`;
+  try { MN.data = await api("monsters"); renderMonsters(); }
+  catch (e) { $("#mnlist").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  finally { MN.loading = false; }
+}
+document.querySelectorAll("#mndir .chip").forEach(c => c.onclick = () => { MN.dir = c.dataset.dir; MN.sel = null; $("#mnplan").hidden = true; renderMonsters(); });
+$("#mnq").addEventListener("input", () => renderMonsters());
+function renderMonsters() {
+  if (!MN.data) return;
+  const s = MN.data.summary[MN.dir], other = GAMEN[MN.dir === "ddo" ? "ddda" : "ddo"];
+  $("#mnsum").textContent = `${s.families} ${GAMEN[MN.dir]} monster families: ` + Object.entries(s.verdicts).map(([v, n]) => `${n} ${v}`).join(" · ")
+    + `. Same body: the model, its materials and textures convert, and ${other}'s own motions move it.`;
+  document.querySelectorAll("#mndir .chip").forEach(c => c.classList.toggle("on", c.dataset.dir === MN.dir));
+  $("#mnv").innerHTML = [["", "All"], ["same body", "Same body"], ["same skeleton", "Same skeleton"], ["partial", "Partial"], ["none", "None"]]
+    .map(([k, l]) => `<button class="chip ${MN.verdict === k ? "on" : ""}" data-v="${k}">${l}</button>`).join("");
+  $("#mnv").querySelectorAll(".chip").forEach(c => c.onclick = () => { MN.verdict = c.dataset.v; renderMonsters(); });
+  const q = $("#mnq").value.trim().toLowerCase();
+  const rows = MN.data.rows[MN.dir].filter(r => (!MN.verdict || r.verdict === MN.verdict) && (!q
+    || `${r.family} ${r.name} ${r.ids.join(" ")} ${r.counterpart || ""} ${r.counterpart_name}`.toLowerCase().includes(q)));
+  $("#mnlist").innerHTML = rows.map(r => `<div class="fmrow ${MN.sel && MN.sel.family === r.family ? "sel" : ""}" data-f="${esc(r.family)}">
+      <span class="badge ${VBADGE[r.verdict] || ""}">${esc(r.verdict)}</span>
+      <div style="min-width: 0"><div class="fp">${esc(r.name || r.family)} <span class="muted">${esc(r.family)}</span> &rarr; ${r.counterpart
+        ? `${esc(r.counterpart_name || r.counterpart)} <span class="muted">${esc(r.counterpart)}</span>` : '<span class="muted">no counterpart</span>'}</div>
+        <div class="fa">${esc(r.ids.join(", "))}${r.textures ? " · textures " + esc(r.textures) : ""}</div></div>
+      <div class="fa">${r.counterpart ? "Convert&hellip;" : ""}</div></div>`).join("") || `<div class="empty">Nothing matches.</div>`;
+  $("#mnlist").querySelectorAll(".fmrow").forEach(el => el.onclick = () => {
+    MN.sel = MN.data.rows[MN.dir].find(r => r.family === el.dataset.f); renderMonsters(); monsterPanel();
+  });
+}
+function monsterPanel() {
+  const r = MN.sel, box = $("#mnplan");
+  if (!r) { box.hidden = true; return; }
+  const dst = MN.dir === "ddo" ? "ddda" : "ddo";
+  const skinable = MN.dir === "ddo" && r.ids.some(id => MN.data.skins.includes(id.toLowerCase()));
+  box.hidden = false;
+  box.innerHTML = `<div class="wform" style="padding: 12px 0">
+      <label>Monster</label><select id="mnsrc">${r.ids.length > 1 ? `<option value="${esc(r.family)}">${esc(r.name || r.family)} (the family)</option>` : ""}
+        ${r.ids.map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join("")}</select>
+      <label>Becomes</label><input class="input" id="mninto" value="${esc(r.counterpart || "")}" placeholder="a ${GAMEN[dst]} enemy: a name or an id">
+      ${skinable ? `<label>As a skin</label><input class="input" id="mnskin" inputmode="numeric" placeholder="optional: a skin number 1..99 (chosen chimeras only)">` : ""}
+      <label>Put it in</label><div id="mndestbox">${destPicker("mndest", null, dst)}</div>
+    </div>
+    <div class="row"><button class="btn small" id="mncheck">Check</button><button class="btn small primary" id="mngo">Convert</button>
+      <span class="sub grow">Goes into a ${GAMEN[dst]} mod. The destination keeps its own motions, AI and collision.</span></div>
+    <div id="mnout" style="margin-top: 10px"></div>`;
+  wireDest("mndest");
+  $("#mncheck").onclick = () => busy($("#mncheck"), () => monsterGo(true));
+  $("#mngo").onclick = () => busy($("#mngo"), () => monsterGo(false));
+}
+async function monsterGo(dry) {
+  const skinBox = $("#mnskin");
+  const body = { from: MN.dir, source: $("#mnsrc").value, into: $("#mninto").value.trim(), skin: skinBox ? skinBox.value.trim() : "", dry_run: dry };
+  if (!body.into) throw new Error("say which enemy it becomes");
+  if (!dry) Object.assign(body, destBody("mndest"));
+  const r = await api("monsters/convert", body);
+  $("#mnout").innerHTML = `<div><b>${esc(r.source)}</b> &rarr; <b>${esc(r.target)}</b>: <span class="badge ${VBADGE[r.verdict] || ""}">${esc(r.verdict)}</span>
+      <span class="sub">textures ${esc(r.textures)}</span> ${r.allowed ? '<span class="badge on">allowed</span>' : '<span class="badge bad">refused</span>'}</div>
+    ${r.refused.map(x => `<div class="status bad" style="margin-top: 6px">${esc(x)}</div>`).join("")}
+    ${r.notes.map(n => `<div class="sub" style="margin-top: 4px">${esc(n)}</div>`).join("")}
+    ${r.written.length ? `<div style="margin-top: 8px">Written into <b>${esc(r.mod)}</b>:</div>${r.written.slice(0, 12).map(f => `<div class="mono sub">${esc(f)}</div>`).join("")}${r.written.length > 12 ? `<div class="sub">and ${r.written.length - 12} more</div>` : ""}` : ""}`;
+  if (!dry && r.written.length) { toast(`Converted into ${r.mod}. Install it from the Mods tab.`); await refresh(); }
+}
+
+/* ---------- skins ---------- */
+let K = null;
+async function skinsOpen() {
+  try { K = await api("skins"); }
+  catch (e) { $("#skgrid").innerHTML = `<div class="card empty" style="grid-column: 1/-1">${esc(e.message)}</div>`; return; }
+  renderSkinForm(); renderSkins();
+}
+function renderSkinForm() {
+  const fam = $("#skfam"), fcur = fam.value, src = $("#sksrc"), scur = src.value;
+  fam.innerHTML = K.families.map(f => `<option value="${esc(f.key)}">${esc(f.key)} (${esc(f.enemy)})</option>`).join("");
+  if (fcur && K.families.some(f => f.key === fcur)) fam.value = fcur;
+  src.innerHTML = `<option value="">my own pictures</option>` + K.ddo.map(v => `<option value="${esc(v)}">Dragon's Dogma Online: ${esc(v)}</option>`).join("");
+  src.value = K.ddo.includes(scur) ? scur : "";
+  renderSkinPics();
+  $("#skdest").innerHTML = destPicker("skdest"); wireDest("skdest");
+}
+function renderSkinPics() {
+  const f = K.families.find(x => x.key === $("#skfam").value) || K.families[0];
+  $("#skpics").innerHTML = $("#sksrc").value ? `<span class="sub">Made from the Dragon's Dogma Online client on this PC (read only; takes a few seconds).</span>`
+    : f.textures.map(b => `<label><span class="mono">${esc(b)}</span><input type="file" accept=".png,.dds,.tex" data-base="${esc(b)}"></label>`).join("")
+      + `<span class="sub">Leave a map empty to keep the game's. A .png goes in as the game's own kind of texture (a power-of-two size up to 4096).</span>`;
+}
+$("#skfam").onchange = renderSkinPics; $("#sksrc").onchange = renderSkinPics;
+function renderSkins() {
+  const g = $("#skgrid");
+  if (!K.skins.length) { g.innerHTML = `<div class="card empty" style="grid-column: 1/-1"><div class="big">No skins yet</div>Make one on the left, from your own pictures or from one of Dragon's Dogma Online's variants.</div>`; return; }
+  g.innerHTML = K.skins.map((s, i) => s.error ? `<div class="card skin"><b>${esc(s.mod)}</b><div class="status bad">${esc(s.error)}</div></div>` : `<div class="card skin">
+      <div class="thumbs">${Object.entries(s.thumbs).map(([b, u]) => u ? `<img src="${u}" alt="" title="${esc(b)}">` : `<div class="none" title="${esc(b)}: missing"></div>`).join("")}</div>
+      <div class="row"><b class="grow">${esc(s.title || s.family + " skin " + s.number)}</b><span class="badge adds">adds</span></div>
+      <div class="sub">${esc(s.family)} skin <b>${s.number}</b> · in ${esc(s.mod)}${s.source ? " · " + esc(s.source) : ""}</div>
+      <div class="row"><button class="btn small" data-i="${i}" data-x="png">Pictures (.png)</button><button class="btn small" data-i="${i}" data-x="dds">.dds</button>
+        <button class="btn small ghost" data-i="${i}" data-x="edit">Replace pictures…</button><button class="btn small ghost" data-i="${i}" data-x="files">Files</button></div></div>`).join("");
+  g.querySelectorAll("button[data-x]").forEach(b => b.onclick = () => {
+    const s = K.skins[+b.dataset.i], x = b.dataset.x;
+    if (x === "files") { $('.tab[data-view="mods"]').click(); openFiles(s.mod, null, `/s${String(s.number).padStart(2, "0")}/`); return; }
+    if (x === "edit") {
+      $("#skfam").value = s.family; $("#sksrc").value = ""; renderSkinPics();
+      $("#sknum").value = s.number; $("#sktitle").value = s.title;
+      $("#skdest").innerHTML = destPicker("skdest", s.mod); wireDest("skdest"); S.dest.skdest = s.mod;
+      $("#skpics").scrollIntoView({ behavior: "smooth", block: "center" });
+      toast(`Pick the edited pictures, then Make skin: skin ${s.number} in ${s.mod} is replaced and its old files are kept in aside/_history.`, "ok", 9000);
+      return;
+    }
+    busy(b, async () => {
+      const r = await api("skins/export?" + qs({ mod: s.mod, family: s.family, number: s.number, as: x }));
+      saveDownload(r); toast(`Downloaded ${r.name}: edit the pictures, then Replace pictures…`);
+    });
+  });
+}
+$("#skmake").onclick = () => busy($("#skmake"), async () => {
+  const body = { family: $("#skfam").value, ...destBody("skdest"), title: $("#sktitle").value.trim() };
+  if ($("#sknum").value.trim()) body.number = +$("#sknum").value;
+  if ($("#sksrc").value) body.ddo = $("#sksrc").value;
+  else {
+    body.textures = {};
+    for (const i of $("#skpics").querySelectorAll("input[type=file]")) if (i.files[0]) body.textures[i.dataset.base] = { b64: await fileB64(i.files[0]) };
+    if (!Object.keys(body.textures).length) throw new Error("pick at least one picture, or a Dragon's Dogma Online look");
+  }
+  const r = await api("skins/make", body);
+  const out = $("#skout"); out.hidden = false;
+  out.innerHTML = `<div><b>${esc(body.family)} skin ${r.number}</b> is in <b>${esc(r.mod)}</b> (${r.written.length} files).</div>
+    <div class="sub">${esc(r.note)}${r.kept.length ? `; the ${r.kept.length} file(s) it replaced are kept in aside/_history` : ""}.</div>
+    <div class="sub">Wear it: the World tab's Skin field, or <span class="mono">riftstone encounter … --skin ${r.number}</span>.</div>`;
+  toast(`${body.family} skin ${r.number} is in ${r.mod}`);
+  S.dest.skdest = r.mod; $("#sknum").value = "";
+  $("#skpics").querySelectorAll("input[type=file]").forEach(i => i.value = "");
+  await refresh(); await skinsOpen();
+});
+
+/* ---------- editor ---------- */
+const ta = $("#ta"), hl = $("#hl"), gutter = $("#gutter"), band = $("#band");
+async function openEditor(mod, rel) {
+  if (S.dirty && !confirm("Discard unsaved changes?")) return;
+  const r = await api(`file?mod=${encodeURIComponent(mod)}&rel=${encodeURIComponent(rel)}`).catch(e => { toast(e.message, "bad"); });
+  if (!r) return;
+  S.editing = { mod, rel }; S.dirty = false; S.lotSel = null;
+  $("#editorwrap").hidden = false; $("#edpath").textContent = `${mod} / ${rel}`;
+  ta.value = r.text; S.errLine = 0; ta.scrollTop = 0; ta.scrollLeft = 0; paint(); validate(); editorMap();
+  ta.focus({ preventScroll: true }); ta.setSelectionRange(0, 0); syncScroll();
+  $("#editorwrap").scrollIntoView({ behavior: "smooth", block: "start" });
+  const tag = /^riftstone:\s*([\w-]+)\//m.exec(r.text.slice(0, 4096));
+  helpOpen(rel, tag ? tag[1] : "");
+}
+
+/* ---------- learn more: the format, then the field under the cursor (EN | 日本語) ---------- */
+const H = { help: null, field: null, cache: {}, timer: 0 };
+function helpLang() { try { return localStorage.getItem("riftstone.lang") === "ja" ? "ja" : "en"; } catch (e) { return "en"; } }
+function helpRender() {
+  const box = $("#edhelp");
+  if (!H.help) { box.hidden = true; return; }
+  const lang = helpLang();
+  box.hidden = false; box.classList.toggle("ja", lang === "ja");
+  box.querySelectorAll("[data-hl]").forEach(x => x.classList.toggle("active", x.dataset.hl === lang));
+  $("#edhelptitle").textContent = (lang === "ja" ? "詳しく：" : "Learn more: ") + H.help.title[lang];
+  $("#edhelpbody").textContent = H.help.body[lang];
+  $("#edhelpfield").textContent = H.field ? `${H.field.name}: ${H.field[lang]}` : "";
+}
+document.querySelectorAll("[data-hl]").forEach(b => b.onclick = () => {
+  try { localStorage.setItem("riftstone.lang", b.dataset.hl); } catch (e) {}
+  helpRender();
+});
+async function helpOpen(rel, tag) {
+  H.help = null; H.field = null;
+  try { H.help = (await api("help?" + qs({ path: rel, tag: tag || "" }))).help; } catch (e) { H.help = null; }
+  helpRender();
+}
+function helpCaret() {
+  if (!H.help || !(H.help.fields || []).length) return;
+  const s = ta.value.lastIndexOf("\n", ta.selectionStart - 1) + 1, e = ta.value.indexOf("\n", ta.selectionStart);
+  const m = /^\s*(?:-\s+)?([^\s:#"'][^:#]*?)\s*:/.exec(ta.value.slice(s, e < 0 ? undefined : e));
+  const key = m ? m[1] : null;
+  if (!key || !H.help.fields.includes(key)) { if (H.field) { H.field = null; helpRender(); } return; }
+  if (H.field && H.field.name === key) return;
+  const ck = H.help.topic + "\u0000" + key;
+  if (ck in H.cache) { H.field = H.cache[ck]; helpRender(); return; }
+  clearTimeout(H.timer);
+  H.timer = setTimeout(async () => {
+    try { const r = await api("help?" + qs({ topic: H.help.topic, field: key })); H.cache[ck] = (r.help && r.help.field) || null; }
+    catch (e) { return; }
+    H.field = H.cache[ck]; helpRender();
+  }, 120);
+}
+["keyup", "click"].forEach(ev => ta.addEventListener(ev, helpCaret));
+function paint() {
+  hl.innerHTML = highlight(ta.value) + "\n";
+  const n = ta.value.split("\n").length;
+  let g = ""; for (let i = 1; i <= n; i++) g += `<div data-l="${i}">${i}</div>`;
+  gutter.innerHTML = g; syncScroll(); markError(S.errLine);
+}
+function syncScroll() { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; gutter.scrollTop = ta.scrollTop; positionBand(); }
+function lineHeight() { return parseFloat(getComputedStyle(ta).lineHeight) || 20; }
+function positionBand() { if (S.errLine) band.style.top = (14 + (S.errLine - 1) * lineHeight() - ta.scrollTop) + "px"; }
+function markError(line) {
+  S.errLine = line || 0; gutter.querySelectorAll(".err").forEach(x => x.classList.remove("err"));
+  if (!line) { band.hidden = true; return; }
+  const el = gutter.querySelector(`[data-l="${line}"]`); if (el) el.classList.add("err");
+  band.hidden = false; band.style.height = lineHeight() + "px"; positionBand();
+}
+let vTimer = 0;
+ta.addEventListener("input", () => {
+  S.dirty = true; paint(); clearTimeout(vTimer); vTimer = setTimeout(validate, 350);
+  clearTimeout(mapTimer); mapTimer = setTimeout(editorMap, 250);
+});
+ta.addEventListener("scroll", syncScroll);
+ta.addEventListener("keydown", e => {
+  if (e.key === "Tab") { e.preventDefault(); const s = ta.selectionStart; ta.setRangeText("  ", s, ta.selectionEnd, "end"); ta.dispatchEvent(new Event("input")); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); $("#edsave").click(); }
+});
+async function validate() {
+  const st = $("#edstatus");
+  try {
+    const r = await api("validate", { text: ta.value });
+    if (r.ok) { st.className = "status ok"; st.textContent = `Valid: ${r.summary}, ${human(r.bytes)} when built.`; markError(0); }
+    else { st.className = "status bad"; st.textContent = r.error; markError(r.line); }
+  } catch (e) { st.className = "status bad"; st.textContent = e.message; }
+}
+async function save() {
+  const r = await api("file", { mod: S.editing.mod, rel: S.editing.rel, text: ta.value });
+  S.dirty = false;
+  if (!r.ok) { toast("Saved, but the file has an error:\n" + r.error, "warn", 8000); markError(r.line); return false; }
+  toast("Saved " + S.editing.rel); return true;
+}
+$("#edsave").onclick = () => busy($("#edsave"), save);
+$("#edinstall").onclick = () => busy($("#edinstall"), async () => {
+  if (!(await save())) return;
+  await installSet([...new Set([...installedMods(), S.editing.mod])], `Saved and installed ${S.editing.mod}`);
+});
+$("#edclose").onclick = () => { if (S.dirty && !confirm("Discard unsaved changes?")) return; S.dirty = false; $("#editorwrap").hidden = true; S.editing = null; };
+window.addEventListener("beforeunload", e => { if (S.dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+function portRow(r) {
+  const cur = S.state && S.state.game, games = (S.state && S.state.games) || [];
+  const other = games.find(g => !g.current);
+  if (!cur || !other || !/\.(tex|gmd|mod|mrl|lmt)$/i.test(r.path)) return "";
+  const mods = S.mods.filter(m => !m.error && m.game === other.kind);
+  if (!mods.length) return `<div class="actions row"><input id="portnew" placeholder="new ${esc(other.title)} mod name" style="flex:1">
+    <button class="btn small" id="portnewbtn" data-kind="${esc(other.kind)}">New ${esc(other.title)} mod</button></div>`;
+  return `<div class="actions row"><select id="portto">${mods.map(m => `<option>${esc(m.name)}</option>`).join("")}</select>
+    <input id="portas" class="mono" placeholder="as (a ${esc(other.title)} path; blank = same path)" style="flex:1;min-width:12em">
+    <button class="btn small" id="portbtn" title="Converted and checked: textures, text, models with their material and textures, animations (motion lists)">Port to ${esc(other.title)}</button></div>`;
+}
+
+/* ---------- the game: switching between the two, diagnostics ---------- */
+function renderSwitch(games) {
+  const have = new Set(games.map(x => x.kind)), cur = games.find(x => x.current);
+  document.querySelectorAll(".gametab").forEach(b => {
+    const k = b.dataset.kind, g = games.find(x => x.kind === k);
+    b.classList.toggle("active", !!(cur && cur.kind === k));
+    b.disabled = !have.has(k);
+    b.title = g ? `${g.title}: ${g.root}` : `${k === "ddo" ? "Dragon's Dogma Online" : "Dragon's Dogma: Dark Arisen"} was not found on this PC`;
+    b.onclick = () => {
+      if (!have.has(k) || (cur && cur.kind === k)) return;
+      busy(b, async () => {
+        await api("switch", { kind: k });
+        S.typesLoaded = false; L.sel = null; W.stages = null; W.st = null;
+        toast(`Switched to ${g.title}; indexing its archives`);
+        await refresh();
+        if ($("#view-mods").classList.contains("active")) libraryOpen();
+      });
+    };
+  });
+}
+function tile(label, value, kind, note) {
+  return `<div class="card tile ${kind === "bad" ? "badtile" : ""}"><div class="label">${esc(label)}</div><div class="value ${kind || ""}">${esc(value)}</div>${note ? `<div class="note">${esc(note)}</div>` : ""}</div>`;
+}
+const FANGS = ["██▌       ▐██", " ██▌     ▐██", "  ██▌   ▐██", "   █▌   ▐█", "    ▌   ▐", "    ▏   ▕"];
+function renderGame() {
+  const g = S.state && S.state.game;
+  if (!g) { $("#tiles").innerHTML = tile("Game", "Not found", "bad", "Start Studio with --game \"C:\\...\\DDDA\""); $("#dterm").innerHTML = ""; return; }
+  $("#tiles").innerHTML = tile("Game folder", g.title, "ok", g.root)
+    + tile("Executable", g.build_verified ? g.build : "Different build", g.build_verified ? "ok" : "warn", g.build_verified ? "the build Riftstone is tested on" : "formats likely match; engine patches will not apply")
+    + (g.loader_supported ? tile("Loader", g.loader ? (g.loader_version.installed || "Installed") : "Not installed", g.loader ? "ok" : "", g.loader ? "overlay, plugins, crash reports, F10 panel" : "mods replace archives directly (originals kept)")
+                          : tile("Loader", "Not needed", "", "mods replace archives directly (originals kept)"))
+    + tile("Install mode", g.mode === "overlay" ? "Overlay" : "Direct", "", g.mode === "overlay" ? "riftstone\\overlay serves your archives" : "originals kept in riftstone\\vanilla")
+    + tile("Archives changed", String(g.archives_changed), g.drift.length ? "bad" : "ok", g.drift.length ? g.drift.length + " changed by something else" : "all verified")
+    + tile(g.exe, g.running ? "Running" : "Closed", g.running ? "ok" : "", g.running ? "live readings above" : "");
+  const ls = g.last_session;
+  if (ls) $("#tiles").innerHTML += tile("Last session", ls.label, ls.normal ? "ok" : (ls.reason === "not-clean" ? "warn" : "bad"), ls.sentence + (ls.detail ? " What the loader saw: " + ls.detail : ""));
+  if (g.safe_mode) $("#tiles").innerHTML += tile("Safe mode", "On", "bad", "two start-up crashes in a row: the game starts without plugins and mods");
+  if (g.quarantine && g.quarantine.length) $("#tiles").innerHTML += tile("Quarantined", g.quarantine.join(", "), "warn", "crashed the game's start-up twice; skipped until the file changes");
+  $("#safemoderow").hidden = !g.safe_mode;
+  const v = g.loader_version || {}, lb = $("#loaderbtn"), outdated = g.loader && v.installed && v.available && v.installed !== v.available;
+  lb.textContent = !g.loader ? "Install loader" : outdated ? `Update loader to ${v.available}` : "Remove loader";
+  lb.className = !g.loader || outdated ? "btn primary" : "btn";
+  lb.dataset.action = !g.loader || outdated ? "install" : "remove";
+  lb.closest(".card").style.display = g.loader_supported ? "" : "none";
+  $("#crashes").innerHTML = g.crash_reports.length ? g.crash_reports.slice().reverse().map(c => `<div class="file" data-c="${esc(c)}"><span class="badge ${/^crash|^fatal/.test(c) ? "bad" : ""}">${esc(c.split("-")[0])}</span>${esc(c)}</div>`).join("") : `<div class="file static">No crashes, fatal errors or hangs recorded.</div>`;
+  document.querySelectorAll("[data-c]").forEach(el => el.onclick = async () => {
+    const r = await api("crash?name=" + encodeURIComponent(el.dataset.c)).catch(e => toast(e.message, "bad"));
+    if (r) { $("#modaltitle").textContent = el.dataset.c; $("#modalbody").textContent = (r.explanation || []).map(l => "• " + l).join("\n") + "\n\n" + r.text; $("#modal").classList.add("open"); }
+  });
+  // what the tools know right now, the way the terminal says it
+  const on = (g.plugins || []).filter(p => p.enabled).length, mods = S.mods.filter(m => m.enabled && !modOther(m)).length;
+  const lines = [
+    [g.build_verified ? "VERIFIED" : "WARN", "build", g.build_verified ? `${g.build} (the tested build)` : "not the tested build"],
+    ...(g.loader_supported ? [[g.loader ? (outdated ? "UPDATE" : "READY") : "OFF", "loader", g.loader ? `${v.installed}${outdated ? ` (this Riftstone has ${v.available})` : ""}` : "not installed"],
+                              [on ? "READY" : "OFF", "plugins", `${on} on`]] : []),
+    [mods ? "READY" : "OFF", "mods", `${mods} installed`],
+    [g.drift.length ? "FAIL" : "PASS", "archives", g.drift.length ? `${g.drift.length} changed by something else` : `${g.archives_changed} changed by Riftstone, all verified`],
+    ...(ls ? [[ls.normal ? "PASS" : ls.reason === "not-clean" ? "WARN" : "FAIL", "last session", ls.label]] : []),
+  ];
+  $("#dterm").innerHTML = `<div class="fangs">${FANGS.map(esc).join("\n")}</div><div style="margin-bottom: 8px">NryQ // RIFTSTONE</div>`
+    + lines.map(([t, a, b]) => `<div class="tl"><span class="tag ${t === "FAIL" ? "bad" : ""}">[${t}]</span><span>${esc(a)}</span><span>${esc(b)}</span></div>`).join("");
+  renderPanel(S.live);
+}
+const GB = n => (n / 1073741824).toFixed(2);
+function renderPanel(r) {
+  const g = S.state && S.state.game, box = $("#dpanel");
+  if (!box || !g) { if (box) box.innerHTML = ""; return; }
+  const live = r && r.running ? r : null, key = ((g.plugins || []).length || g.loader) ? "F10" : "";
+  const ver = (live && live.loader_version) || (g.loader_version && g.loader_version.installed) || "";
+  let pool = { text: "UNKNOWN", pct: 0, peak: null, cls: "unknown",
+               note: !g.loader_supported ? "Online has no enemy pool reading" : live ? "no reading from this game build" : "game closed" };
+  if (live && live.enemies_active != null && live.enemy_slots) {
+    const pk = live.enemy_peak != null ? live.enemy_peak : live.enemies_active;
+    pool = { text: `${live.enemies_active} / ${live.enemy_slots}`, pct: 100 * live.enemies_active / live.enemy_slots, peak: 100 * pk / live.enemy_slots, note: `peak ${pk}`, cls: "" };
+  }
+  let mem = { text: "UNKNOWN", pct: 0, guard: null, note: "game closed", cls: "unknown", head: "" };
+  if (live && live.va_total) {
+    const guardB = Math.max(live.va_total - 400 * 1048576, 0), free = live.va_total - live.va_used;
+    mem = { text: `${GB(live.va_used)} / ${GB(live.va_total)} GB`, pct: 100 * live.va_used / live.va_total, guard: 100 * guardB / live.va_total,
+            note: `guard ${GB(guardB)}`, head: `${(100 * free / live.va_total).toFixed(1)}% headroom / ${GB(free)} GB`, cls: live.address_space_low ? "crit" : "" };
+  }
+  const chips = live && live.plugin_list && live.plugin_list.length ? live.plugin_list.map(p => {
+      const nm = p.name.replace(/\.(asi|dll)$/i, ""), st = p.state === "loaded" ? "ACTIVE" : p.state.toUpperCase();
+      return `<span class="pchip ${p.state === "loaded" ? "" : "bad"}">${esc(nm)}: <b>${esc(st)}</b></span>`;
+    }).join("")
+    : (g.plugins || []).map(p => `<span class="pchip off">${esc(p.name)}: <b>${p.enabled ? "ON" : "OFF"}</b></span>`).join("") || `<span class="sub">No plugins.</span>`;
+  const meter = (m, tick, cls) => `<div class="meter ${m.cls}"><i style="width: ${Math.min(100, m.pct).toFixed(1)}%"></i>${tick != null ? `<b class="${cls || ""}" style="left: ${Math.min(100, tick).toFixed(1)}%"></b>` : ""}</div>`;
+  box.innerHTML = `<div class="dhead"><span>NryQ // Riftstone${ver ? " v" + esc(ver) : ""}</span><span class="key">${key}</span></div>
+    <div class="drow"><div class="dline"><span class="dlabel">Active enemy pool</span><span class="dval">${esc(pool.text)}${pool.cls ? "" : " <small>slots</small>"}</span></div>
+      ${meter(pool, pool.peak)}<div class="dnote"><span>${live && live.enemies_usable != null ? live.enemies_usable + " usable" : ""}</span><span>${esc(pool.note)}</span></div></div>
+    <div class="drow"><div class="dline"><span class="dlabel">Memory guard</span><span class="dval">${esc(mem.text)}</span></div>
+      ${meter(mem, mem.guard, "guard")}<div class="dnote"><span>${esc(mem.head)}</span><span>${esc(mem.note)}</span></div></div>
+    <div class="pchips">${chips}</div>
+    <div class="dfoot"><span class="fps">${live && live.fps ? live.fps.toFixed(1) + " FPS" : "— FPS"}</span><span>${live ? (live.stage != null ? "STAGE " + live.stage : "STAGE —") : (g.running ? "no live readings: install the loader" : "GAME CLOSED")}</span></div>`;
+  const crit = $("#dcrit");
+  if (live && live.address_space_low) {
+    crit.hidden = false;
+    crit.innerHTML = `<svg viewBox="0 0 30 36"><use href="#i-drop"/></svg><div class="ct">VAS &gt; ${GB(Math.max(live.va_total - 400 * 1048576, 0))} GB</div>
+      <div class="cx">The game's address space is nearly used up, and a crash is likely soon. Fewer or smaller texture mods, a lower TextureDetail or fewer enemies at once give it room.</div>`;
+  } else if (live && live.hang) {
+    crit.hidden = false;
+    crit.innerHTML = `<svg viewBox="0 0 30 36"><use href="#i-drop"/></svg><div class="ct">No frames</div><div class="cx">The game stopped drawing while it was in front; the loader wrote a hang report (Reports, below).</div>`;
+  } else crit.hidden = true;
+}
+async function renderLive() {
+  const want = $("#view-game").classList.contains("active") || (L.sel === "p:enemy_cap" && $("#view-mods").classList.contains("active"));
+  if (!want || document.hidden) return;
+  const r = await api("live").catch(() => null);
+  S.live = r && r.running ? r : null;
+  if ($("#view-game").classList.contains("active")) renderPanel(S.live);
+}
+$("#safemodebtn").onclick = () => busy($("#safemodebtn"), async () => {
+  await api("safe-mode", {}); toast("Safe mode off: the next start loads plugins and mods"); await refresh();
+});
+setInterval(renderLive, 1500);
+$("#loaderbtn").onclick = () => {
+  const action = $("#loaderbtn").dataset.action || "install";
+  if (action === "remove" && !confirm("Remove the loader? Mods move back into the game's folder (originals kept); plugins stop loading.")) return;
+  busy($("#loaderbtn"), async () => {
+    const r = await api("loader", { action });
+    toast(action === "install" ? (r.updated ? "Loader updated; your settings are kept" : "Loader installed" + (r.chained ? `; your previous dinput8.dll is chained as ${r.chained}` : "")) : "Loader removed");
+    await refresh();
+  });
+};
+$("#loadersettings").onclick = () => { L.sel = "loader"; L.tab = "settings"; go("mods"); };
+$("#restorebtn").onclick = () => busy($("#restorebtn"), async () => {
+  if (!confirm("Put every archive Riftstone changed back to the original?")) return;
+  const r = await api("restore", {}); toast(`Restored ${r.restored.length} archive(s)`); await refresh();
+});
+$("#modalclose").onclick = () => $("#modal").classList.remove("open");
+$("#modal").onclick = e => { if (e.target.id === "modal") $("#modal").classList.remove("open"); };
+try { const v = sessionStorage.getItem("riftstone.view"); if (v && v !== "home") go(v); } catch (e) {}
+
+refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>

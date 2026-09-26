@@ -1,0 +1,395 @@
+{
+ "source": "DDO.exe MtDTI registry (client 03.04.003)",
+ "shell_lists": 11,
+ "unknown_ids": [],
+ "classes": {
+  "0x01B191D4": {
+   "name": "cShlParamCompList",
+   "parent": "cShlParamComponent"
+  },
+  "0x65E75A0D": {
+   "name": "cShlParamComponent",
+   "parent": "MtObject"
+  },
+  "0x2EA10CEB": {
+   "name": "MtObject",
+   "parent": null
+  },
+  "0x01F14E36": {
+   "name": "cShlParamAlchemColEnchant",
+   "parent": "cShlParamEnchant"
+  },
+  "0x0941236C": {
+   "name": "cShlParamEnchant",
+   "parent": "cShlParamBase"
+  },
+  "0x5FB7D583": {
+   "name": "cShlParamBase",
+   "parent": "MtObject"
+  },
+  "0x06035C61": {
+   "name": "cShlParamNotifyCatch",
+   "parent": "cShlParamSpeed"
+  },
+  "0x133F9104": {
+   "name": "cShlParamSpeed",
+   "parent": "cShlParamBase"
+  },
+  "0x06C85C82": {
+   "name": "cShlParamBakuensenSpark",
+   "parent": "cShlParamBase"
+  },
+  "0x06CC15D3": {
+   "name": "uShlStateSurveillance::cStateSurveillanceInfo",
+   "parent": "MtObject"
+  },
+  "0x0C08A345": {
+   "name": "cShlParamDividedCalled::cDividedCalledParam",
+   "parent": "MtObject"
+  },
+  "0x0D89B1B6": {
+   "name": "cShlParamCompKeyFrame",
+   "parent": "cShlParamComponent"
+  },
+  "0x0F1FA3CB": {
+   "name": "cShlParamJob10CS06",
+   "parent": "cShlParamCustomSpline"
+  },
+  "0x7626A6C4": {
+   "name": "cShlParamCustomSpline",
+   "parent": "cShlParamSpline"
+  },
+  "0x34DB303B": {
+   "name": "cShlParamSpline",
+   "parent": "cShlParamBase"
+  },
+  "0x14BBA0EC": {
+   "name": "cShlParamArrowRainCtrl::cShootCtrlParamArrowRainCtrl",
+   "parent": "cShlParamGenerator::cShootCtrlParam"
+  },
+  "0x720688DA": {
+   "name": "cShlParamGenerator::cShootCtrlParam",
+   "parent": "MtObject"
+  },
+  "0x14F0B46A": {
+   "name": "cShlParamHitReactionStick",
+   "parent": "cShlParamStick"
+  },
+  "0x53A24520": {
+   "name": "cShlParamStick",
+   "parent": "cShlParamBase"
+  },
+  "0x153BE451": {
+   "name": "cKeyFrameValueF32",
+   "parent": "MtObject"
+  },
+  "0x18849460": {
+   "name": "cShlParamAlchemyCS03::cDamageAlchemyValueInfo",
+   "parent": "MtObject"
+  },
+  "0x18861F27": {
+   "name": "cShlParamBakuensen",
+   "parent": "cShlParamKeepLog"
+  },
+  "0x0464870E": {
+   "name": "cShlParamKeepLog",
+   "parent": "cShlParamBase"
+  },
+  "0x1B465F48": {
+   "name": "cShlParamJob09CS11Alchem",
+   "parent": "cShlParamAlchemColBase"
+  },
+  "0x23A90E98": {
+   "name": "cShlParamAlchemColBase",
+   "parent": "cShlParamBase"
+  },
+  "0x1C5F9931": {
+   "name": "cShlParamRenmadanCtrl::cRenmaSubCtrlParam",
+   "parent": "MtObject"
+  },
+  "0x1D42FE61": {
+   "name": "cShlParamJob08CS13",
+   "parent": "cShlParamMgcArrow"
+  },
+  "0x7E66F223": {
+   "name": "cShlParamMgcArrow",
+   "parent": "cShlParamHoming"
+  },
+  "0x69C8C479": {
+   "name": "cShlParamHoming",
+   "parent": "cShlParamSpeed"
+  },
+  "0x210A816F": {
+   "name": "cShlParamCompCollision",
+   "parent": "cShlParamComponent"
+  },
+  "0x211E0F85": {
+   "name": "cShlParamMeteo",
+   "parent": "cShlParamBase"
+  },
+  "0x22724000": {
+   "name": "cShlParamJob06CS13",
+   "parent": "cShlParamCustomSpline"
+  },
+  "0x2295CA44": {
+   "name": "cShlParamHitReactionSpline",
+   "parent": "cShlParamSpline"
+  },
+  "0x23BB7A3C": {
+   "name": "cShlGroupParam",
+   "parent": "MtObject"
+  },
+  "0x23D20CFD": {
+   "name": "cShlParamArrowRainCtrl",
+   "parent": "cShlParamGenerator"
+  },
+  "0x66B7802A": {
+   "name": "cShlParamGenerator",
+   "parent": "cShlParamBase"
+  },
+  "0x271FACCD": {
+   "name": "cShlParamMeteoCtrl",
+   "parent": "cShlParamGenerator"
+  },
+  "0x2B862F12": {
+   "name": "cShlParamStateSurveillance",
+   "parent": "cShlParamStick"
+  },
+  "0x2CA03D21": {
+   "name": "cShlParamFireWallCtrl",
+   "parent": "cShlParamBase"
+  },
+  "0x2CE6F9C4": {
+   "name": "cShlParamJob09CS11Blow",
+   "parent": "cShlParamBase"
+  },
+  "0x2D3F4400": {
+   "name": "cShlParamShortChargeRe",
+   "parent": "cShlParamBase"
+  },
+  "0x2D4094B3": {
+   "name": "cShlParamKeyFrameSpeed",
+   "parent": "cShlParamSpeed"
+  },
+  "0x2D5DDDF8": {
+   "name": "cShlParamSpline::cSplineShlNodeParam",
+   "parent": "MtObject"
+  },
+  "0x3006449E": {
+   "name": "cShlParamStickCtrl2",
+   "parent": "cShlParamStickCtrl"
+  },
+  "0x56DCBC48": {
+   "name": "cShlParamStickCtrl",
+   "parent": "cShlParamBase"
+  },
+  "0x30E7BFF1": {
+   "name": "cShlParamReflectWall",
+   "parent": "cShlParamHoming"
+  },
+  "0x325AACA5": {
+   "name": "rShlParamList",
+   "parent": "cResource"
+  },
+  "0x5CDD1F19": {
+   "name": "cResource",
+   "parent": "MtObject"
+  },
+  "0x36F698F6": {
+   "name": "cShlParamElemntCover",
+   "parent": "cShlParamCustomConditionBase"
+  },
+  "0x44E72503": {
+   "name": "cShlParamCustomConditionBase",
+   "parent": "cShlParamConditionBase"
+  },
+  "0x710E280C": {
+   "name": "cShlParamConditionBase",
+   "parent": "cShlParamBase"
+  },
+  "0x3825A2F8": {
+   "name": "cShlParamGeneAlongGround",
+   "parent": "cShlParamGenerator"
+  },
+  "0x3B162A31": {
+   "name": "cShlParamBreath",
+   "parent": "cShlParamBase"
+  },
+  "0x3C16D5A3": {
+   "name": "cShlParamJob06CS14",
+   "parent": "cShlParamBase"
+  },
+  "0x3CF2821F": {
+   "name": "cShlParamComponentCtrl",
+   "parent": "cShlParamBase"
+  },
+  "0x3E6DFEC1": {
+   "name": "cShlParamJob08Cs12Pad",
+   "parent": "cShlParamPadCtrl"
+  },
+  "0x6714726F": {
+   "name": "cShlParamPadCtrl",
+   "parent": "cShlParamSpeed"
+  },
+  "0x437252F6": {
+   "name": "cShlParamIntervalHitStick",
+   "parent": "cShlParamStick"
+  },
+  "0x442E81CC": {
+   "name": "cShlParamArrow",
+   "parent": "cShlParamSpeed"
+  },
+  "0x452033E6": {
+   "name": "cShlParamRenmadanMain",
+   "parent": "cShlParamHoming"
+  },
+  "0x46D686C3": {
+   "name": "cShlParamJob04CS14",
+   "parent": "cShlParamCustomSpline"
+  },
+  "0x47112A92": {
+   "name": "cShlParamCompCondition",
+   "parent": "cShlParamComponent"
+  },
+  "0x4E2CB6FD": {
+   "name": "cShlParamJob09CS11",
+   "parent": "cShlParamKeyFrameSpeed"
+  },
+  "0x4FAC1A6D": {
+   "name": "cShlParamCompSelectorJob10Cs08",
+   "parent": "cShlParamCompSelector"
+  },
+  "0x3400EBF0": {
+   "name": "cShlParamCompSelector",
+   "parent": "cShlParamComponent"
+  },
+  "0x53F7601C": {
+   "name": "cShlParamAlchemyTrap::cTrapAttackShlInfo",
+   "parent": "MtObject"
+  },
+  "0x55757096": {
+   "name": "cShlParamJob06CS12",
+   "parent": "cShlParamBase"
+  },
+  "0x55DA5919": {
+   "name": "cShlParamIntervalHitBase",
+   "parent": "cShlParamBase"
+  },
+  "0x599A082B": {
+   "name": "cShlParamCompConditionJob10Cs08",
+   "parent": "cShlParamCompCustomCondition"
+  },
+  "0x248E3102": {
+   "name": "cShlParamCompCustomCondition",
+   "parent": "cShlParamCompCondition"
+  },
+  "0x5ADB4840": {
+   "name": "cShlParamAlchemyTrap",
+   "parent": "cShlParamAlchemyObj"
+  },
+  "0x76931753": {
+   "name": "cShlParamAlchemyObj",
+   "parent": "cShlParamBase"
+  },
+  "0x5BBDAFA7": {
+   "name": "cShlParamJob08Cs05Ex02Stick",
+   "parent": "cShlParamStick"
+  },
+  "0x5ED2F7A4": {
+   "name": "cShlParamAlchemyCS03Ex01",
+   "parent": "cShlParamAlchemyCS03"
+  },
+  "0x62EF778E": {
+   "name": "cShlParamAlchemyCS03",
+   "parent": "cShlParamAlchemy"
+  },
+  "0x625321D6": {
+   "name": "cShlParamAlchemy",
+   "parent": "cShlParamStick"
+  },
+  "0x60731C73": {
+   "name": "cShlParamAlchemColTrapAttack",
+   "parent": "cShlParamAlchemyTrapAttack"
+  },
+  "0x673E1E34": {
+   "name": "cShlParamAlchemyTrapAttack",
+   "parent": "cShlParamBase"
+  },
+  "0x6111C2E7": {
+   "name": "cShlParamJob10CS04",
+   "parent": "cShlParamSpeed"
+  },
+  "0x62C4C33E": {
+   "name": "cShlParamJob08CS12Npc",
+   "parent": "cShlParamHoming"
+  },
+  "0x62FD0792": {
+   "name": "cShlParamJob11MarkUp",
+   "parent": "cShlParamStick"
+  },
+  "0x6B421E7F": {
+   "name": "cShlParamJob08Cs12Homing",
+   "parent": "cShlParamHoming"
+  },
+  "0x6B9CAA08": {
+   "name": "cShlParamMgcArrowErosion",
+   "parent": "cShlParamHoming"
+  },
+  "0x6D8F9A3B": {
+   "name": "cShlParamEnergyCharge",
+   "parent": "cShlParamBase"
+  },
+  "0x70E13D6B": {
+   "name": "cShlParamHitReactionConditionStick",
+   "parent": "cShlParamConditionStick"
+  },
+  "0x2E8B626C": {
+   "name": "cShlParamConditionStick",
+   "parent": "cShlParamStick"
+  },
+  "0x71134D41": {
+   "name": "MtArray",
+   "parent": "MtObject"
+  },
+  "0x722CABC3": {
+   "name": "cShlParamFriendSupport",
+   "parent": "cShlParamBase"
+  },
+  "0x727349C7": {
+   "name": "cShlParamFollowMove",
+   "parent": "cShlParamBase"
+  },
+  "0x73184D37": {
+   "name": "cShlParamShortCharge",
+   "parent": "cShlParamFollowMove"
+  },
+  "0x73960E2B": {
+   "name": "cShlParamDividedCalled",
+   "parent": "cShlParamBase"
+  },
+  "0x7818935D": {
+   "name": "cShlParamJob10CS07",
+   "parent": "cShlParamBase"
+  },
+  "0x78230FE7": {
+   "name": "cShlParamMgcArrowErosionCtrl",
+   "parent": "cShlParamBase"
+  },
+  "0x782A8FF8": {
+   "name": "cShlParamRenmadanCtrl",
+   "parent": "cShlParamBase"
+  },
+  "0x793E7E5C": {
+   "name": "cShlParamConstErosion",
+   "parent": "cShlParamBase"
+  },
+  "0x7F894E71": {
+   "name": "cShlParamCustomConditionFollowMove",
+   "parent": "cShlParamConditionFollowMove"
+  },
+  "0x7F9811DC": {
+   "name": "cShlParamConditionFollowMove",
+   "parent": "cShlParamFollowMove"
+  }
+ }
+}

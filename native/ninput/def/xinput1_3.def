@@ -1,0 +1,13 @@
+LIBRARY xinput1_3
+EXPORTS
+    XInputGetState=nx_XInputGetState @2
+    XInputSetState=nx_XInputSetState @3
+    XInputGetCapabilities=nx_XInputGetCapabilities @4
+    XInputEnable=nx_XInputEnable @5
+    XInputGetDSoundAudioDeviceGuids=nx_XInputGetDSoundAudioDeviceGuids @6
+    XInputGetBatteryInformation=nx_XInputGetBatteryInformation @7
+    XInputGetKeystroke=nx_XInputGetKeystroke @8
+    XInputGetStateEx=nx_XInputGetStateEx @100 NONAME
+    XInputWaitForGuideButton=nx_XInputWaitForGuideButton @101 NONAME
+    XInputCancelGuideButtonWait=nx_XInputCancelGuideButtonWait @102 NONAME
+    XInputPowerOffController=nx_XInputPowerOffController @103 NONAME

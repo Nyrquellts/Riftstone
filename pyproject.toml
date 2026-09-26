@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "riftstone"
+version = "0.3.1"
+description = "Dragon's Dogma: Dark Arisen and Dragon's Dogma Online modding suite: archives, parameter YAML, mods, the loader and its plugins, Studio"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+riftstone = "riftstone.cli:main"
+riftstone-audio = "riftstone.audio_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+riftstone = ["data/*.json", "data/*.json.gz", "studio/*.html", "studio/*.svg", "studio/fonts/*"]
