@@ -12,9 +12,13 @@ The stream is packed little-endian, read field by field::
 
   mCoreHeader    "NAV\\0", u32 version 0x21, u32 0, u32 the u32 slots of mpNodeBuffer (every triangle's
                  lists together; the loader allocates that many and trusts it)
-  mName          u32 n, then n + 1 bytes ending in NUL ("new Navigation" in 38 of 41 files)
+  mName          u32 n, then n characters and a NUL ("new Navigation" in 38 of 41 files).  The loader
+                 (0x00CFEE30) reads a name up to its first NUL, whatever n says, and copies up to n
+                 characters into a 256-byte buffer on its stack: a NUL before the end would move every
+                 field after it, and a name of more than 255 characters overruns that buffer
   counts         u32 vertices, u32 triangles (mNumberOfNode), u32 node infos (0 in every file),
-                 u8 1 when every vertex carries mpNearWall and mpWallDistance (1 in every file)
+                 u8 1 when every vertex carries mpNearWall and mpWallDistance (1 in every file; the loader
+                 reads them only after a 1, 0x010992D6, and 0 is the only other value written)
   vertex         float3 position (centimetres, stage space), then u8 near-wall and u16 wall distance
                  (0 and 0 in every file)
   triangle       (nodeData, 0x50 bytes in memory) s32 its own index, u32 n + u32[n] attributes (one
@@ -43,7 +47,8 @@ carries no debug records for, so their parts are named after its methods (``node
 ``getNodeArea``, ``HierarchyArea::getGeometry``, ``getChild``, ``getLink``).
 
 Every count and index the loader uses unchecked (list sizes, vertex and neighbour indices, the buffer
-total, the tree size) is checked here, so a mesh this module accepts is one the loader can read.
+total, the tree size, the names' lengths) is checked here, so a mesh this module accepts is one the loader
+can read; and every number is finite, so the one this module writes back is the same file, byte for byte.
 
 A stage does not always load its own mesh: the engine's stage table (0x01530348: 65 stage numbers, and
 0x015303D0: 65 rows of 11 s16) names, in a row's seventh field, the stage whose ``_nav`` it loads (read at
@@ -65,6 +70,8 @@ VERSION = 0x21
 LINK_WORDS = 6              # a link fills six u32 slots of mpNodeBuffer
 QUAD_DEPTH_MAX = 10         # 7 in every file; 10 would be 349,525 tree nodes
 MAX_COUNT = 1 << 22         # sanity bound on any count (the biggest mesh has 11,238 triangles)
+NAME_MAX = 255              # characters in a name: the loader's buffers for the mesh's and each area's are 256 bytes
+F32_MAX = 3.4028234663852886e38
 BOX, OBB, SPHERE = 0, 1, 2
 _GEOMETRY_FLOATS = {BOX: 6, OBB: 3 + 16, SPHERE: 4}
 
@@ -83,17 +90,20 @@ def stage_table(exe: bytes) -> dict:
     STAGE_TABLE, STAGE_ROWS field NAV_FIELD) -- how ``NAV_OF`` is checked against the player's exe."""
     if len(exe) < 0x200 or exe[:2] != b"MZ":
         raise RiftError("not a Windows executable")
-    pe = struct.unpack_from("<I", exe, 0x3C)[0]
-    if exe[pe:pe + 4] != b"PE\0\0" or struct.unpack_from("<H", exe, pe + 0x18)[0] != 0x10B:
-        raise RiftError("not a 32-bit Windows executable")
-    base = struct.unpack_from("<I", exe, pe + 0x34)[0]
-    nsec, optsz = struct.unpack_from("<H", exe, pe + 6)[0], struct.unpack_from("<H", exe, pe + 20)[0]
-    sections = [struct.unpack_from("<IIII", exe, pe + 24 + optsz + 40 * i + 8) for i in range(nsec)]
+    try:                        # headers that run past the end of the file are struct.errors, not a crash
+        pe = struct.unpack_from("<I", exe, 0x3C)[0]
+        if exe[pe:pe + 4] != b"PE\0\0" or struct.unpack_from("<H", exe, pe + 0x18)[0] != 0x10B:
+            raise RiftError("not a 32-bit Windows executable")
+        base = struct.unpack_from("<I", exe, pe + 0x34)[0]
+        nsec, optsz = struct.unpack_from("<H", exe, pe + 6)[0], struct.unpack_from("<H", exe, pe + 20)[0]
+        sections = [struct.unpack_from("<IIII", exe, pe + 24 + optsz + 40 * i + 8) for i in range(nsec)]
+    except struct.error:
+        raise RiftError("the executable's headers run past the end of the file") from None
 
     def read(va: int, n: int) -> bytes:
         rva = va - base
         for vsize, sva, rsize, rptr in sections:
-            if sva <= rva and rva + n <= sva + min(vsize, rsize):
+            if sva <= rva and rva + n <= sva + min(vsize, rsize) and rptr + rva - sva + n <= len(exe):
                 return exe[rptr + rva - sva:rptr + rva - sva + n]
         raise RiftError(f"0x{va:08x} is not in the executable's file (another build?)")
     stages = struct.unpack("<65H", read(STAGE_TABLE, 130))
@@ -216,14 +226,38 @@ class _Reader:
         o = self.need(n)
         return self.d[o:o + n]
 
-    def text(self) -> bytes:
-        n = self.count("a name's length", 0xFFFF)
-        return self.raw(n + 1)
+    def text(self, what: str) -> bytes:
+        """u32 n, then the name's n characters and its NUL, as the loader reads it: to the first NUL, into a
+        256-byte buffer (0x00CFEE30), so a NUL anywhere else or a longer name is refused."""
+        o = self.o
+        n = self.u32()
+        if n > NAME_MAX:
+            raise FormatError("nav", f"{what} is {n} characters; the loader's buffer holds {NAME_MAX}", o)
+        raw = self.raw(n + 1)
+        if not _name_ok(raw):
+            raise FormatError("nav", f"{what} is not {n} characters and a NUL (the loader reads a name up to its "
+                                     "first NUL)", o)
+        return raw
+
+
+def _name_ok(name: bytes) -> bool:
+    """n characters (no NUL among them, at most NAME_MAX) and a NUL: the loader reads the same name the file says."""
+    return 1 <= len(name) <= NAME_MAX + 1 and name[-1] == 0 and 0 not in name[:-1]
 
 
 def _finite(values, what: str, where: int) -> None:
     if not all(math.isfinite(v) for v in values):
         raise FormatError("nav", f"{what} is not a finite number", where)
+
+
+def _f32(values, what: str) -> None:
+    """Every float build writes: finite and within a float32's range (so the file parses back as written)."""
+    try:
+        if all(math.isfinite(v) and abs(v) <= F32_MAX for v in values):
+            return
+    except TypeError:
+        pass
+    raise FormatError("nav", f"{what} is not a finite 32-bit number")
 
 
 def parse(data: bytes) -> Nav:
@@ -235,10 +269,14 @@ def parse(data: bytes) -> Nav:
         raise FormatError("nav", f"version 0x{version:x}; both games' meshes are 0x{VERSION:x}")
     r = _Reader(data)
     r.o = 16
-    name = r.text()
+    name = r.text("the mesh's name")
     nv, nt = r.count("vertices"), r.count("triangles")
     ni = r.count("node infos")
+    o = r.o
     extras = r.u8()
+    if extras > 1:
+        raise FormatError("nav", f"the vertex-extras byte is {extras}: 1 when every vertex carries its near-wall "
+                                 "flag and wall distance, else 0 (the loader reads them only after a 1)", o)
     positions, near, dist = [], ([] if extras == 1 else None), ([] if extras == 1 else None)
     for _ in range(nv):
         o = r.o
@@ -254,8 +292,10 @@ def parse(data: bytes) -> Nav:
         index = struct.unpack_from("<i", data, r.need(4))[0]
         attributes = [r.u32() for _ in range(r.count("a triangle's attributes", 1 << 16))]
         flag = r.u8()
+        fo = r.o
         vector = r.f(3)
         value = r.f(1)[0]
+        _finite(vector + (value,), f"triangle {i}'s vector or value", fo)
         areas = [r.u32() for _ in range(r.u8())]
         n = r.count("a triangle's corners", 1 << 16)
         corners = list(struct.unpack_from(f"<{n}i", data, r.need(4 * n)))
@@ -268,7 +308,7 @@ def parse(data: bytes) -> Nav:
             cost, t1, t2 = r.f(3)
             if to >= nt:
                 raise FormatError("nav", f"triangle {i} links to triangle {to} past the mesh's {nt}", lo)
-            _finite((cost,), "a link's cost", lo)
+            _finite((cost, t1, t2), "a link's cost (or a number after it)", lo)
             if cost < 0:
                 raise FormatError("nav", f"triangle {i}'s link to {to} has a negative cost (every game's is the "
                                          "distance between the two triangles)", lo)
@@ -280,7 +320,7 @@ def parse(data: bytes) -> Nav:
     areas = []
     for _ in range(r.u16()):
         aid = r.u16()
-        aname = r.text()
+        aname = r.text(f"area {aid}'s name")
         avalue = r.u32()
         o = r.o
         ng = r.u32()
@@ -289,7 +329,10 @@ def parse(data: bytes) -> Nav:
         geometries = []
         for _ in range(ng):
             kind = r.u8()
-            geometries.append(Geometry(kind, r.f(_GEOMETRY_FLOATS[kind]) if kind in _GEOMETRY_FLOATS else ()))
+            go = r.o
+            values = r.f(_GEOMETRY_FLOATS[kind]) if kind in _GEOMETRY_FLOATS else ()
+            _finite(values, f"area {aid}'s geometry", go)
+            geometries.append(Geometry(kind, values))
         first, count, parent = r.u16(), r.u16(), r.u16()
         children = r.raw(r.u8())
         alinks = r.raw(r.u8())
@@ -309,7 +352,9 @@ def parse(data: bytes) -> Nav:
     nodes = r.u32()
     if not 1 <= depth <= QUAD_DEPTH_MAX or nodes != (4 ** depth - 1) // 3:
         raise FormatError("nav", f"a quadtree of depth {depth} has {(4 ** depth - 1) // 3} nodes, not {nodes}", o)
+    o = r.o
     bounds = r.f(8)
+    _finite(bounds, "the quadtree's bounds", o)
     cells = []
     for _ in range(nodes):
         o = r.o
@@ -341,11 +386,12 @@ def build(nav: Nav) -> bytes:
         raise FormatError("nav", "every vertex needs its near-wall flag and wall distance")
     buffer_total = sum(len(t.attributes) + len(t.areas) + len(t.corners) + LINK_WORDS * len(t.links) for t in tris)
     p(struct.pack("<4sIII", MAGIC, nav.version, nav.word, buffer_total))
-    if not nav.name.endswith(b"\0"):
-        raise FormatError("nav", "the mesh's name must end in NUL")
+    if not _name_ok(nav.name):
+        raise FormatError("nav", f"the mesh's name is at most {NAME_MAX} characters and ends in its only NUL")
     p(struct.pack("<I", len(nav.name) - 1) + nav.name)
     p(struct.pack("<IIIB", len(nav.positions), len(tris), len(nav.infos), 1 if extras else 0))
     for i, pos in enumerate(nav.positions):
+        _f32(pos, f"vertex {i}")
         p(struct.pack("<3f", *pos))
         if extras:
             p(struct.pack("<BH", nav.near_wall[i], nav.wall_distance[i]))
@@ -355,6 +401,7 @@ def build(nav: Nav) -> bytes:
             raise FormatError("nav", f"triangle {i} names a vertex or a neighbour the mesh does not have")
         if any(not (math.isfinite(lk.cost) and lk.cost >= 0) for lk in t.links):
             raise FormatError("nav", f"triangle {i} has a link whose cost is negative or not a number")
+        _f32((*t.vector, t.value, *(v for lk in t.links for v in (lk.cost, *lk.tail))), f"triangle {i}'s numbers")
         if len(t.areas) > 255:
             raise FormatError("nav", f"triangle {i} lists more than 255 areas")
         p(struct.pack("<iI", t.index, len(t.attributes)))
@@ -367,14 +414,16 @@ def build(nav: Nav) -> bytes:
             p(struct.pack("<3I3f", lk.to, lk.word, lk.edge, lk.cost, *lk.tail))
     p(struct.pack("<H", len(nav.areas)))
     for a in nav.areas:
-        if not a.name.endswith(b"\0") or len(a.geometries) > 255 or len(a.children) > 255 or len(a.links) > 255:
-            raise FormatError("nav", f"area {a.id} does not fit the loader (name ends in NUL, at most 255 each)")
+        if not _name_ok(a.name) or len(a.geometries) > 255 or len(a.children) > 255 or len(a.links) > 255:
+            raise FormatError("nav", f"area {a.id} does not fit the loader (a name of at most {NAME_MAX} characters "
+                                     "ending in its only NUL; at most 255 geometries, children and links)")
         p(struct.pack("<HI", a.id, len(a.name) - 1) + a.name)
         p(struct.pack("<II", a.value, len(a.geometries)))
         for g in a.geometries:
             want = _GEOMETRY_FLOATS.get(g.kind, 0)
             if len(g.values) != want:
                 raise FormatError("nav", f"a kind-{g.kind} area geometry has {want} numbers, not {len(g.values)}")
+            _f32(g.values, f"area {a.id}'s geometry")
             p(struct.pack(f"<B{want}f", g.kind, *g.values))
         p(struct.pack("<HHHB", a.first, a.count, a.parent, len(a.children)) + a.children)
         p(struct.pack("<B", len(a.links)) + a.links)
@@ -384,8 +433,10 @@ def build(nav: Nav) -> bytes:
         if len(blob) != 32:
             raise FormatError("nav", "a node info is a word and 32 bytes")
         p(struct.pack("<I", word) + blob)
-    if len(nav.cells) != (4 ** nav.depth - 1) // 3:
-        raise FormatError("nav", f"a quadtree of depth {nav.depth} has {(4 ** nav.depth - 1) // 3} nodes")
+    if not 1 <= nav.depth <= QUAD_DEPTH_MAX or len(nav.cells) != (4 ** nav.depth - 1) // 3:
+        raise FormatError("nav", f"a quadtree is 1..{QUAD_DEPTH_MAX} deep, and one of depth {nav.depth} has "
+                                 f"{(4 ** nav.depth - 1) // 3 if 1 <= nav.depth <= QUAD_DEPTH_MAX else 'no'} nodes")
+    _f32(nav.bounds, "the quadtree's bounds")
     p(struct.pack("<BI8f", nav.depth, len(nav.cells), *nav.bounds))
     for cell in nav.cells:
         if any(not 0 <= t < nt for t, _ in cell):
@@ -394,9 +445,29 @@ def build(nav: Nav) -> bytes:
     return bytes(out)
 
 
+def regions(triangles) -> list[int]:
+    """Each triangle's walkable region (triangles joined by links): the same number for the same region.  Reads
+    only the links, so it answers for any mesh parse accepts (the queries also need three corners each)."""
+    parent = list(range(len(triangles)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for i, t in enumerate(triangles):
+        for lk in t.links:
+            ri, rj = find(i), find(lk.to)
+            if ri != rj:
+                parent[ri] = rj
+    return [find(i) for i in range(len(triangles))]
+
+
 def info(nav: Nav) -> str:
-    m = Mesh(nav)
-    comps = sorted(m.component_sizes().values(), reverse=True)
+    sizes = defaultdict(int)
+    for c in regions(nav.triangles):
+        sizes[c] += 1
+    comps = sorted(sizes.values(), reverse=True)
     name = nav.name.rstrip(b"\0").decode("latin-1")
     attrs = sum(1 for t in nav.triangles if t.attribute)
     lo = [min(p[a] for p in nav.positions) for a in range(3)] if nav.positions else [0.0] * 3
@@ -517,19 +588,7 @@ class Mesh:
     def component(self, t: int) -> int:
         """The walkable region triangle t belongs to (triangles joined by links)."""
         if self._comp is None:
-            parent = list(range(len(self.tris)))
-
-            def find(i):
-                while parent[i] != i:
-                    parent[i] = parent[parent[i]]
-                    i = parent[i]
-                return i
-            for i, links in enumerate(self.adj):
-                for j, _ in links:
-                    ri, rj = find(i), find(j)
-                    if ri != rj:
-                        parent[ri] = rj
-            self._comp = [find(i) for i in range(len(self.tris))]
+            self._comp = regions(self.nav.triangles)
         return self._comp[t]
 
     def component_sizes(self) -> dict:
@@ -649,19 +708,15 @@ _MESHES: dict = {}
 
 
 def game_resource(game, idx, name: bytes, type_id: int) -> bytes | None:
-    """One resource as the game ships it (the first archive holding it), reading only that entry."""
-    from .corpus import directory, encrypted, payload
+    """One resource as the game ships it (the first archive holding it), reading only that entry.  Its stream is
+    checked as modfiles.load checks it (arc.Entry.data): a damaged entry is a FormatError, not a zlib.error."""
+    from .modfiles import _entry
 
     arcs = idx.archives_with(name, type_id)
     if not arcs:
         return None
-    path = game.vanilla_arc(arcs[0])
-    for n, t, stored, _size, off in directory(path):
-        if n == name and t == type_id:
-            with open(path, "rb") as fh:
-                fh.seek(off)
-                return payload(fh.read(stored), encrypted(path))
-    return None
+    e = _entry(game.vanilla_arc(arcs[0]), name, type_id)
+    return e.data() if e is not None else None
 
 
 def stage_mesh(game, idx, stage: int, mod_root=None) -> Mesh | None:

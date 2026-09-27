@@ -5,9 +5,10 @@ mods like any mod made here.
 Each input archive is matched to the game's archive by its path (the longest tail that names one,
 e.g. ...\\nativePC\\rom\\ui\\gui_cmn.arc or rom\\ui\\gui_cmn.arc) or, failing that, by a unique file
 name.  Resources are compared by their decoded bytes, so a tool that only recompressed an archive
-changes nothing.  A change goes to ``files/`` (every archive holding it) when every copy in the game
-was identical and received the same new bytes; otherwise to ``archives/<arc>.arc/`` for exactly that
-archive.  Editable formats are written as YAML when the YAML rebuilds the exact bytes.
+changes nothing.  A change goes to ``files/`` (every archive holding it) when the inputs change it in
+exactly the archives that hold it, every copy in the game was identical and all received the same new
+bytes; otherwise to ``archives/<arc>.arc/`` for exactly that archive (an archive that adds a resource
+it never had always gets its own copy).  Editable formats are written as YAML when the YAML rebuilds the exact bytes.
 """
 from __future__ import annotations
 
@@ -71,7 +72,7 @@ def match(game: Game, path: Path, base: Path, names: dict[str, str], by_file: di
 def import_archives(game: Game, index, inputs: list[Path], mod_root: Path, yaml: bool = True,
                     per_archive: bool = False, progress=None) -> ImportReport:
     rep = ImportReport()
-    names = {game.arc_name(f).lower(): game.arc_name(f) for f in game.archives()}
+    names = {n.lower(): n for n, _ in game.archive_names()}
     by_file: dict[str, list[str]] = defaultdict(list)
     for n in names.values():
         by_file[n.rsplit("/", 1)[-1].lower()].append(n)
@@ -110,7 +111,8 @@ def import_archives(game: Game, index, inputs: list[Path], mod_root: Path, yaml:
         holders = index.archives_with(name, tid) if index is not None else []
         same_new = len({hashlib.sha256(d).digest() for d in per.values()}) == 1
         same_old = len({vanilla_digest.get((name, tid, a)) for a in holders}) == 1
-        everywhere = bool(holders) and set(holders) <= set(per) and same_new and same_old
+        # files/ reaches the game's holders only: an input archive that adds the resource needs its own copy
+        everywhere = bool(holders) and set(holders) == set(per) and same_new and same_old
         data0 = next(iter(per.values()))
         payload, suffix = data0, ""
         if yaml and params.is_editable_resource(data0, tid):

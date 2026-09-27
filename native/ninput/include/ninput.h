@@ -129,6 +129,10 @@ typedef struct NinputDisplay {
 typedef void (*NinputHotkeyFn)(int slot, void* user);
 typedef void (*NinputTransformFn)(int slot, NinputPad* inout, void* user);
 
+/* The Xbox "Guide" button. The plain XInputGetState masks it out; Ninput sources the game's poll
+ * from XInputGetStateEx so a hotkey can bind it, then clears it before the game reads the pad. */
+#define NINPUT_GAMEPAD_GUIDE 0x0400
+
 typedef struct NinputInput {
     int (*get_state)(int slot, NinputPad* out);  /* 0 == a controller is connected on that slot */
 

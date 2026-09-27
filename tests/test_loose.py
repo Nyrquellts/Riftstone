@@ -11,6 +11,8 @@ from riftstone import install, loader, mod
 from riftstone.errors import BuildError, RiftError
 from riftstone.index import Index
 
+setUpModule, tearDownModule = helpers.module_env("RIFTSTONE_HOME")
+
 
 class LooseTest(unittest.TestCase):
     @classmethod
@@ -112,6 +114,29 @@ class LooseTest(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"edited by hand")
         target.write_bytes(b"mine")
         install.apply(self.game, self.idx, [])
+
+    def test_a_refusal_comes_before_anything_is_written(self):
+        """A loose file in someone else's way, or one edited since Riftstone wrote it, was refused only when its
+        turn came, after the archives were written; a dry run passed.  Both are refused before the first write."""
+        foreign = self.game.overlay_dir / "compat" / "blocked.lmt"
+        foreign.parent.mkdir(parents=True, exist_ok=True)
+        foreign.write_bytes(b"not ours")
+        root = self.new_mod("Blocked", {"compat/blocked.lmt": b"ours"})
+        try:
+            with self.assertRaises(RiftError):
+                install.apply(self.game, self.idx, [root], dry_run=True)
+        finally:
+            foreign.unlink()
+        mine = self.new_mod("Edited", {"compat/edited.lmt": b"mine"})
+        install.apply(self.game, self.idx, [mine])
+        target = self.game.overlay_dir / "compat" / "edited.lmt"
+        target.write_bytes(b"edited by hand")
+        try:
+            with self.assertRaises(RiftError):
+                install.apply(self.game, self.idx, [], dry_run=True)
+        finally:
+            target.write_bytes(b"mine")
+            install.apply(self.game, self.idx, [])
 
     def test_direct_mode_needs_the_loader(self):
         dll = self.game.root / "dinput8.dll"

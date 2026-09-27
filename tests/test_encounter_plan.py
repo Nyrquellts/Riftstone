@@ -78,6 +78,22 @@ class PlanFile(unittest.TestCase):
                     encounter_plan.parse(text)
                 self.assertIn(fragment, str(e.exception))
 
+    def test_huge_numbers_and_deep_nesting_are_refused(self):
+        # was: OverflowError (math.isfinite on a 400-digit integer) and RecursionError (json.loads)
+        deep = 100_000
+        cases = {
+            plan_text(entry(at=[10 ** 400, 0, 0])): "at is [x, y, z]",
+            plan_text(entry(at=[0, -10 ** 400, 0])): "at is [x, y, z]",
+            plan_text(entry(spread=10 ** 400)): "spread is a distance",
+            '{"format": "riftstone-encounters/1", "encounters": ' + "[" * deep + "]" * deep + "}": "not JSON",
+        }
+        for text, fragment in cases.items():
+            with self.subTest(text=text[:80]):
+                with self.assertRaises(RiftError) as e:
+                    encounter_plan.parse(text)
+                self.assertIn(fragment, str(e.exception))
+        self.assertEqual(encounter_plan.parse(plan_text(entry(at=[999999, 0, 0.5], spread=5000)))[0].spread, 5000.0)
+
 
 class ApplyPlan(unittest.TestCase):
     """Plans applied to the stand-in game (tests/world_fixture.py: stage 424, goblins em0100, em0101)."""

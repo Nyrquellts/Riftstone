@@ -1,9 +1,10 @@
 import struct
 import unittest
+from unittest import mock
 
 import helpers
-from riftstone import params, xfs
-from riftstone.errors import ParamError
+from riftstone import params, typemap, xfs, yamlish
+from riftstone.errors import FormatError, ParamError
 
 
 class ParamsTest(unittest.TestCase):
@@ -89,6 +90,30 @@ class ParamsTest(unittest.TestCase):
         self.err("riftstone: xfs/1", "riftstone: xfs/9", "not a Riftstone parameter file")
         self.err("version: 4", "version: -1", "between 0 and 65535")
 
+    def test_huge_numbers_are_refused_in_a_short_message(self):
+        # a hex number thousands of digits long parses (base 16 has no digit limit), and writing it in
+        # decimal for the message raised ValueError ("Exceeds the limit (4300 digits)") instead
+        huge = "0x" + "F" * 3600
+        for old, new in (("mInt: 3735928559", f"mInt: {huge}"), ("mInt: 3735928559", "mInt: " + "9" * 5000),
+                         ("mRange16:\n    - [1, 65535]", f"mRange16:\n    - [1, {huge}]"),
+                         ("version: 4", f"version: {huge}")):
+            with self.subTest(new=new[:20]):
+                with self.assertRaises(ParamError) as cm:
+                    self.edit(old, new)
+                self.assertLess(len(str(cm.exception)), 200)
+
+    def test_a_resource_name_in_any_script(self):
+        # the name (riftstone param passes the file's stem) was encoded as Latin-1 and read back as UTF-8:
+        # "テスト.stm" crashed with UnicodeEncodeError and "é" came out as \udce9
+        raw = xfs.build(helpers.sample_xfs())
+        ext = typemap.extension(0x215896C2)
+        for name in ("テスト", "é", "param\\pl\\x", "a: b # c"):
+            with self.subTest(name=name):
+                text = params.resource_to_yaml(raw, name, 0x215896C2)
+                self.assertEqual(yamlish.parse(text).get("resource").text, f"{name}.{ext}")
+                self.assertEqual(xfs.build(params.from_yaml(text)), raw)
+        self.assertIn(f"resource: param\\pl\\x.{ext}\n", params.resource_to_yaml(raw, "param\\pl\\x", 0x215896C2))
+
     def test_missing_property(self):
         with self.assertRaises(ParamError) as cm:
             params.from_yaml(self.text.replace("  mShort: 65000\n", ""), "t.yaml")
@@ -120,6 +145,23 @@ class ParamsTest(unittest.TestCase):
             raw = xfs.build(x)
             self.assertEqual(xfs.build(params.from_yaml(params.to_yaml(xfs.parse(raw)))), raw, s)
 
+    def test_a_number_too_large_for_a_float_is_not_infinity(self):
+        # f32_bits (the YAML of flat, DDO collision and the other binary formats) stored "1e400" as +inf,
+        # though "1e39" was refused and XFS files refused both; infinity is written .inf
+        for text in ("1e400", "-1e400", "1e39", "infinity"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                params.f32_bits(text)
+        for text, bits in ((".inf", 0x7F800000), ("-.inf", 0xFF800000), ("+inf", 0x7F800000), ("-inf", 0xFF800000)):
+            self.assertEqual(params.f32_bits(text), bits)
+        from riftstone import flat
+        good = flat.to_yaml(flat.Flat("ajp", 0, {"version": 1, "mpArray": [1.0]}))
+        with self.assertRaises(ParamError):
+            flat.yaml_to_bytes(good.replace("mpArray: [1.0]", "mpArray: [1e400]"), "a.yaml")
+        self.err("mFloat: 0.5", "mFloat: 1" + "0" * 5000, "too large")      # a long number is quoted short
+        with self.assertRaises(ParamError) as cm:
+            self.edit("mFloat: 0.5", "mFloat: 1" + "0" * 5000)
+        self.assertLess(len(str(cm.exception)), 200)
+
     def test_nan_literals_are_validated(self):
         for bad in ("nan:0x7fa00000-0.0", "nan:0x3f800000", "nan:0x1ffffffff", "nan:0xzz"):
             with self.assertRaises(ParamError, msg=bad):
@@ -148,6 +190,59 @@ class ParamsTest(unittest.TestCase):
         self.assertGreaterEqual(len(db), 540)
         self.assertIn("rAIFSM", db)
         self.assertIn("rStatusParam", db)
+
+
+def _cls(name, *props):
+    return xfs.ClassDef(typemap.jamcrc(name), 0x10, tuple(props))
+
+
+class EveryParsedTreeConvertsTest(unittest.TestCase):
+    """What xfs.parse accepts, to_yaml writes and from_yaml reads back: riftstone param's output compiles."""
+
+    def round_trip(self, x: xfs.Xfs) -> str:
+        raw = xfs.build(x)
+        text = params.to_yaml(xfs.parse(raw), "t")
+        self.assertEqual(xfs.build(params.from_yaml(text, "t.yaml")), raw)
+        return text
+
+    def test_the_deepest_tree(self):
+        # parse took objects 256 deep and YAML holds 200 levels: a 200-deep chain converted, then from_yaml
+        # refused it.  An object in a list takes two levels, and so does a list of resource references.
+        node = _cls("rDeep", helpers.prop("mNext", "classref"), helpers.prop("mKids", "classref", 0xA0),
+                    helpers.prop("mRefs", "resource", 0xA0))
+        ref = xfs.ResourceRef(b"rTexture", b"a\\b")
+        for in_list in (False, True):
+            with self.subTest(in_list=in_list):
+                o = xfs.Obj(0, [[None], [], [ref, ref]])
+                for _ in range(xfs.MAX_DEPTH):
+                    o = xfs.Obj(0, [[None], [o], []] if in_list else [[o], [], []])
+                self.round_trip(xfs.Xfs(1, [node], o))
+                with mock.patch.object(xfs, "MAX_DEPTH", xfs.MAX_DEPTH + 1):   # one level more: parse refuses
+                    raw = xfs.build(xfs.Xfs(1, [node], xfs.Obj(0, [[o], [], []])))
+                with self.assertRaises(FormatError):
+                    xfs.parse(raw)
+
+    def test_properties_named_like_a_key(self):
+        # a property named _class was written beside the object's own _class line (a duplicate key), and a
+        # repeated name could take the key of a property named name#N
+        odd = _cls("rOdd", helpers.prop("_class", "u32"), helpers.prop("a", "u32"), helpers.prop("a#2", "u32"),
+                   helpers.prop("a", "u32"), helpers.prop("a", "u32"), helpers.prop("_class", "u32"))
+        text = self.round_trip(xfs.Xfs(1, [odd], xfs.Obj(0, [[1], [2], [3], [4], [5], [6]])))
+        self.assertIn("_class#2: 1\n", text)
+        self.assertEqual(params.prop_keys(odd), ["_class#2", "a", "a#2", "a#3", "a#4", "_class#3"])
+
+    def test_the_most_objects(self):
+        # parse numbers objects 0..65535 (65,536 of them), but build and from_yaml stopped at 65,535
+        many = _cls("rMany", helpers.prop("mKids", "classref", 0xA0))
+        x = xfs.Xfs(1, [many, _cls("rLeaf")], xfs.Obj(0, [[xfs.Obj(1, []) for _ in range(0xFFFF)]]))
+        text = self.round_trip(x)
+        leaf = next(line for line in text.splitlines(True) if line.lstrip().startswith("- _class:"))
+        with self.assertRaises(ParamError) as cm:           # one more cannot be numbered
+            params.from_yaml(text.replace(leaf, leaf * 2, 1), "t.yaml")
+        self.assertIn("more than 65536 objects", str(cm.exception))
+        x.root.fields[0].append(xfs.Obj(1, []))
+        with self.assertRaises(FormatError):
+            xfs.build(x)
 
 
 if __name__ == "__main__":

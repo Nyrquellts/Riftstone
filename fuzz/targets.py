@@ -12,7 +12,8 @@ xfs      parse -> build is canonical; YAML of anything parsable rebuilds the sam
 xfs_ddo_text  Online strings (Shift-JIS): bytes survive YAML; typed text stored as cp932 or refused
 params   YAML text -> XFS -> YAML -> XFS reaches a fixed point
 yaml     parse -> emit -> parse gives the same tree
-fsmap    names <-> paths reverse exactly; decoded user paths are canonical
+fsmap    names <-> paths reverse exactly for every resource type (a two-byte selector); decoded user paths are
+         canonical
 live_block  the loader's live-stats page: parses or refuses; what parses describes itself, sizes stay sane; the
          memory verdict is bound whenever the address space left is under 400 MB; Direct3D and pressure fields
          are said when set
@@ -44,7 +45,9 @@ mission  mission grammars: refused, or finite and seeded missions whose main pat
 wfc      small constraint problems: every answer satisfies every constraint; "unsatisfiable" is confirmed by
          trying every assignment; the same seed, the same answer
 dungeon  the level director with hostile options on a stage with a mesh: refused, or main beats deeper one after
-         another and every planned spawn point on the mesh in the doors' region
+         another and every planned spawn point on the mesh in the doors' region; the dry run writes nothing
+ground   encounters on a stage with a mesh, hostile spot, count, spread and ground choice: refused, or spawn points
+         on the mesh, reached on foot from the first, apart and with room as the rules say, fewer only when said
 names    plain names for any path or search word: a title says what the file is, enemies and stages only from the
          tables (case and a .yaml suffix aside), whole names before names holding the words
 mod_names  --mod "<name>": a path stays as given; a name is a mod of the mods folder, or refused; a new one is made
@@ -62,6 +65,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.append(str(Path(__file__).resolve().parents[1] / "tools"))         # check_corpus: the gate's own checks
 
 from riftstone import arc, arcfolder, fsmap, ocl, params, typemap, xfs, yamlish  # noqa: E402
 from riftstone.errors import FormatError, RiftError  # noqa: E402
@@ -587,7 +591,8 @@ def t_lmt(data: bytes) -> None:
 
 def t_port_lmt(data: bytes) -> None:
     """A motion list ported to the other game (first byte: direction): refuses cleanly, or gives a file
-    the strict reader accepts with the destination's version, every track's bone and key frames kept."""
+    the strict reader accepts with the destination's version, every motion slot and every track kept (counted,
+    since the pairs compared stop at the shorter list), each track's bone and key frames kept."""
     from riftstone import lmt, lmtcodec, port
 
     if not data:
@@ -600,8 +605,10 @@ def t_port_lmt(data: bytes) -> None:
         return
     b = lmt.parse(out.data)
     assert b.version == port.LMT_VERSION[dst], "ported to the wrong version"
+    assert len(b.motions) == len(a.motions), f"the port has {len(b.motions)} motion slots, not {len(a.motions)}"
     for ma, mb in zip(a.motions, b.motions):
         assert (ma is None) == (mb is None), "a motion slot changed"
+        assert ma is None or len(mb.tracks.tracks) == len(ma.tracks.tracks), "the port lost or added a track"
         for ta, tb in zip(ma.tracks.tracks if ma else (), mb.tracks.tracks if mb else ()):
             assert ta.bone == tb.bone and ta.usage == tb.usage, "the port changed a track's bone"
             if ta.buffer is not None and tb.buffer is not None and ta.codec in lmtcodec.KEY_SIZE:
@@ -1085,8 +1092,9 @@ def t_solo(data: bytes) -> None:
 def t_ddo_access(data: bytes) -> None:
     """A DDO quest's mission_params (arbitrary JSON): classify never crashes, and the solo-access fix opens
     the gate to exactly minimum_members = 1 (and, with fill_pawns, only max_pawns), changes nothing else,
-    and is a fixed point."""
-    from riftstone import ddo_access
+    and is a fixed point.  Written into a quest file's text (the input bytes as its mission_params), the fix
+    stays inside mission_params, reads back as the fixed document and is a fixed point there too."""
+    from riftstone import ddo, ddo_access
 
     try:
         doc = json.loads(data.decode("utf-8", "replace"))
@@ -1095,9 +1103,18 @@ def t_ddo_access(data: bytes) -> None:
     if not isinstance(doc, dict):
         return
     ddo_access.classify("fuzz", doc)                                  # never raises
+    head = b'{\n    "type": "ExtremeMission",\n    "mission_params" : '
+    tail = b',\n    "rewards": [{"type": "exp", "amount": 1}]\n}'
+    quest = head + data + tail
+    try:
+        ddo.parse_json(quest, "fuzz")               # the input as text: valid UTF-8 with nothing around the object
+    except RiftError:
+        quest = None
+    same = lambda a, b: a is b or a == b            # noqa: E731 - a NaN left alone is itself, though NaN != NaN
     for fill in (False, True):
         change = ddo_access.fixed_mission_params(doc, fill_pawns=fill)
         if change is None:
+            assert quest is None or ddo_access.opened(quest, fill) is None, "the text fix changed a quest needing none"
             continue
         new_mp, what = change
         assert what, "a change with no description"
@@ -1107,8 +1124,17 @@ def t_ddo_access(data: bytes) -> None:
         assert set(new_mp) - set(doc) <= touched, "the fix added an unexpected key"
         for k, v in doc.items():
             if k not in touched:
-                assert new_mp.get(k) == v, f"the fix changed {k}"
+                assert same(new_mp.get(k), v), f"the fix changed {k}"
         assert ddo_access.fixed_mission_params(new_mp, fill_pawns=fill) is None, "the fix is not a fixed point"
+        if quest is None:
+            continue
+        out, what_text = ddo_access.opened(quest, fill)
+        assert what_text == what, "the text fix describes another change"
+        assert out.startswith(head) and out.endswith(tail), "the text fix reached past mission_params"
+        got, _ = ddo.parse_json(out, "fuzz")
+        assert json.dumps(got["mission_params"], sort_keys=True) == json.dumps(new_mp, sort_keys=True), \
+            "the text fix reads back as another document"
+        assert ddo_access.opened(out, fill) is None, "the text fix is not a fixed point"
 
 
 def _dye_case(data: bytes):
@@ -1399,6 +1425,18 @@ def t_save(data: bytes) -> None:
     assert saves.unpack(again) == xml, "pack -> unpack changed the XML"
 
 
+_TYPE_IDS = sorted(typemap.BY_ID)          # both games' types: more than one byte can pick
+
+
+def fsmap_type(data: bytes) -> tuple[int, bytes]:
+    """The resource type a t_fsmap input names -- its first two bytes, little-endian, index the sorted type ids
+    (one byte reached only the first 256 of them) -- and the rest of the input."""
+    return _TYPE_IDS[int.from_bytes(data[:2], "little") % len(_TYPE_IDS)], data[2:]
+
+
+def fsmap_seed(tid: int, name: bytes) -> bytes:
+    """A t_fsmap input for this type and name (what fsmap_type reads back)."""
+    return _TYPE_IDS.index(tid).to_bytes(2, "little") + name
 def _knowledge_tables():
     """Stand-in knowledge thresholds (the game's are game data, read from the exe at run time): fixed,
     so a saved finding replays the same; fractions of a second test the game's 32-bit rounding."""
@@ -1443,9 +1481,10 @@ def t_save_knowledge(data: bytes) -> None:
 
 
 def t_fsmap(data: bytes) -> None:
-    ids = sorted(typemap.BY_ID)
-    tid = ids[data[0] % len(ids)] if data else ids[0]
-    name = data[1:].replace(b"\0", b"")[:63] or b"x"
+    """Names <-> paths reverse exactly for every resource type (the first two bytes pick it); decoded user
+    paths are canonical."""
+    tid, rest = fsmap_type(data)
+    name = rest.replace(b"\0", b"")[:63] or b"x"
     p = fsmap.encode_name(name, tid)
     assert fsmap.decode_path(p) == (name, tid), "encode/decode mismatch"
     for part in p.split("/"):
@@ -1465,6 +1504,63 @@ def _workdir():
 
 def _snapshot(root: Path) -> set[str]:
     return {str(p.relative_to(root)) for p in root.rglob("*")}
+
+
+# Caches Riftstone keeps under RIFTSTONE_HOME that reading the stand-in game rewrites: the resource index (an
+# SQLite database, whose journal files come and go with every connection) and the world map (world.py).
+_CACHES = ("index-", "world-")
+
+
+def _outside(base: Path, *inside: Path) -> dict[str, tuple | None]:
+    """Everything a filesystem target must leave alone: every folder and file under ``base`` (the stand-in
+    game, its home, the sentinels, other targets' folders) but the mod or workspace it works in (``inside``)
+    and the index and world caches in ``base/home`` (_CACHES).  Folders map to None; the stand-in game's files
+    (a few small archives) to their size and SHA-1, so a write that keeps the size shows; every other file to
+    its size and modification time."""
+    import hashlib
+
+    skip = {os.path.normcase(os.path.abspath(p)) for p in inside}
+    out: dict[str, tuple | None] = {}
+
+    def walk(folder: str, rel: str) -> None:
+        out[rel] = None
+        with os.scandir(folder) as it:
+            for e in sorted(it, key=lambda e: e.name):
+                r = os.path.join(rel, e.name) if rel else e.name
+                if e.is_dir(follow_symlinks=False):
+                    if os.path.normcase(os.path.abspath(e.path)) not in skip:
+                        walk(e.path, r)
+                elif rel == "home" and e.name.startswith(_CACHES):
+                    continue
+                elif r.startswith("game" + os.sep):
+                    try:
+                        with open(e.path, "rb") as fh:
+                            raw = fh.read()
+                        out[r] = (len(raw), hashlib.sha1(raw).hexdigest())
+                    except OSError:              # held open elsewhere: seen by its size alone
+                        out[r] = (e.stat().st_size, "unreadable")
+                else:
+                    st = e.stat()
+                    out[r] = (st.st_size, st.st_mtime_ns)
+
+    walk(str(base), "")
+    return out
+
+
+def _changed(before: dict, after: dict) -> list[str]:
+    """What differs between two _outside maps: paths added, removed or rewritten (sorted)."""
+    return sorted(p for p in set(before) | set(after) if before.get(p, "gone") != after.get(p, "gone"))
+
+
+def close_caches() -> None:
+    """Close and forget the stand-in games the filesystem targets keep for the life of their process: their index
+    databases stay open in the scratch folder otherwise (a worker that ends closes them anyway; a replay runs the
+    targets in its own process, then removes that folder).  The next case builds them again."""
+    global _AUTHOR, _WORLD, _STUDIO, _SF
+    for cached in (_AUTHOR, _WORLD):
+        if cached is not None:
+            cached[1].close()
+    _AUTHOR = _WORLD = _STUDIO = _SF = None
 
 
 def t_pack(data: bytes) -> None:
@@ -1585,10 +1681,10 @@ def _author():
 
 def t_author(data: bytes) -> None:
     """text find/add and items find/new/shop with hostile arguments: refuse cleanly, write only inside the
-    mod, and leave every file they write loadable."""
+    mod -- nothing else under the stand-in's folder changes, the game's archives and home included (but the
+    index cache, _outside) -- and leave every file they write loadable."""
     import shutil
 
-    from riftstone import items, text
     from riftstone.mod import Mod
 
     game, idx, base = _author()
@@ -1598,12 +1694,25 @@ def t_author(data: bytes) -> None:
         raise RiftError("not a case") from None
     if not isinstance(case, dict) or not isinstance(case.get("args"), list):
         raise RiftError("not a case")
-    args = case["args"][:6]
     root = base / "mod"
     if root.exists():
         shutil.rmtree(root)
     Mod.create(root, "Fuzz")
-    before = {p.name for p in base.iterdir()}
+    before = _outside(base, root)
+    try:
+        _author_op(case, game, idx, root)
+    finally:
+        changed = _changed(before, _outside(base, root))
+        assert not changed, f"wrote outside the mod: {changed[:5]}"
+    for f in (root / "files").rglob("*.yaml"):                  # everything written loads back
+        params.yaml_to_resource(f.read_text(encoding="utf-8"), str(f))
+
+
+def _author_op(case: dict, game, idx, root: Path) -> None:
+    """One t_author case's operation."""
+    from riftstone import items, text
+
+    args = case["args"][:6]
     op = str(case.get("op", ""))
 
     def s(i, default=""):
@@ -1648,9 +1757,6 @@ def t_author(data: bytes) -> None:
                 assert fd.get(was[iid]) == fd.get(now[iid]), f"{fd.name} changed with {list(changed)}"
     else:
         raise RiftError("unknown op")
-    assert {p.name for p in base.iterdir()} == before, "wrote outside the mod"
-    for f in (root / "files").rglob("*.yaml"):                  # everything written loads back
-        params.yaml_to_resource(f.read_text(encoding="utf-8"), str(f))
 
 
 _WORLD = None
@@ -1677,14 +1783,88 @@ def _world_game():
     return _WORLD
 
 
+def package_seeds() -> list[bytes]:
+    """package_install's seeds: a real package of the stand-in's skin + encounter mod (as bytes), and packages
+    described as JSON (a bare manifest, a hand-made mod, a path out of the zip)."""
+    import hashlib
+    import shutil
+
+    from riftstone import delta, encounter, package, skins
+    from riftstone import mod as modlib
+
+    game, idx, w, base = _world_game()
+    work = base / "pkgseed"
+    if work.exists():
+        shutil.rmtree(work)
+    root = modlib.Mod.create(work / "Seed", "Seed").root
+    fam = skins.FAMILIES["chimera"]
+    skins.write(root, fam, 2, skins.resources(game, idx, fam, 2, {}), "Seed", "fuzz")
+    encounter.write(encounter.plan(game, idx, w, root, 424, "em5200", 1, "0,-350,40", skin=2), root)
+    out = work / "seed.zip"
+    package.build(_OnlyDarkArisen(game, idx), [root], [], out)
+    real = out.read_bytes()
+    shutil.rmtree(work)
+    text = b"a new line of text"
+    blob = delta.encode(delta.make(text, []), len(text)).decode("latin-1")
+    manifest = {"schema": "riftstone.package/2", "game": "ddda", "needs": ["ddda"], "mods": [{"folder": "Hand"}],
+                "name": "hand"}
+    hand = {"mods/Hand/riftstone-mod.json": {"schema": "riftstone.mod/1", "name": "Hand", "game": "ddda"},
+            "mods/Hand/recipes.json": {"schema": "riftstone.sources/1", "recipes": [], "foreign": {}},
+            "mods/Hand/patch.json": {"schema": "riftstone.patch/1", "files": [
+                {"path": "archives/rom/enemy/em5200.arc/x/new.txt", "size": len(text),
+                 "sha256": hashlib.sha256(text).hexdigest(), "bases": [], "delta": "deltas/0.rsd"}]},
+            "mods/Hand/deltas/0.rsd": blob}
+    return [b"\x00" + real,
+            b"\x01" + json.dumps({"members": hand, "manifest": manifest}).encode(),
+            b"\x01" + json.dumps({"members": {"README - x.txt": "hi"}, "manifest": manifest}).encode(),
+            b"\x01" + json.dumps({"members": {"../evil.txt": "x"}, "manifest": manifest}).encode()]
+
+
+def sources_seeds() -> list[bytes]:
+    """sources' seeds: a texture preset on the stand-in's own texture (replays), and recipes that cannot."""
+    import hashlib
+
+    from riftstone import arc, typemap
+
+    game, idx, w, base = _world_game()
+    TEX = typemap.BY_EXT["tex"]
+    name = b"model\\em\\e52\\e5200\\e5200_skin_BM"
+    holder = idx.archives_with(name, TEX)[0]
+    data = arc.Archive.read(game.vanilla_arc(holder)).find(name, TEX).data()
+    on = {"game": "ddda", "archive": holder, "name": name.decode("latin-1"), "type": TEX,
+          "sha256": hashlib.sha256(data).hexdigest()}
+    path = "files/model/em/e52/e5200/e5200_skin_BM.tex"
+    docs = [{"schema": "riftstone.sources/1", "foreign": {},
+             "recipes": [{"kind": "texfx", "args": {"path": path, "on": on, "preset": "frost", "strength": 0.5,
+                                                    "seed": 3}, "files": [path]},
+                         {"kind": "texfx", "args": {"path": path, "on": {"path": path, "sha256": "00"},
+                                                    "preset": "lava", "strength": 1, "seed": 1}, "files": [path]}]},
+            {"schema": "riftstone.sources/1", "foreign": {"archives/x.arc/y.tex": "Dragon's Dogma Online"},
+             "recipes": [{"kind": "ddo-skin", "args": {"family": "chimera", "skin": 4, "variant": "white"},
+                          "files": []},
+                         {"kind": "port", "args": {"src": "ddo", "dst": "ddda", "resource": "obj/em/x.mod"},
+                          "files": []}]}]
+    return [json.dumps(d).encode() for d in docs]
+
+
+def delta_seeds() -> list[bytes]:
+    from riftstone import delta
+    a = bytes(range(256)) * 4
+    target = a[:300] + b"new bytes" + a[310:900]
+    return [b"\x00" + delta.encode(delta.make(target, [a]), len(target)),
+            b"\x00" + delta.encode(delta.make(b"RIFTSTONE" * 20 + b"!", [b"", b"RIFTSTONE" * 50]), 181),
+            b"\x01" + target + b"\xff" + a + b"\xff" + b"RIFTSTONE" * 9]
+
+
 def t_encounter(data: bytes) -> None:
     """World queries and encounters with hostile arguments: refuse cleanly; a planned encounter's group
     list and layout read back, its group is new, inside the engine's 295-slot table and marked in
     mGroupList, it keeps the load conditions of the group it copies (from whichever of the stage's group lists
-    holds it), its record ids fit the loader's table, and writing it touches only the mod."""
+    holds it), its record ids fit the loader's table, and planning and writing it change nothing outside the
+    mod (the stand-in game and home included, but the index and world caches: _outside)."""
     import shutil
 
-    from riftstone import encounter, gpl, lot, modfiles, world
+    from riftstone import encounter
     from riftstone.mod import Mod
 
     game, idx, w, base = _world_game()
@@ -1717,7 +1897,28 @@ def t_encounter(data: bytes) -> None:
     if root.exists():
         shutil.rmtree(root)
     Mod.create(root, "Fuzz")
-    before = {p.name for p in base.iterdir()}
+    before = _outside(base, root)
+    try:
+        _encounter_case(case, game, idx, w, root)
+    finally:
+        changed = _changed(before, _outside(base, root))
+        assert not changed, f"wrote outside the mod: {changed[:5]}"
+    for f in root.rglob("*.yaml"):                                   # everything written loads back
+        params.yaml_to_resource(f.read_text(encoding="utf-8"), str(f))
+
+
+def _encounter_case(case: dict, game, idx, w, root: Path) -> None:
+    """One t_encounter case, planned and written into the mod at ``root``, with its invariants."""
+    from riftstone import encounter, gpl, lot, modfiles, world
+
+    def s(k, default=""):
+        v = case.get(k)
+        return str(v) if v is not None else default
+
+    def n(k):
+        v = case.get(k)
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
     spread = case.get("spread")
     spread = float(spread) if isinstance(spread, (int, float)) and not isinstance(spread, bool) else 250.0
     story = case.get("story") if isinstance(case.get("story"), str) else None
@@ -1747,9 +1948,349 @@ def t_encounter(data: bytes) -> None:
     for k in ("mLoadCondition.mLotFlag", "mDataLotFlag.mFlagNo", "mDataLotFlag.mFlagNo2"):
         assert new.get(k) == tmpl[0].get(k), f"the copy did not keep {k}"
     encounter.write(enc, root)
-    assert {p.name for p in base.iterdir()} == before, "wrote outside the mod"
-    for f in root.rglob("*.yaml"):                                   # everything written loads back
-        params.yaml_to_resource(f.read_text(encoding="utf-8"), str(f))
+
+
+def t_gpl_merge(data: bytes) -> None:
+    """Group lists several mods change, planned together on the stand-in game.  Byte 0 picks 2-4 mods; then
+    each 3 bytes are one edit to one mod's copy of st424_e (add a group under a small number with a layout,
+    change a count or a story bound, remove a group, flip an mSetBit bit, share a group's wander area with a
+    number).  The plan merges or refuses cleanly; no number keeps two different groups unless the plan says
+    one had to keep it; every group only one mod adds (or several add alike) reaches the built list under its
+    own number or the one the plan moved it to, its fields as the mod has them (its cells' and its siblings'
+    references following the move) and its layout renamed with it, bytes kept; a game group only one mod
+    touches arrives as that mod has it; the plan and the built bytes are the same twice; nothing is written
+    outside the mods."""
+    import shutil
+
+    from riftstone import gpl, gplmerge, lot, modfiles
+    from riftstone import mod as modlib
+
+    game, idx, w, base = _world_game()
+    if len(data) < 4:
+        raise RiftError("too short")
+    GPL, LOT = typemap.BY_EXT["gpl"], typemap.BY_EXT["lot"]
+    name = b"scr\\st424\\etc\\st424_e"
+    stage_arc = "rom/stage/stage400/stage424"
+    vanilla = gpl.parse(modfiles.load(game, idx, None, name, GPL)[0])
+    base_nums = {g["mGroup"] for g in vanilla.groups} | {1}          # 1: the DLC list's
+    game_rec = {g["mGroup"]: g for g in vanilla.groups}
+    n_mods = 2 + data[0] % 3
+    docs = [gpl.parse(gpl.build(vanilla)) for _ in range(n_mods)]
+    lays: list[dict] = [{} for _ in range(n_mods)]
+    goblin = lot.parse(modfiles.load(game, idx, None, lot.layout_name(424, 0, 0, "e", 0).encode(), LOT)[0])
+    units = ("em0100", "em0101", "em5200")
+    for k in range(1, min(len(data) - 2, 3 * 24), 3):
+        m, op, arg = data[k] % n_mods, data[k + 1] % 6, data[k + 2]
+        d = docs[m]
+        by = {g["mGroup"]: g for g in d.groups}
+        n = arg % 9                                                  # small numbers: mods collide
+        if op == 0 and n not in by:
+            g = json.loads(json.dumps(vanilla.groups[0]))
+            g["mGroup"] = n
+            g["mUnitKindList"] = [{"name": units[arg % 3], "isBelong": 1}]
+            for la in g["mLayoutIDArray"]:
+                la["mGroup"] = n
+            d.groups.append(g)
+            d.mGroupList[n] = 0x80000000
+            L = lot.parse(lot.build(goblin))
+            for r in L.records:
+                r.set_vec("mPosition", (float(arg), 0.0, -8800.0))     # one arg in two mods: the same group
+            lays[m][n] = lot.build(L)
+        elif op == 1 and by:
+            by[sorted(by)[arg % len(by)]]["mSetCountMax"] = arg
+        elif op == 2 and by:
+            gone = sorted(by)[arg % len(by)]
+            d.groups = [g for g in d.groups if g["mGroup"] != gone]
+            d.mGroupList[gone] = 0
+            lays[m].pop(gone, None)
+        elif op == 3:
+            d.mSetBit[arg % 16] ^= 1 << (arg % 32)
+        elif op == 4 and by:
+            g = by[sorted(by)[arg % len(by)]]
+            g["ShareWanderArea"], g["SharedWanderAreaGroup"] = 1, n
+        elif op == 5 and by:
+            by[sorted(by)[arg % len(by)]]["mAppearBgn"] = arg * 37
+    root = base / "gplmerge"
+    if root.exists():
+        shutil.rmtree(root)
+    roots = []
+    for m in range(n_mods):
+        r = modlib.Mod.create(root / f"M{m}", f"M{m}").root
+        rel = fsmap.encode_name(name, GPL)
+        (r / "files" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (r / "files" / rel).write_bytes(gpl.build(docs[m]))
+        for n, blob in lays[m].items():
+            lay = fsmap.encode_name(lot.layout_name(424, 0, 0, "e", n).encode(), LOT)
+            out = r / "archives" / (stage_arc + ".arc") / lay
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(blob)
+        roots.append(r)
+    before = {p.name for p in base.iterdir()}
+
+    def run():
+        p = modlib.plan(game, idx, [modlib.Mod.load(r) for r in roots])
+        modlib.check_plan(p)
+        return p, {a: modlib.build_archive(game, a, cs).data for a, cs in sorted(p.archives.items())}
+
+    p, built = run()
+    p2, built2 = run()
+    assert (p.renumbered, p.unmoved, p.merged, p.conflicts) == (p2.renumbered, p2.unmoved, p2.merged, p2.conflicts), \
+        "planning twice differs"
+    assert built == built2, "building twice differs"
+    assert {x.name for x in base.iterdir()} == before, "wrote outside the mods"
+    A = arc.Archive.parse(built[stage_arc])
+    final = {g["mGroup"]: g for g in gpl.parse(A.find(name, GPL).data()).groups}
+    groups_moved = [r for r in p.renumbered if "group" in r]          # (layouts' records move too: lotmerge)
+    moved = {(r["mod"], r["group"]): r["as"] for r in groups_moved}
+    contested = {r["group"] for r in p.unmoved if "group" in r}
+    assert all(r["as"] not in base_nums and 0 <= r["as"] < gplmerge.SLOTS for r in groups_moved), "moved onto a used number"
+    assert len(set(moved.values())) == len(moved), "two groups moved to one number"
+    for n in {g["mGroup"] for d in docs for g in d.groups} - base_nums - contested:
+        staying = {(json.dumps(g, sort_keys=True), lays[o].get(n)) for o, d in enumerate(docs) for g in d.groups
+                   if g["mGroup"] == n and (f"M{o}", n) not in moved}
+        assert len(staying) <= 1, f"two different groups kept number {n}"
+    for m, d in enumerate(docs):
+        who = f"M{m}"
+        mine = {n: v for (x, n), v in moved.items() if x == who}
+        for g in d.groups:
+            n = g["mGroup"]
+            if n in base_nums or n in contested:
+                continue
+            at = mine.get(n, n)
+            want = json.loads(json.dumps(g))
+            want["mGroup"] = at
+            for la in want["mLayoutIDArray"]:
+                if la["mGroup"] == n:
+                    la["mGroup"] = at
+            if want.get("ShareWanderArea") and want["SharedWanderAreaGroup"] in mine:
+                want["SharedWanderAreaGroup"] = mine[want["SharedWanderAreaGroup"]]
+            assert final.get(at) == want, f"{who}'s group {n} did not arrive as group {at}"
+            if n in lays[m]:
+                got = A.find(lot.layout_name(424, 0, 0, "e", at).encode(), LOT)
+                assert got is not None and got.data() == lays[m][n], f"{who}'s layout for group {n} is not group {at}'s"
+        # a game group only this mod touches arrives as this mod has it
+        for n, g0 in game_rec.items():
+            mine_g = [g for g in d.groups if g["mGroup"] == n]
+            if mine_g == [g0]:
+                continue
+            if all([g for g in docs[o].groups if g["mGroup"] == n] == [g0] for o in range(n_mods) if o != m):
+                assert final.get(n) == (mine_g[0] if mine_g else None), f"{who}'s change to game group {n} was lost"
+
+
+def t_lot_merge(data: bytes) -> None:
+    """Layouts several mods change, planned together on the stand-in game (lotmerge.py).  Byte 0 picks 2-4 mods;
+    then each 3 bytes are one edit to one mod's copy of the game's goblin layout (copy a record under the next id
+    or a given one, move a record, change its order, remove it).  The plan merges or refuses cleanly; the built
+    layout uses each id once, within the game's table; every record only one mod adds (or several add alike)
+    arrives under its id or the one the plan moved it to, fields as the mod has them, unless the plan says it had
+    to keep an id another mod uses; a game record only one mod touches arrives as that mod has it; the plan and
+    the built bytes are the same twice; nothing is written outside the mods."""
+    import shutil
+
+    from riftstone import lot, modfiles
+    from riftstone import mod as modlib
+
+    game, idx, w, base = _world_game()
+    if len(data) < 4:
+        raise RiftError("too short")
+    LOT = typemap.BY_EXT["lot"]
+    name = lot.layout_name(424, 0, 0, "e", 0).encode()
+    stage_arc = "rom/stage/stage400/stage424"
+    vanilla = lot.parse(modfiles.load(game, idx, None, name, LOT)[0])
+    game_rec = {r.id: r for r in vanilla.records}
+    n_mods = 2 + data[0] % 3
+    docs = [lot.parse(lot.build(vanilla)) for _ in range(n_mods)]
+    for k in range(1, min(len(data) - 2, 3 * 24), 3):
+        m, op, arg = data[k] % n_mods, data[k + 1] % 5, data[k + 2]
+        d = docs[m]
+        if not d.records and op != 0:
+            continue
+        r = d.records[arg % len(d.records)] if d.records else None
+        if op == 0 and d.records:
+            docs[m] = d = lot.copy(d, arg % len(d.records), (float(arg), -350.0, -8800.0))
+        elif op == 1:                                     # a copy under an id of its own choosing (small: they collide)
+            if r is not None and arg % 8 not in {x.id for x in d.records}:
+                new = r.copy()
+                new.id = arg % 8
+                d.records.append(new)
+        elif op == 2:
+            r.set_vec("mPosition", (float(arg) * 3, -350.0, -8800.0))
+        elif op == 3:
+            r.fields["mOrder"] = arg
+        elif op == 4:
+            d.records.remove(r)
+    root = base / "lotmerge"
+    if root.exists():
+        shutil.rmtree(root)
+    roots = []
+    for m in range(n_mods):
+        r = modlib.Mod.create(root / f"M{m}", f"M{m}").root
+        out = r / "files" / fsmap.encode_name(name, LOT)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(lot.build(docs[m]))
+        roots.append(r)
+    before = {p.name for p in base.iterdir()}
+
+    def run():
+        p = modlib.plan(game, idx, [modlib.Mod.load(r) for r in roots])
+        modlib.check_plan(p)
+        return p, {a: modlib.build_archive(game, a, cs).data for a, cs in sorted(p.archives.items())}
+
+    p, built = run()
+    p2, built2 = run()
+    assert (p.renumbered, p.unmoved, p.merged, p.conflicts) == (p2.renumbered, p2.unmoved, p2.merged, p2.conflicts), \
+        "planning twice differs"
+    assert built == built2, "building twice differs"
+    assert {x.name for x in base.iterdir()} == before, "wrote outside the mods"
+    final_doc = lot.parse(arc.Archive.parse(built[stage_arc]).find(name, LOT).data())
+    lot.check_ids(final_doc)
+    final = {r.id: r for r in final_doc.records}
+    moved = {(r["mod"], r["record"]): r["as"] for r in p.renumbered if "record" in r}
+    contested = {r["record"] for r in p.unmoved if "record" in r}
+    assert len(set(moved.values())) == len(moved), "two records moved to one id"
+    assert not set(moved.values()) & set(game_rec), "a record moved onto one of the game's ids"
+    for n in {r.id for d in docs for r in d.records} - set(game_rec) - contested:
+        staying = {lot.build(lot.Lot([r])) for o, d in enumerate(docs) for r in d.records
+                   if r.id == n and (f"M{o}", n) not in moved}
+        assert len(staying) <= 1, f"two different records kept id {n}"
+    for m, d in enumerate(docs):
+        who = f"M{m}"
+        for r in d.records:
+            if r.id in game_rec or r.id in contested:
+                continue
+            at = moved.get((who, r.id), r.id)
+            got = final.get(at)
+            assert got is not None and (got.kind, got.fields) == (r.kind, r.fields), \
+                f"{who}'s record {r.id} did not arrive as record {at}"
+        for n, r0 in game_rec.items():
+            mine = [r for r in d.records if r.id == n]
+            if mine == [r0]:
+                continue
+            if all([r for r in docs[o].records if r.id == n] == [r0] for o in range(n_mods) if o != m):
+                got = final.get(n)
+                assert (got.fields if got else None) == (mine[0].fields if mine else None), \
+                    f"{who}'s change to game record {n} was lost"
+
+
+def t_server_merge(data: bytes) -> None:
+    """Online server tables several mods change, merged (servermerge.py).  Byte 0: bit 0 the spawn table or the
+    shops, bits 1-2 how many mods (2-4), bit 7 a last copy made of the input's tail bytes; then each 3 bytes are
+    one edit to one mod's copy (spawn: add, remove or change a row, add a drop item, change a chance, add a
+    table; shops: add, remove or reprice goods, change a shop, add or remove a shop).  Copies made by edits
+    always merge; hostile bytes merge or raise MergeError.  The merged file reads back in the server's style,
+    the same twice, with no id twice; one changed copy comes back as it is; and when no mod disagrees, every
+    row, drop item, table, good and shop a mod added is there."""
+    import copy
+
+    from riftstone import ddo, servermerge
+
+    if len(data) < 3:
+        raise RiftError("too short")
+    spawn = not data[0] & 1
+    n = 2 + (data[0] >> 1) % 3
+    good = lambda i, item: {"Index": i, "ItemId": item, "Price": 10, "Stock": 5, "Unk4": False, "Unk7": []}  # noqa: E731
+    if spawn:
+        rel, style = "EnemySpawn.json", (2, "")
+        base = {"schemas": {"enemies": ["StageId", "GroupId", "PositionIndex", "EnemyId", "Lv", "DropsTableId"]},
+                "dropsTables": [{"id": t, "name": f"t{t}", "mdlType": 0, "items": [[7000 + t, 1, 1, 0, False, 0.5]]}
+                                for t in range(3)],
+                "enemies": [[s, g, p, f"0x0101{s:02X}", 1, g] for s in (1, 2) for g in (0, 1) for p in (0, 1)]}
+    else:
+        rel, style = "Shop.json", (4, "\n")
+        base = [{"ShopId": s, "Data": {"Unk0": 0, "WalletType": 1, "GoodsParamList": [good(i, 34 + i) for i in range(3)]}}
+                for s in (223, 52)]
+    copies = [copy.deepcopy(base) for _ in range(n)]
+    for k in range(1, min(len(data) - 2, 3 * 30), 3):
+        m, op, arg = data[k] % n, data[k + 1] % 6, data[k + 2]
+        d = copies[m]
+        if spawn:
+            rows, tables = d["enemies"], d["dropsTables"]
+            if op == 0:
+                rows.insert(arg % (len(rows) + 1), [3 + arg % 2, arg % 3, arg % 4, f"0x0150{arg:02X}", arg % 50, 0])
+            elif op == 1 and rows:
+                del rows[arg % len(rows)]
+            elif op == 2 and rows:
+                rows[arg % len(rows)][4] = arg
+            elif op == 3 and tables and not any(it[0] == 9000 + arg for it in tables[arg % len(tables)]["items"]):
+                tables[arg % len(tables)]["items"].append([9000 + arg, 1, 1, 0, False, 0.1])
+            elif op == 4 and tables and tables[arg % len(tables)]["items"]:
+                tables[arg % len(tables)]["items"][0][5] = arg / 256
+            elif op == 5 and not any(t["id"] == 100 + arg % 5 for t in tables):
+                tables.append({"id": 100 + arg % 5, "name": "new", "mdlType": 0, "items": []})
+        else:
+            shop = d[arg % len(d)] if d else None
+            goods = shop["Data"]["GoodsParamList"] if shop else None
+            if op == 0 and shop and not any(g["ItemId"] == 500 + arg for g in goods):
+                goods.append(good(len(goods), 500 + arg))
+            elif op == 1 and goods:
+                del goods[arg % len(goods)]
+                for i, g in enumerate(goods):
+                    g["Index"] = i
+            elif op == 2 and goods:
+                goods[arg % len(goods)]["Price"] = arg
+            elif op == 3 and shop:
+                shop["Data"]["WalletType"] = arg
+            elif op == 4 and not any(s["ShopId"] == 300 + arg % 3 for s in d):
+                d.append({"ShopId": 300 + arg % 3, "Data": {"Unk0": 0, "WalletType": 2, "GoodsParamList": []}})
+            elif op == 5 and d:
+                del d[arg % len(d)]
+    raw = ddo.dumps_style(base, style)
+    versions = [(f"M{i}", ddo.dumps_style(c, style)) for i, c in enumerate(copies)]
+    if data[0] & 0x80:
+        versions[-1] = ("Hostile", data[1 + 3 * 30:])
+        try:
+            out, _ = servermerge.merge(rel, raw, versions)
+        except servermerge.MergeError:
+            return
+        ddo.parse_json(out)
+        return
+    out, fights = servermerge.merge(rel, raw, versions)
+    assert servermerge.merge(rel, raw, versions) == (out, fights), "merging twice differs"
+    doc, got_style = ddo.parse_json(out)
+    assert got_style == style, "the merged file is not in the server's style"
+    changed = [v for _, v in versions if v != raw]
+    if len(set(changed)) == 1:
+        assert out == changed[0], "the one changed copy did not come back as it is"
+    if spawn:
+        ids = [t["id"] for t in doc["dropsTables"]]
+        assert len(set(ids)) == len(ids), "a drop table id twice"
+        for t in doc["dropsTables"]:
+            items = [it[0] for it in t["items"]]
+            assert len(set(items)) == len(items), f"drop table {t['id']} lists an item twice"
+    else:
+        ids = [s["ShopId"] for s in doc]
+        assert len(set(ids)) == len(ids), "a shop id twice"
+        for s in doc:
+            items = [g["ItemId"] for g in s["Data"]["GoodsParamList"]]
+            assert len(set(items)) == len(items), f"shop {s['ShopId']} sells an item twice"
+            assert [g["Index"] for g in s["Data"]["GoodsParamList"]] == list(range(len(items))), "goods misnumbered"
+    if fights:
+        return
+    if spawn:
+        base_rows = {json.dumps(r) for r in base["enemies"]}
+        out_rows = {json.dumps(r) for r in doc["enemies"]}
+        tables = {t["id"]: {it[0] for it in t["items"]} for t in doc["dropsTables"]}
+        for c in copies:
+            assert all(json.dumps(r) in out_rows for r in c["enemies"] if json.dumps(r) not in base_rows), \
+                "a row a mod added is missing"
+            for t in c["dropsTables"]:                    # a table this mod added or changed is there, with its items
+                old = next((b for b in base["dropsTables"] if b["id"] == t["id"]), None)
+                if t == old:
+                    continue
+                assert t["id"] in tables, f"drop table {t['id']} that a mod changes is missing"
+                new_items = {it[0] for it in t["items"]} - ({it[0] for it in old["items"]} if old else set())
+                assert new_items <= tables[t["id"]], f"an item a mod added to drop table {t['id']} is missing"
+    else:
+        shops_out = {s["ShopId"]: {g["ItemId"] for g in s["Data"]["GoodsParamList"]} for s in doc}
+        for c in copies:
+            for s in c:                                   # a shop this mod added or changed is there, with its goods
+                old = next((b for b in base if b["ShopId"] == s["ShopId"]), None)
+                if s == old:
+                    continue
+                assert s["ShopId"] in shops_out, f"shop {s['ShopId']} that a mod changes is missing"
+                new_goods = {g["ItemId"] for g in s["Data"]["GoodsParamList"]} - (
+                    {g["ItemId"] for g in old["Data"]["GoodsParamList"]} if old else set())
+                assert new_goods <= shops_out[s["ShopId"]], f"goods a mod added to shop {s['ShopId']} are missing"
 
 
 _STUDIO = None
@@ -1787,8 +2328,17 @@ def _studio():
     return _STUDIO
 
 
+# Studio routes the target leaves to unit tests: they write into the game (install, restore, loader, the plugin
+# routes: tests/test_plugins.py), start the installed game through Steam (launch) or open a folder (open), or reach
+# past the stand-in to the games on this PC (switch, port, monsters: tests/test_monsters.py, test_port_lmt.py).
+_STUDIO_ELSEWHERE = ("install", "restore", "loader", "open", "launch", "switch", "port", "monsters",
+                     "monsters/convert", "plugins/set", "plugins/toggle", "plugins/add")
+
+
 def t_studio(data: bytes) -> None:
-    """The Studio API with hostile requests: refuse cleanly, never touch files outside its folders."""
+    """The Studio API with hostile requests: refuse cleanly; change nothing outside its workspace -- the stand-in
+    game and home included -- but the index and world caches (_outside) and, for safe mode, the loader's
+    riftstone/runtime-state.ini it exists to write."""
     s, base = _studio()
     try:
         req = json.loads(data.decode("utf-8", "replace"))
@@ -1797,13 +2347,20 @@ def t_studio(data: bytes) -> None:
     if not isinstance(req, dict):
         raise RiftError("not a case")
     route = str(req.get("route", "state"))
-    if route in ("install", "restore", "loader", "open"):
-        raise RiftError("side-effecting routes are covered by unit tests")
+    if route in _STUDIO_ELSEWHERE:
+        raise RiftError("routes that act on the installed games or the loader are covered by unit tests")
     method = "POST" if req.get("post") else "GET"
     q = {str(k): str(v) for k, v in req.get("q", {}).items()} if isinstance(req.get("q"), dict) else {}
     body = req.get("body") if isinstance(req.get("body"), dict) else {}
-    s.api(method, route, q, body)
-    assert (base / "outside.txt").read_bytes() == SENTINEL, "Studio wrote outside its folders"
+    before = _outside(base, s.workspace)
+    try:
+        s.api(method, route, q, body)
+    finally:
+        allowed = {os.path.join("game", "riftstone"), os.path.join("game", "riftstone", "runtime-state.ini")} \
+            if (route, method) == ("safe-mode", "POST") else set()
+        changed = [p for p in _changed(before, _outside(base, s.workspace)) if p not in allowed]
+        assert not changed, f"Studio wrote outside its workspace: {changed[:5]}"
+        assert (base / "outside.txt").read_bytes() == SENTINEL, "Studio wrote outside its folders"
 
 
 def t_lot_ddo(data: bytes) -> None:
@@ -2030,7 +2587,7 @@ def t_port(data: bytes) -> None:
     tid = typemap.BY_EXT[ext]
     try:
         out = port.convert(body, tid, src, dst)
-    except (RiftError, struct.error, ValueError):
+    except RiftError:                        # a refusal; any other exception is a finding (ALLOWED)
         pass
     else:
         {"tex": tex.parse, "gmd": gmd.parse, "mod": port.model_info, "mrl": mrl.parse}[ext](out.data)
@@ -2238,17 +2795,39 @@ def t_monster(data: bytes) -> None:
         assert len(bound) < monsters.MIN_RIG or parented * 2 < len(bound), "none for a rig that fits"
 
 
-def t_package(data: bytes) -> None:
-    """riftstone package with a hostile mod, plugin names and output name: refused cleanly, or one zip that
-    holds exactly the loader, its settings, the listed plugins (with their .ini), the changed archives
-    (each parses and equals what install builds), a README and a manifest whose hashes match -- and
-    nothing else is written."""
+class _OnlyDarkArisen:
+    """The stand-in Dark Arisen for sources.replay / package: any other game is not on this PC."""
+
+    def __init__(self, game, idx):
+        self.g, self.i = game, idx
+
+    def game(self, kind):
+        if kind != "ddda":
+            raise RiftError(f"{kind} is not on this PC")
+        return self.g
+
+    def index(self, kind):
+        self.game(kind)
+        return self.i
+
+    def close(self):
+        pass
+
+
+def _tree(root: Path) -> dict:
     import hashlib
+    return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(root.rglob("*")) if p.is_file()} if root.exists() else {}
+
+
+def t_package(data: bytes) -> None:
+    """riftstone package with a hostile mod, plugin names and output name: refused cleanly, or one zip with no
+    game file (every member audited) that its own check reads, whose manifest lists exactly its members, that
+    writes nothing else -- and that a player's install makes into the same mod, resource for resource."""
     import shutil
     import zipfile
 
-    from riftstone import arc as arclib
-    from riftstone import loader as loaderlib
+    from riftstone import ipaudit
     from riftstone import mod as modlib
     from riftstone import package
 
@@ -2273,9 +2852,6 @@ def t_package(data: bytes) -> None:
             target.write_bytes(item[1].encode("utf-8", "surrogateescape"))
         except (OSError, RiftError, ValueError):
             continue
-    ldir = work / "loader"
-    ldir.mkdir()
-    (ldir / "dinput8.dll").write_bytes(b"MZ" + loaderlib.MARKER)
     plugins = []
     for i, nm in enumerate((case.get("plugins") or [])[:4] if isinstance(case.get("plugins"), list) else []):
         if not isinstance(nm, str) or not nm or any(c in nm for c in '\\/:*?"<>|\0') or nm.strip(". ") != nm:
@@ -2291,36 +2867,242 @@ def t_package(data: bytes) -> None:
     if not out_name or any(c in out_name for c in '\\/:*?"<>|\0') or out_name.strip(". ") != out_name:
         raise RiftError("not a usable file name")
     out = work / "dist" / out_name
-    before = {p.relative_to(work).as_posix() for p in work.rglob("*")}
+    games = _OnlyDarkArisen(game, idx)
+    before = set(_tree(work))
+    outside = _outside(base, work)
     ok = False
     try:
-        r = package.build(game, idx, [root], plugins, out, case.get("name") if isinstance(case.get("name"), str) else None,
-                          loader_dir=ldir)
+        package.build(games, [root], plugins, out, case.get("name") if isinstance(case.get("name"), str) else None)
         ok = True
     finally:
-        made = {p.relative_to(work).as_posix() for p in work.rglob("*")} - before
-        allowed = {"dist", f"dist/{out_name}"} if ok else {"dist"}
+        made = set(_tree(work)) - before
+        allowed = {f"dist/{out_name}"} if ok else set()
         assert made <= allowed, f"wrote {sorted(made - allowed)}"
+        changed = _changed(outside, _outside(base, work))          # the stand-in game and home stay as they were
+        assert not changed, f"wrote outside its folder: {changed[:5]}"
     with zipfile.ZipFile(out) as z:
         names = z.namelist()
         assert len(names) == len(set(names)), "a path is in the zip twice"
-        assert "dinput8.dll" in names and "riftstone_loader.ini" in names and "riftstone/package.json" in names
+        found = [f for n in names for f in ipaudit.scan_bytes(n, z.read(n))]
+        assert not found, f"the package carries {found[:3]}"
+        man = json.loads(z.read("riftstone-package.json"))
+        assert set(man["members"]) == set(names) - {"riftstone-package.json"}, "the manifest does not list the zip"
         assert sum(1 for n in names if n.startswith("README - ") and n.endswith(".txt")) == 1, "one README"
-        overlay = [n for n in names if n.startswith("riftstone/overlay/")]
-        assert overlay and sorted(overlay) == sorted(
-            f"riftstone/overlay/{game.arc_path(a).relative_to(game.native).as_posix()}" for a in r["archives"])
-        for n in overlay:
-            arclib.Archive.parse(z.read(n))
-        plugged = sorted(n for n in names if n.startswith("riftstone/plugins/"))
-        assert plugged == sorted(f"riftstone/plugins/{p.name}" for p in plugins), "the plugins are not what was asked"
+        assert sorted(n for n in names if n.startswith("plugins/") and n.endswith((".asi", ".dll"))) == \
+            sorted(f"plugins/{p.name}" for p in plugins), "the plugins are not what was asked"
+    package.check(out)
+    player = work / "player"
+    package.install(out, player, games)
+    want = {(c.arc.lower() if c.arc else None, c.name, c.type_id): c.data for c in modlib.collect(modlib.Mod.load(root))}
+    got = {(c.arc.lower() if c.arc else None, c.name, c.type_id): c.data
+           for c in modlib.collect(modlib.Mod.load(player / "Fuzz"))}
+    assert got == want, "the player's mod is not the author's"
+
+
+def t_package_plugins(data: bytes) -> None:
+    """riftstone package --plugins-only with hostile plugin names, settings, title and output name: refused
+    cleanly with nothing written, or one zip for the game folder -- the loader, each plugin and each plugin's .ini
+    once, one README, a manifest listing exactly its members, no game data (every member audited) -- that writes
+    nothing else."""
+    import shutil
+    import zipfile
+
+    from riftstone import ipaudit
+    from riftstone import loader as loaderlib
+    from riftstone import package
+
+    _game, _idx, _w, base = _world_game()
+    try:
+        case = json.loads(data.decode("utf-8", "replace"))
+    except ValueError:
+        raise RiftError("not a case") from None
+    if not isinstance(case, dict):
+        raise RiftError("not a case")
+    work = base / "pkgplug"
+    if work.exists():
+        shutil.rmtree(work)
+    ldir = work / "loader"
+    ldir.mkdir(parents=True)
+    (ldir / "dinput8.dll").write_bytes(b"MZ" + loaderlib.MARKER)
+    plugins = []
+    inis = case.get("inis") if isinstance(case.get("inis"), dict) else {}
+    for i, nm in enumerate((case.get("plugins") or [])[:4] if isinstance(case.get("plugins"), list) else []):
+        if not isinstance(nm, str) or not nm or any(c in nm for c in '\\/:*?"<>|\0') or nm.strip(". ") != nm:
+            continue
+        d = work / f"p{i % 2}"                  # two plugins may share a folder, so x.asi and x.dll share x.ini
+        d.mkdir(exist_ok=True)
+        try:
+            (d / nm).write_bytes(b"MZ plugin " + nm.encode("utf-8", "surrogateescape"))
+            ini = inis.get(nm)
+            if isinstance(ini, str):
+                (d / nm).with_suffix(".ini").write_bytes(ini.encode("utf-8", "surrogateescape"))
+        except (OSError, ValueError):
+            continue
+        plugins.append(d / nm)
+    ninput = None
+    if isinstance(case.get("ninput"), str):                  # "PE:<exports>" a real DLL, else the file's bytes
+        ninput = work / "ninput" / "xinput1_3.dll"
+        ninput.parent.mkdir()
+        spec = case["ninput"]
+        if spec.startswith("PE:"):
+            import helpers
+            names = tuple(x for x in spec[3:].split(",") if x and x.isascii() and "\0" not in x)[:8]
+            ninput.write_bytes(helpers.pe_file(exports=names))            # (export names are ASCII C strings)
+        else:
+            ninput.write_bytes(spec.encode("utf-8", "surrogateescape"))
+    out_name = case.get("out") if isinstance(case.get("out"), str) else "x.zip"
+    if not out_name or any(c in out_name for c in '\\/:*?"<>|\0') or out_name.strip(". ") != out_name:
+        raise RiftError("not a usable file name")
+    out = work / "dist" / out_name
+    before = set(_tree(work))
+    outside = _outside(base, work)
+    ok = False
+    try:
+        r = package.build_plugins(plugins, out, case.get("name") if isinstance(case.get("name"), str) else None,
+                                  loader_dir=ldir, ninput=ninput)
+        ok = True
+    finally:
+        made = set(_tree(work)) - before
+        allowed = {f"dist/{out_name}"} if ok else set()
+        assert made <= allowed, f"wrote {sorted(made - allowed)}"
+        changed = _changed(outside, _outside(base, work))          # the stand-in game and home stay as they were
+        assert not changed, f"wrote outside its folder: {changed[:5]}"
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+        assert len(names) == len(set(names)), "a path is in the zip twice"
+        assert {"dinput8.dll", "riftstone_loader.ini", "riftstone/package.json"} <= set(names)
+        assert sum(1 for n in names if n.startswith("README - ") and n.endswith(".txt")) == 1, "one README"
+        assert not [n for n in names if n.startswith(("riftstone/overlay/", "mods/"))], "game data in the zip"
+        found = [f for n in names for f in ipaudit.scan_bytes(n, z.read(n))]
+        assert not found, f"the zip carries {found[:3]}"
         man = json.loads(z.read("riftstone/package.json"))
         assert set(man["files"]) == set(names) - {"riftstone/package.json"}, "the manifest does not list the zip"
-        for n, digest in man["files"].items():
-            assert hashlib.sha256(z.read(n)).hexdigest() == digest, f"hash of {n}"
-        p = modlib.plan(game, idx, [modlib.Mod.load(root)])
-        for a in r["archives"]:
-            want = modlib.build_archive(game, a, p.archives[a]).data
-            assert z.read(f"riftstone/overlay/{game.arc_path(a).relative_to(game.native).as_posix()}") == want
+        assert sorted(n for n in names if n.startswith("riftstone/plugins/") and n.endswith((".asi", ".dll"))) == \
+            sorted(f"riftstone/plugins/{p.name}" for p in plugins), "the plugins are not what was asked"
+        want_inis = {p.with_suffix(".ini").name.lower() for p in plugins if p.with_suffix(".ini").is_file()}
+        got_inis = [n[len("riftstone/plugins/"):].lower() for n in names
+                    if n.startswith("riftstone/plugins/") and n.endswith(".ini")]
+        assert sorted(got_inis) == sorted(want_inis), "each plugin's settings go in once"
+        optional = [n for n in names if n.startswith("optional/")]
+        assert "xinput1_3.dll" not in names, "Ninput where the game would load it"
+        if ninput is None:
+            assert not optional, "optional files nobody asked for"
+        else:
+            assert z.read("optional/ninput/xinput1_3.dll") == ninput.read_bytes(), "not the Ninput given"
+            assert "optional/ninput/licenses/Zydis.txt" in names, "Ninput without its licences"
+    assert r["files"] == len(names) and r["plugins"] == [p.name for p in plugins] and r["ninput"] == (ninput is not None)
+
+
+def t_package_install(data: bytes) -> None:
+    """A hostile package (first byte 0: the zip's own bytes; 1: JSON naming its members, the manifest made to
+    match unless it names one): check and install refuse cleanly, or make mod folders that load and build --
+    and nothing is written outside the folder of mods, and nothing is left in it after a refusal."""
+    import hashlib
+    import io
+    import shutil
+    import zipfile
+
+    from riftstone import mod as modlib
+    from riftstone import package
+
+    game, idx, w, base = _world_game()
+    work = base / "pkgin"
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir()
+    (work / "outside.txt").write_bytes(SENTINEL)
+    mode, rest = data[:1], data[1:]
+    if mode == b"\x01":
+        try:
+            case = json.loads(rest.decode("utf-8", "replace"))
+        except ValueError:
+            raise RiftError("not a case") from None
+        if not isinstance(case, dict) or not isinstance(case.get("members"), dict):
+            raise RiftError("not a case")
+        members = {k: (v if isinstance(v, str) else json.dumps(v)).encode("utf-8", "surrogateescape")
+                   for k, v in list(case["members"].items())[:40] if isinstance(k, str) and k}
+        manifest = case.get("manifest")
+        if isinstance(manifest, dict) and "members" not in manifest:
+            manifest["members"] = {k: hashlib.sha256(v).hexdigest() for k, v in members.items()}
+        buf = io.BytesIO()
+        try:
+            with zipfile.ZipFile(buf, "w") as z:
+                for k, v in members.items():
+                    z.writestr(k, v)
+                if manifest is not None:
+                    z.writestr("riftstone-package.json", json.dumps(manifest))
+        except (ValueError, UnicodeEncodeError):
+            raise RiftError("not storable") from None
+        raw = buf.getvalue()
+    else:
+        raw = rest
+    zp = work / "in.zip"
+    zp.write_bytes(raw)
+    into = work / "mods"
+    games = _OnlyDarkArisen(game, idx)
+    before = _tree(work)
+    try:
+        package.check(zp)
+    except RiftError:
+        pass
+    assert _tree(work) == before, "check wrote something"
+    try:
+        r = package.install(zp, into, games)
+    except RiftError:
+        left = [p for p in into.rglob("*")] if into.exists() else []
+        assert not left, f"a refused install left {left[:3]}"
+        r = None
+    after = _tree(work)
+    assert (work / "outside.txt").read_bytes() == SENTINEL
+    assert {k: v for k, v in after.items() if not k.startswith("mods/")} == \
+        {k: v for k, v in before.items() if not k.startswith("mods/")}, "install wrote outside the folder of mods"
+    if r is not None:
+        for m in r["mods"]:
+            modlib.collect(modlib.Mod.load(Path(m)))
+        assert all(Path(m).parent == into for m in r["mods"])
+
+
+def t_delta(data: bytes) -> None:
+    """Deltas: hostile bytes decode or refuse cleanly, what decodes encodes back to the same bytes and applies to
+    exactly its size (or refuses); and made from any target and bases (first byte 1; 0xFF separates), a delta
+    decodes to itself and rebuilds the target, never carrying more new bytes than the target has."""
+    from riftstone import delta
+
+    bases = [bytes(range(256)) * 4, b"RIFTSTONE" * 50]
+    if data[:1] == b"\x01":
+        parts = data[1:].split(b"\xff")
+        target, own = parts[0], parts[1:5]
+        ops = delta.make(target, own)
+        blob = delta.encode(ops, len(target))
+        back, size = delta.decode(blob)
+        assert back == ops and size == len(target), "a delta does not decode to itself"
+        assert delta.apply(back, own, size) == target, "a delta does not rebuild its target"
+        assert delta.new_bytes(ops) <= len(target)
+        return
+    ops, size = delta.decode(data[1:])
+    assert delta.encode(ops, size) == data[1:], "a decoded delta encodes to other bytes"
+    try:
+        out = delta.apply(ops, bases, size)
+    except delta.DeltaError:
+        return
+    assert len(out) == size
+
+
+def t_sources(data: bytes) -> None:
+    """A hostile riftstone-sources.json: refused cleanly, or recipes whose replay on the stand-in (Dark Arisen
+    only) makes files or refuses cleanly -- never another error, never a write into the game."""
+    from riftstone import sources
+
+    game, idx, w, base = _world_game()
+    try:
+        doc = json.loads(data.decode("utf-8", "replace"))
+    except ValueError:
+        raise RiftError("not JSON") from None
+    checked = sources.check(doc)
+    before = _tree(base / "game")
+    made = sources.replay(checked["recipes"][:4], _OnlyDarkArisen(game, idx))
+    assert all(isinstance(k, str) and isinstance(v, bytes) for k, v in made.items())
+    assert _tree(base / "game") == before, "a replay wrote into the game"
 
 
 def t_png(data: bytes) -> None:
@@ -2429,12 +3211,15 @@ def t_studio_files(data: bytes) -> None:
         (root / "aside" / rels["@tex"]).parent.mkdir(parents=True, exist_ok=True)
         (root / rels["@tex"]).replace(root / "aside" / rels["@tex"])
     top = sorted(p.name for p in base.iterdir())
+    outside = _outside(base, ws)
     before = _mod_contents(root)
     try:
         out = s.api(_SF_ROUTES[route], route, q, body)
     finally:
         assert (base / "sf-outside.txt").read_bytes() == SENTINEL, "wrote outside the workspace"
         assert sorted(p.name for p in base.iterdir()) == top, "made something outside the workspace"
+        changed = _changed(outside, _outside(base, ws))            # the stand-in game and home included
+        assert not changed, f"wrote outside the workspace: {changed[:5]}"
         after = _mod_contents(root) if root.is_dir() else []
         missing = list(before)
         for h in after:
@@ -2468,10 +3253,13 @@ def t_terrain(data: bytes) -> None:
     """A model or a collision mesh (.sbc) offered as a Gransys terrain cell: check refuses nothing (it
     reports); what the tool can move moves by exactly the cell's corner -- a model's positions, bounds,
     group spheres and envelope volumes, a collision's boxes, tree lanes and vertices -- with every other
-    byte unchanged; taking the corner off gives back what worldize wrote; a cell piece in its frame that
-    is moved into the world no longer passes check."""
+    byte unchanged; taking the corner off gives the original back within float32 rounding (check_corpus.
+    moved_back: half a float32 step at the moved value plus half a step at the value moved back), and moving
+    that into the world again gives worldize's bytes; a cell piece in its frame that is moved into the world
+    no longer passes check."""
     import math
 
+    from check_corpus import moved_back
     from riftstone import sbc, terrain
 
     c = terrain.Cell(47, 35)
@@ -2500,7 +3288,10 @@ def t_terrain(data: bytes) -> None:
             continue
         assert y == struct.unpack("<f", struct.pack("<f", x + c.offset[axis]))[0], "a value did not move by the corner"
     if tame:
-        assert terrain.worldize(terrain.localize(w, c), c) == w, "localize does not undo worldize"
+        back = terrain.localize(w, c)
+        stray = moved_back(data, w, back, floats)[2]
+        assert stray is None, f"localize does not give the original back within float32 rounding: {stray}"
+        assert terrain.worldize(back, c) == w, "moving back and into the world again changed the bytes"
     errors, _ = terrain.check(w, c)
     pts = terrain.positions(data)
     if tame and pts and not terrain.check(data, c)[0]:
@@ -2627,6 +3418,18 @@ def t_session(data: bytes) -> None:
             assert line.startswith("The last session") and "\n" not in line, "the description is not one line"
 
 
+def _ini_view(raw: bytes) -> tuple[list, int]:
+    """(an ini's lines, each with its end, as Windows splits them -- at CR or LF only, in the text behind a UTF-16
+    mark, else in the bytes; how many CR CR it holds).  runtime.ini_text reads the same file."""
+    import re
+
+    from riftstone import runtime
+
+    if raw.startswith(runtime.INI_UTF16):
+        text = raw[2:].decode("utf-16-le")               # write_setting refuses a file that does not decode
+        parts = re.split(r"(\r\n|\r|\n)", text)
+        return [a + b for a, b in zip(parts[::2], parts[1::2] + [""])], text.count("\r\r")
+    return raw.splitlines(keepends=True), raw.count(b"\r\r")
 def t_playtest(data: bytes) -> None:
     """A play session's logs as text of any shape: loader.log, then after "#cap" enemy_cap.log, after "#sprint"
     free_sprint.log, after "#state" runtime-state.ini.  Every item gets a verdict, every line stays one line."""
@@ -2658,24 +3461,28 @@ def t_playtest(data: bytes) -> None:
 
 
 def t_plugin_ini(data: bytes) -> None:
-    """A plugin's settings file (text of any shape), then after a line "#set" the file stem, section, key and
-    value Studio would write, NUL-separated."""
+    """A plugin's settings file (any bytes), then after a line "#set" the file stem, section, key and value
+    Studio would write (UTF-8 text, NUL-separated).  The file is what the loader and its plugins read: the
+    Windows code page, or UTF-16 behind its mark, a line ending at CR or LF only (runtime.ini_text).  The write
+    is refused and the file keeps every byte; or the value reads back on its key (plugins.read_settings), every
+    other line keeps its bytes (lines split as Windows splits them), and no CR CR appears that was not there."""
     from riftstone import plugins
 
-    text = data.decode("utf-8", "replace")
-    ini, _, req = text.partition("\n#set\n")
-    parts = req.split("\0")
-    stem, section, key, value = parts[:4] if len(parts) >= 4 else ("enemy_cap", "enemy_cap", "slots", req)
+    ini, _, req = data.partition(b"\n#set\n")
+    request = req.decode("utf-8", "replace")
+    parts = request.split("\0")
+    stem, section, key, value = parts[:4] if len(parts) >= 4 else ("enemy_cap", "enemy_cap", "slots", request)
     with _workdir() as tmp:
         path = Path(tmp) / "plugin.ini"
-        path.write_bytes(ini.encode("utf-8"))
+        path.write_bytes(ini)
         before = plugins.read_settings(path)
-        assert all("\n" not in s["key"] + s["value"] + s["section"] for s in before), "a setting spans lines"
+        assert all(not any(c in s[k] for c in "\r\n") for s in before for k in ("section", "key", "value")), \
+            "a setting spans lines"
         try:
             clean = plugins._valid(stem, section, key, value)
             plugins.write_setting(path, section, key, clean)
         except RiftError:
-            assert path.read_bytes() == ini.encode("utf-8"), "a refused write changed the file"
+            assert path.read_bytes() == ini, "a refused write changed the file"
             return
         assert not any(c in clean for c in ";=[]\r\n\0"), "a written value carries a separator"
         rule = plugins._RULES.get((stem.lower(), section.lower(), key.lower()))
@@ -2687,10 +3494,9 @@ def t_plugin_ini(data: bytes) -> None:
         after = plugins.read_settings(path)
         hits = [s for s in after if s["section"].lower() == section.lower() and s["key"].lower() == key.lower()]
         assert hits and hits[0]["value"] == clean, "the value did not land on its key"
-        old = ini.encode("utf-8").decode("utf-8-sig", "replace").splitlines()
-        new = path.read_text(encoding="utf-8").splitlines()
+        (old, old_crcr), (new, new_crcr) = _ini_view(ini), _ini_view(path.read_bytes())
         assert len(old) == len(new) and sum(a != b for a, b in zip(old, new)) <= 1, "other lines changed"
-        assert b"\r\r" not in path.read_bytes(), "a line ending was doubled"
+        assert new_crcr <= old_crcr, "a line ending was doubled"
 
 
 PLAN_ENTRIES = 4      # of a fuzzed plan applied to the stand-in game: a few stack as a whole plan does
@@ -2700,7 +3506,8 @@ def _plan_dry_and_real(entries) -> None:
     """A plan applied to the stand-in game (stage 424) as a dry run, then for real, on a new mod and again on the
     mod that first run filled: the dry run plans exactly the encounters the real run writes (group numbers, group
     list and layout bytes, notes) or refuses at the same entry in the same words (the real run adding which
-    encounters it had written), and leaves the mod byte for byte as it was."""
+    encounters it had written), and leaves the mod byte for byte as it was; neither changes anything outside
+    the mod (the stand-in game and home included, but the index and world caches: _outside)."""
     import re
     import shutil
 
@@ -2712,7 +3519,7 @@ def _plan_dry_and_real(entries) -> None:
     if root.exists():
         shutil.rmtree(root)
     Mod.create(root, "Fuzz Plan")
-    outside = {p.name for p in base.iterdir()}
+    outside = _outside(base, root)
 
     def files():
         return {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
@@ -2736,7 +3543,8 @@ def _plan_dry_and_real(entries) -> None:
             assert not isinstance(real, str), f"the dry run planned what the real run refused: {real}"
             assert [enc for _, enc, _ in dry] == [enc for _, enc, _ in real], "the dry run planned other encounters"
             assert all(not f for _, _, f in dry) and all(f for _, _, f in real), "files listed wrongly"
-    assert {p.name for p in base.iterdir()} == outside, "wrote outside the mod"
+    changed = _changed(outside, _outside(base, root))
+    assert not changed, f"wrote outside the mod: {changed[:5]}"
 
 
 def t_encounter_plan(data: bytes) -> None:
@@ -3092,7 +3900,7 @@ def t_dungeon(data: bytes) -> None:
     game, idx, w, b, base = _nav_world()
     try:
         case = json.loads(data.decode("utf-8", "replace"))
-    except ValueError:
+    except (ValueError, RecursionError):
         raise RiftError("not a case") from None
     if not isinstance(case, dict):
         raise RiftError("not a case")
@@ -3102,8 +3910,9 @@ def t_dungeon(data: bytes) -> None:
         return v if isinstance(v, kind) and not isinstance(v, bool) else default
     names = lambda key: {w.find_enemy(str(e)) for e in case[key]} if isinstance(case.get(key), list) else None  # noqa: E731
     grammar = mission.grammar(case["grammar"]) if isinstance(case.get("grammar"), dict) else None
+    # the spacing as given (a 400-digit whole number, nan): direct() refuses what it cannot use
     d = dungeon.direct(game, idx, w, 424, seed=num("seed", 0), grammar=grammar, which=str(case.get("pool", "stage")),
-                       only=names("enemies"), exclude=names("exclude") or set(), spacing=float(num("spacing", 10.0, (int, float))),
+                       only=names("enemies"), exclude=names("exclude") or set(), spacing=num("spacing", 10.0, (int, float)),
                        max_points=num("at_once", 10), b=b)
     mains = [p.site.depth for p in d.placed if not p.beat.side]
     assert mains == sorted(mains), "main beats are not deeper one after another"
@@ -3112,9 +3921,83 @@ def t_dungeon(data: bytes) -> None:
     root = base / "mod"
     if not root.exists():
         Mod.create(root, "Fuzz")
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
     done = encounter_plan.apply(game, idx, w, root, entries, dry_run=True)
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before, "the dry run changed the mod"
     proof = dungeon.check(d.space, [enc for _, enc, _ in done])
     assert proof.problems == [] and proof.in_region == proof.points > 0, proof.problems[:3]
+
+
+def t_ground(data: bytes) -> None:
+    """Encounters on a stage with a navigation mesh (the stand-in stage 424: a corridor with a hole, an island) with
+    hostile spots, counts, spreads, enemies and ground choices (JSON): refused with RiftError, or a plan whose
+    spawn points, when put on the ground, each stand on the mesh's surface, are reached on foot from the first
+    within twice the straight distance plus 5 m, keep 0.6 x spread from one another and have the room the enemy
+    needs, no more than were asked and a note when fewer fit; points left on flat rings (flyers, ground false)
+    keep the spot's height.  Planning writes nothing, and a tiny spread in a tight spot stays within the slow
+    limit (the rings searched are bounded)."""
+    import math
+
+    from riftstone import bestiary, encounter, nav
+    from riftstone.mod import Mod
+
+    game, idx, w, b, base = _nav_world()
+    try:
+        case = json.loads(data.decode("utf-8", "replace"))
+    except (ValueError, RecursionError):
+        raise RiftError("not a case") from None
+    if not isinstance(case, dict):
+        raise RiftError("not a case")
+    at = case.get("at", [2500, -350, -9600])
+    if isinstance(at, list):
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) < 1e6 for v in at):
+            raise RiftError("not a spot")
+        at = ",".join(repr(float(v)) for v in at)
+    count, points, spread, ground = case.get("count", 6), case.get("points"), case.get("spread", 250.0), case.get("ground")
+    if (not isinstance(count, int) or isinstance(count, bool) or points is not None and
+            (not isinstance(points, int) or isinstance(points, bool)) or ground not in (None, True, False)):
+        raise RiftError("not a case")
+    if isinstance(spread, bool) or not isinstance(spread, (int, float)) or not 0 < spread <= 5000:
+        raise RiftError("not a spread encounter.plan is given")     # every caller passes 0 < float <= 5000
+    root = base / "ground"
+    if not root.exists():
+        Mod.create(root, "Ground")
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    enemy = str(case.get("enemy", "goblin"))
+    try:
+        enc = encounter.plan(game, idx, w, root, 424, enemy, count, str(at), points, float(spread), ground=ground)
+    finally:
+        assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before, "planning wrote into the mod"
+    asked = min(count, encounter.POOL) if points is None else points
+    assert 1 <= enc.points == len(enc.positions) <= asked, (enc.points, len(enc.positions), asked)
+    xyz = encounter.parse_at(str(at), w, 424)
+    if not enc.ground:
+        height = struct.unpack("<f", struct.pack("<f", xyz[1]))[0]        # a layout keeps 32-bit floats
+        assert all(p[1] == height for p in enc.positions), "flat rings left the spot's height"
+        return
+    assert ground is not False, "ground=False put points on the mesh"
+    mesh = nav.stage_mesh(game, idx, 424, root)
+
+    def under(p):
+        """Every triangle whose surface holds p (a point on a shared edge is on both)."""
+        return [t for t in mesh._near(p[0], p[2], 1.0)
+                if (h := mesh.height(t, p[0], p[2])) is not None and abs(h - p[1]) < 1.0]
+    first = under(enc.positions[0])
+    assert first, "the first spawn point is not on the mesh"
+    reach = mesh.distances(first)
+    room = b.room(enc.enemy) if b.walks(enc.enemy) else bestiary.ROOM_FLOOR
+    for i, p in enumerate(enc.positions):
+        tris = under(p)
+        assert tris, f"spawn point {i} {p} is not on the mesh"
+        if i:
+            walk = min(reach.get(t, math.inf) for t in tris)
+            assert walk <= 2 * math.dist(p, enc.positions[0]) / 100 + 5 + 0.01, \
+                f"spawn point {i} is {walk:.1f} m on foot from the first, more than the rule allows"
+            assert mesh.clearance(p) >= room - 0.01, f"spawn point {i} has less room than {enc.enemy} needs"
+        for q in enc.positions[:i]:
+            assert math.dist(p, q) >= float(spread) * 0.6 - 0.01, f"spawn points closer than 0.6 x spread ({i})"
+    if enc.points < asked:
+        assert any(f"only {enc.points} of {asked} spawn points" in n for n in enc.notes), "fewer points, unsaid"
 
 
 TARGETS = {
@@ -3157,6 +4040,9 @@ TARGETS = {
     "dye_tables": (t_dye_tables, False, 1 << 16),
     "encounter": (t_encounter, True, 1 << 12),
     "encounter_plan": (t_encounter_plan, True, 1 << 13),
+    "gpl_merge": (t_gpl_merge, False, 1 << 8),
+    "lot_merge": (t_lot_merge, False, 1 << 8),
+    "server_merge": (t_server_merge, False, 1 << 12),
     "waves": (t_waves, True, 1 << 12),
     "arcs": (t_arcs, False, 1 << 14),
     "skintex": (t_skintex, False, 1 << 16),
@@ -3164,6 +4050,10 @@ TARGETS = {
     "terrain": (t_terrain, False, 1 << 18),
     "png": (t_png, False, 1 << 15),
     "package": (t_package, True, 1 << 14),
+    "package_install": (t_package_install, True, 1 << 16),
+    "package_plugins": (t_package_plugins, True, 1 << 14),
+    "delta": (t_delta, False, 1 << 16),
+    "sources": (t_sources, True, 1 << 14),
     "studio_files": (t_studio_files, True, 1 << 15),
     "tex": (t_tex, False, 1 << 18),
     "tex_dds": (t_dds, False, 1 << 18),
@@ -3220,4 +4110,5 @@ TARGETS = {
     "mission": (t_mission, True, 1 << 12),
     "wfc": (t_wfc, False, 1 << 8),
     "dungeon": (t_dungeon, True, 1 << 11),
+    "ground": (t_ground, True, 1 << 10),
 }

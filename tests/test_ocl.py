@@ -93,6 +93,16 @@ class OclTest(unittest.TestCase):
         with self.assertRaises(ParamError):
             ocl.from_yaml(text.replace("flagsUnread: 0x80000000", "flagsUnread: 0x80000001", 1))
 
+    def test_huge_numbers_are_refused_in_a_short_message(self):
+        # a hex number has no digit limit, but the range message wrote it in decimal: ValueError ("Exceeds the
+        # limit (4300 digits)"); a 5,000-digit one was refused with all 5,000 digits in the message
+        text = ocl.to_yaml(ocl.parse(make_simple(1)))
+        for bad in ("0x" + "f" * 3600, "9" * 5000, "-" + "9" * 5000, "1" * 5000 + "x"):
+            with self.subTest(bad=bad[:8]):
+                with self.assertRaises(ParamError) as cm:
+                    ocl.yaml_to_bytes(text.replace("mResourceID: 7", f"mResourceID: {bad}", 1))
+                self.assertLess(len(str(cm.exception)), 200)
+
     def test_empty_attack_slot(self):
         text = ocl.to_yaml(ocl.parse(make_simple(1)))
         with self.assertRaises(ParamError):     # an empty slot holds nothing else

@@ -96,6 +96,53 @@ class FormatTest(unittest.TestCase):
         with self.assertRaises(RiftError):
             nav.Mesh(n)
 
+    def test_stage_table_of_a_cut_executable_is_refused(self):
+        """headers past the end of the file raised struct.error from stage_table (check_corpus, tools/nav_proof)."""
+        from riftstone.errors import RiftError
+        exe = bytearray(0x200)
+        exe[:2] = b"MZ"
+        struct.pack_into("<I", exe, 0x3C, 0x1FC)
+        exe[0x1FC:0x200] = b"PE\0\0"
+        with self.assertRaises(RiftError):
+            nav.stage_table(bytes(exe))
+        struct.pack_into("<I", exe, 0x3C, 0x40)                  # PE header in the file, its sections not
+        exe[0x40:0x44] = b"PE\0\0"
+        struct.pack_into("<H", exe, 0x40 + 6, 60)                # 60 sections...
+        struct.pack_into("<H", exe, 0x40 + 20, 0xE0)             # ...after a 0xE0-byte optional header
+        struct.pack_into("<H", exe, 0x40 + 0x18, 0x10B)
+        with self.assertRaises(RiftError):
+            nav.stage_table(bytes(exe))
+
+    def test_a_damaged_game_entry_is_a_format_error(self):
+        """nav.game_resource decompressed with zlib unchecked: a damaged entry of a game archive was a zlib.error
+        (riftstone nav, dungeon, the bestiary), where modfiles.load says FormatError."""
+        import tempfile
+        from pathlib import Path
+
+        from riftstone import arc, typemap
+        from riftstone.game import Game
+        from riftstone.index import Index
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "game"
+            (root / "nativePC" / "rom").mkdir(parents=True)
+            (root / "DDDA.exe").write_bytes(b"stub")
+            name, tid = b"scr\\st420\\etc\\st420_nav", typemap.BY_EXT["nav"]
+            good = arc.Entry.from_data(name, tid, self.data)
+            bad = arc.Entry(name, tid, good.size, b"\x78\x9c" + b"\xff" * 64)
+            (root / "nativePC" / "rom" / "nav.arc").write_bytes(arc.Archive([bad]).build())
+            game = Game(root)
+            idx = Index(game)
+            try:
+                idx.refresh()
+                with self.assertRaises(FormatError):
+                    nav.game_resource(game, idx, name, tid)
+                (root / "nativePC" / "rom" / "nav.arc").write_bytes(arc.Archive([good]).build())
+                idx.refresh()
+                self.assertEqual(nav.game_resource(game, idx, name, tid), self.data)
+                self.assertIsNone(nav.game_resource(game, idx, b"scr\\st421\\etc\\st421_nav", tid))
+            finally:
+                idx.close()
+
     def test_stage_table(self):
         self.assertEqual(nav.nav_stage(424), 420)
         self.assertEqual(nav.nav_stage(447), 446)
@@ -105,6 +152,86 @@ class FormatTest(unittest.TestCase):
     def test_info_names_the_regions(self):
         text = nav.info(nav.parse(self.data))
         self.assertIn("2 walkable regions", text)
+
+    def test_info_answers_for_a_mesh_the_queries_cannot_use(self):
+        """riftstone nav <file> and the open viewer describe any mesh parse accepts: a triangle of four corners
+        parses (the loader reads any count), and info() used to build the query Mesh, which refuses it."""
+        n = nav.parse(self.data)
+        n.triangles[0].corners.append(n.triangles[0].corners[0])
+        again = nav.parse(nav.build(n))
+        from riftstone.errors import RiftError
+        with self.assertRaises(RiftError):
+            nav.Mesh(again)
+        self.assertIn("2 walkable regions", nav.info(again))
+
+    # the names: the loader reads each up to its first NUL into a 256-byte buffer on its stack (0x00CFEE30)
+    def _with_name(self, name: bytes, n: int | None = None) -> bytes:
+        d, old = self.data, len(self.nav.name)
+        return d[:16] + struct.pack("<I", len(name) - 1 if n is None else n) + name + d[16 + 4 + old:]
+
+    def test_a_name_is_its_characters_and_one_nul(self):
+        longest = b"a" * 255 + b"\0"
+        n = nav.parse(self._with_name(longest))
+        self.assertEqual(n.name, longest)
+        self.assertEqual(nav.build(n), self._with_name(longest))
+        self.bad(self._with_name(b"a" * 256 + b"\0"), "buffer holds 255")
+        self.bad(self._with_name(b"new\0Navigation\0"), "first NUL")       # the loader would stop at the first NUL
+        self.bad(self._with_name(b"new Navigationx"), "first NUL")        # ...or read on past the name
+        for name in (b"a" * 300 + b"\0", b"new\0Navigation\0", b"new Navigation"):
+            n.name = name
+            with self.assertRaises(FormatError):
+                nav.build(n)
+
+    def test_an_area_name_is_its_characters_and_one_nul(self):
+        root = struct.pack("<HI", 0, 4) + b"root\0"
+        self.assertEqual(self.data.count(root), 1)
+        self.bad(self.data.replace(root, struct.pack("<HI", 0, 300) + b"r" * 300 + b"\0"), "buffer holds 255")
+        self.bad(self.data.replace(root, struct.pack("<HI", 0, 4) + b"ro\0t\0"), "first NUL")
+        n = nav.parse(self.data)
+        n.areas[0].name = b"r" * 256 + b"\0"
+        with self.assertRaises(FormatError):
+            nav.build(n)
+
+    def test_the_vertex_extras_byte_is_0_or_1(self):
+        """the loader reads the extras only after a 1 (0x010992D6): any other byte parsed as 'none' and was
+        written back as 0, so the file did not rebuild."""
+        n = nav.parse(self.data)
+        n.near_wall = n.wall_distance = None
+        plain = nav.build(n)
+        at = 16 + 4 + len(self.nav.name) + 12
+        self.assertEqual((self.data[at], plain[at]), (1, 0))
+        self.assertEqual(nav.build(nav.parse(plain)), plain)
+        raw = bytearray(plain)
+        raw[at] = 2
+        self.bad(bytes(raw), "vertex-extras byte is 2")
+
+    def test_numbers_that_would_not_rebuild_are_refused(self):
+        """a signalling NaN (0x7F800001) came back from struct as a quiet one (0x7FC00001): every float the file
+        carries must be finite, as the vertices and costs already were."""
+        n = nav.parse(self.data)
+        vertex0 = 16 + 4 + len(n.name) + 13
+        tri0 = vertex0 + len(n.positions) * 15
+        vector = tri0 + 4 + 4 + 4 * len(n.triangles[0].attributes) + 1
+        t = n.triangles[0]
+        first_link = vector + 16 + 1 + 4 * len(t.areas) + 4 + 4 * len(t.corners) + 4
+        bounds = len(self.data) - sum(4 + 8 * len(c) for c in n.cells) - 32
+        snan = bytes.fromhex("0100807f")
+        for label, at in (("vector", vector), ("value", vector + 12), ("tail", first_link + 16), ("bounds", bounds)):
+            for bits in (snan, struct.pack("<f", float("inf"))):
+                raw = bytearray(self.data)
+                raw[at:at + 4] = bits
+                with self.subTest(label, bits=bits.hex()):
+                    self.bad(bytes(raw), "finite")
+        box = struct.pack("<B6f", nav.BOX, *n.areas[0].geometries[0].values)
+        self.assertEqual(self.data.count(box), 1)
+        self.bad(self.data.replace(box, box[:1] + snan + box[5:]), "finite")
+        n.bounds = (float("nan"),) + n.bounds[1:]
+        with self.assertRaises(FormatError):
+            nav.build(n)
+        n = nav.parse(self.data)
+        n.triangles[0].vector = (0.0, 0.0, 1e39)          # past a float's range: struct.pack raised OverflowError
+        with self.assertRaises(FormatError):
+            nav.build(n)
 
 
 class QueryTest(unittest.TestCase):

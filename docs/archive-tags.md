@@ -97,10 +97,11 @@ The function names in this page are descriptions, not engine symbols.
   (format string at `0x015623B4`). `_t` lists have no such loop.
 - Vanilla: `st443_e_dlc01` and `st444_e_dlc01` (in the `dl1` set archives) are the only group lists with
   `mDLCNo` = 1, and their groups carry `mDLCNoBits` = 1. The other 197 group-list copies have `mDLCNo` = 0.
-- **Lead** for separate encounter mods on one stage (the group-list clash in `AGENTS.md`, the roadmap's
-  "merge group lists" item): a mod adds groups by shipping its own `stSSS_e_dlcNN` (`mDLCNo` = NN, its
-  groups' `mDLCNoBits` = NN) instead of replacing `stSSS_e`, so two mods for one stage do not overwrite
-  each other's list. Open before building it:
+- **Lead** for separate encounter mods on one stage, now answered another way: install merges the mods'
+  copies of the stage's list group by group and renumbers a group two mods both add (`docs/world-map.md`,
+  "Encounters in separate mods"), which needs nothing from the engine that the game's own lists do not use.
+  The engine's own route would be for a mod to add groups by shipping its own `stSSS_e_dlcNN` (`mDLCNo` = NN,
+  its groups' `mDLCNoBits` = NN) instead of replacing `stSSS_e`. Open before building it:
   - the list must be parsed (setting its bit) before the stage's lists are read; shipping it inside the
     stage archive may do that (not checked);
   - NN is 1..15 per stage and list type (vanilla uses 1 on 443/444). The mask is global, so a set bit

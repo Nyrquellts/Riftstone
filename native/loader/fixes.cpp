@@ -156,14 +156,32 @@ static BOOL EnemySlotsUnsafe(DWORD base, int n, int* active, int* usable) {
     return TRUE;
 }
 
+// enemy_cap moves the slots to the manager's tail and says how many through its export EnemyCap_Slots.  It is
+// looked for among the plugins the loader brought in, whatever their file names (01_enemy_cap.asi), then as a
+// module named enemy_cap.asi that came in some other way.  *present: an enemy_cap is there (with or without
+// the export).
+typedef int (*EnemyCapSlots_t)();
+static EnemyCapSlots_t EnemyCapExport(BOOL* present) {
+    for (int i = 0; i < g_pluginCount && i < MAX_PLUGINS; i++) {
+        const PluginInfo& p = g_pluginInfo[i];
+        if (p.state != 1 || !p.module) continue;
+        if (FARPROC f = GetProcAddress(p.module, "EnemyCap_Slots")) {
+            *present = TRUE;
+            return (EnemyCapSlots_t)f;
+        }
+    }
+    HMODULE cap = GetModuleHandleW(L"enemy_cap.asi");
+    *present = cap != NULL;
+    return cap ? (EnemyCapSlots_t)GetProcAddress(cap, "EnemyCap_Slots") : NULL;
+}
+
 BOOL EnemySlots(int* active, int* usable, int* slots) {
     if (!g_knownBuild) return FALSE;
     int n = 10;
     DWORD base = SLOTS_VANILLA;
-    if (HMODULE cap = GetModuleHandleW(L"enemy_cap.asi")) {
-        // enemy_cap moves the slots to the manager's tail; it says how many through this export.
-        typedef int (*Slots_t)();
-        Slots_t f = (Slots_t)GetProcAddress(cap, "EnemyCap_Slots");
+    BOOL present = FALSE;
+    EnemyCapSlots_t f = EnemyCapExport(&present);
+    if (present) {
         if (!f) return FALSE;              // an enemy_cap without it: the layout is not known here
         int k = f();
         if (k > 0) {
@@ -301,36 +319,52 @@ static void BuildStandIn() {
 }
 
 static BOOL g_guard = FALSE;
-static wchar_t g_standInPath[MAX_PATH];
+static INIT_ONCE g_standInOnce = INIT_ONCE_STATIC_INIT;
+static wchar_t g_standInPath[MAX_PATH];            // set once, inside g_standInOnce
 
-static BOOL EnsureStandIn() {
-    if (g_standInPath[0]) return TRUE;
-    wchar_t dir[MAX_PATH], path[MAX_PATH];
+// The stand-in on disk holds exactly g_standIn (read while others may have it open).
+static BOOL StandInOnDisk(const wchar_t* path) {
+    BYTE have[64];
+    DWORD got = 0;
+    HANDLE h = Real_CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    ReadFile(h, have, sizeof have, &got, NULL);
+    CloseHandle(h);
+    return got == sizeof g_standIn && memcmp(have, g_standIn, sizeof g_standIn) == 0;
+}
+
+// Made once per process, whichever thread first misses a texture; the others wait for it.  Written under a
+// name of its own and then moved into place, so no reader ever sees half a file (another copy of the game
+// may be reading the stand-in).
+static BOOL CALLBACK MakeStandIn(PINIT_ONCE, PVOID, PVOID*) {
+    wchar_t dir[MAX_PATH], path[MAX_PATH], temp[MAX_PATH];
     _snwprintf_s(dir, _countof(dir), _TRUNCATE, L"%s\\standin", g_stateDir);
     CreateDirectoryW(dir, NULL);
     _snwprintf_s(path, _countof(path), _TRUNCATE, L"%s\\missing-texture-%s.tex", dir, g_game == GAME_DDO ? L"ddo" : L"ddda");
-    BYTE have[64];
-    DWORD got = 0;
-    HANDLE h = Real_CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (h != INVALID_HANDLE_VALUE) {
-        ReadFile(h, have, sizeof have, &got, NULL);
-        CloseHandle(h);
-    }
-    if (got != sizeof g_standIn || memcmp(have, g_standIn, sizeof g_standIn) != 0) {
-        h = Real_CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (!StandInOnDisk(path)) {
+        _snwprintf_s(temp, _countof(temp), _TRUNCATE, L"%s.%lu.tmp", path, GetCurrentProcessId());
+        HANDLE h = Real_CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h == INVALID_HANDLE_VALUE) return FALSE;
         DWORD w = 0;
         WriteFile(h, g_standIn, sizeof g_standIn, &w, NULL);
         CloseHandle(h);
-        if (w != sizeof g_standIn) return FALSE;
+        BOOL placed = w == sizeof g_standIn && MoveFileExW(temp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        if (!placed) DeleteFileW(temp);
+        if (!placed && !StandInOnDisk(path)) return FALSE;    // (another copy of the game may have just made it)
     }
     wcscpy_s(g_standInPath, MAX_PATH, path);
     return TRUE;
 }
 
+// FALSE when it could not be made (the next miss tries again).
+static BOOL EnsureStandIn() { return InitOnceExecuteOnce(&g_standInOnce, MakeStandIn, NULL, NULL); }
+
 HANDLE GuardOpen(const wchar_t* fullPath, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition,
                  DWORD flags, HANDLE templ) {
     (void)share; (void)disposition; (void)templ; (void)access;
+    HANDLE own = ArchiveOpen(fullPath, sa, flags);      // the resource's own bytes, when an archive holds it
+    if (own != INVALID_HANDLE_VALUE) return own;
     if (!g_guard) return INVALID_HANDLE_VALUE;
     const wchar_t* dot = wcsrchr(fullPath, L'.');
     if (!dot || _wcsicmp(dot, L".tex") != 0) return INVALID_HANDLE_VALUE;
@@ -490,6 +524,7 @@ void FixesInstallHooks() {
     g_guard = IniInt(L"guard", L"missing_textures", 1) != 0 && (g_game == GAME_DDDA || g_game == GAME_DDO ||
                                                                  IniInt(L"loader", L"any_program", 0));
     LogLine(L"guard    missing textures %s", g_guard ? L"get a neutral stand-in (riftstone\\standin)" : L"stop the game as usual");
+    ResourcesInit();
     g_borderless = IniInt(L"window", L"borderless", 0) != 0;
     g_fill = IniInt(L"window", L"borderless_fill", 1) != 0;
     g_background = IniInt(L"window", L"background_run", 0) != 0;
@@ -636,8 +671,34 @@ static BOOL SteamRoot(wchar_t* out, DWORD cap) {
     return TRUE;
 }
 
-// Copy every file of one remote folder into <target>\<stamp>, unless the newest copy already
-// holds the same save.  Keep the newest `keep`.
+// A backup folder's name: <YYYYMMDD-HHMMSS> as Stamp() makes it, or <YYYYMMDD-HHMMSS>-<n> when that second
+// already has one (the loader's own, and runtime.backup_saves').  Nothing else in the folder was made by a
+// backup: it is never taken for the newest backup, never counted and never pruned.
+#define STAMP_CAP 32
+static BOOL IsBackupStamp(const wchar_t* name) {
+    for (int i = 0; i < 15; i++) {
+        wchar_t c = name[i];
+        if (i == 8 ? c != L'-' : (c < L'0' || c > L'9')) return FALSE;
+    }
+    if (!name[15]) return TRUE;
+    if (name[15] != L'-' || !name[16]) return FALSE;
+    for (int i = 16; name[i]; i++)
+        if (i > 24 || name[i] < L'0' || name[i] > L'9') return FALSE;
+    return TRUE;
+}
+
+// Time order of two backup names: the date and time, then -<n> (none first).
+static int StampOrder(const void* a, const void* b) {
+    const wchar_t* x = (const wchar_t*)a;
+    const wchar_t* y = (const wchar_t*)b;
+    int c = wcsncmp(x, y, 15);
+    if (c) return c;
+    long xn = x[15] ? wcstol(x + 16, NULL, 10) : 0, yn = y[15] ? wcstol(y + 16, NULL, 10) : 0;
+    return xn < yn ? -1 : xn > yn;
+}
+
+// Copy every file of one remote folder into <target>\<stamp>, unless the newest backup already
+// holds the same save.  Keep the newest `keep` backups; other folders in <target> are left alone.
 static void BackupFolder(const wchar_t* remote, const wchar_t* target, int keep) {
     wchar_t sav[MAX_PATH];
     _snwprintf_s(sav, _countof(sav), _TRUNCATE, L"%s\\DDDA.sav", remote);
@@ -645,18 +706,20 @@ static void BackupFolder(const wchar_t* remote, const wchar_t* target, int keep)
     uint32_t hash = HashFile(sav, &size);
     if (!size) return;
     MakeDirs(target);
-    // The newest existing backup (names sort by time).
-    wchar_t pattern[MAX_PATH], newest[64] = L"";
+    // The backups there, and the newest of them.  A junction or link is never one (pruning would follow it).
+    wchar_t pattern[MAX_PATH], newest[STAMP_CAP] = L"";
     _snwprintf_s(pattern, _countof(pattern), _TRUNCATE, L"%s\\*", target);
-    static wchar_t names[256][64];
+    static wchar_t names[256][STAMP_CAP];
     int n = 0;
     WIN32_FIND_DATAW fd;
     HANDLE find = FindFirstFileW(pattern, &fd);
     if (find != INVALID_HANDLE_VALUE) {
         do {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
-            if (n < 256 && wcslen(fd.cFileName) < 64) wcscpy_s(names[n++], 64, fd.cFileName);
-            if (_wcsicmp(fd.cFileName, newest) > 0) wcscpy_s(newest, 64, fd.cFileName);
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+                !IsBackupStamp(fd.cFileName))
+                continue;
+            if (!newest[0] || StampOrder(fd.cFileName, newest) > 0) wcscpy_s(newest, STAMP_CAP, fd.cFileName);
+            if (n < 256) wcscpy_s(names[n++], STAMP_CAP, fd.cFileName);
         } while (FindNextFileW(find, &fd));
         FindClose(find);
     }
@@ -669,10 +732,17 @@ static void BackupFolder(const wchar_t* remote, const wchar_t* target, int keep)
             return;
         }
     }
+    // A folder of its own: <stamp>, or <stamp>-<n> when a backup of this second exists.
     wchar_t stamp[32], dest[MAX_PATH];
     Stamp(stamp, _countof(stamp));
-    _snwprintf_s(dest, _countof(dest), _TRUNCATE, L"%s\\%s", target, stamp);
-    if (!CreateDirectoryW(dest, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return;
+    BOOL made = FALSE;
+    for (int k = 0; k < 100 && !made; k++) {
+        if (k) _snwprintf_s(dest, _countof(dest), _TRUNCATE, L"%s\\%s-%d", target, stamp, k);
+        else _snwprintf_s(dest, _countof(dest), _TRUNCATE, L"%s\\%s", target, stamp);
+        made = CreateDirectoryW(dest, NULL);
+        if (!made && GetLastError() != ERROR_ALREADY_EXISTS) return;
+    }
+    if (!made) return;
     _snwprintf_s(pattern, _countof(pattern), _TRUNCATE, L"%s\\*", remote);
     int copied = 0;
     find = FindFirstFileW(pattern, &fd);
@@ -688,9 +758,9 @@ static void BackupFolder(const wchar_t* remote, const wchar_t* target, int keep)
         FindClose(find);
     }
     LogLine(L"saves    backed up %d file(s) of %s to %s", copied, remote, dest);
-    // Keep the newest `keep` backups.
+    // Keep the newest `keep` backups (the one just made among them); only backups are ever removed.
     if (n + 1 > keep) {
-        qsort(names, n, sizeof names[0], [](const void* a, const void* b) { return _wcsicmp((const wchar_t*)a, (const wchar_t*)b); });
+        qsort(names, n, sizeof names[0], StampOrder);
         for (int i = 0; i < n + 1 - keep && i < n; i++) {
             wchar_t old[MAX_PATH];
             _snwprintf_s(old, _countof(old), _TRUNCATE, L"%s\\%s", target, names[i]);

@@ -191,6 +191,17 @@ class BankAndCueTests(unittest.TestCase):
             (root / "DDDA.exe").touch()
             self.assertEqual(audio_cli.main(["build", str(source), "--native-order", "-o", str(root / "new.sngw")]), 1)
 
+    def test_cli_refuses_a_sidecar_nested_too_deep(self):
+        # a --metadata file of 200,000 nested arrays raised RecursionError out of main (a traceback), not a refusal
+        with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stderr(io.StringIO()) as err:
+            root = Path(temp)
+            (root / "source.sngw").write_bytes(synthetic_ogg())
+            (root / "meta.json").write_text("[" * 200000)
+            self.assertEqual(audio_cli.main(["build", str(root / "source.sngw"), "--metadata", str(root / "meta.json"),
+                                             "-o", str(root / "new.sngw")]), 1)
+            self.assertIn("sidecar", err.getvalue())
+            self.assertFalse((root / "new.sngw").exists())
+
     def test_native_sngw_build_preserves_order_and_key_without_encoder(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "native.sngw"

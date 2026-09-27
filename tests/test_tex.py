@@ -93,6 +93,60 @@ class TexTest(unittest.TestCase):
         with self.assertRaises(FormatError):
             tex.dds_to_tex(bytes(huge_dim))
 
+    def test_a_dds_must_hold_the_textures_own_format(self):
+        # a DXT5 (or uncompressed) .dds given for a DXT1 texture was taken and its first bytes read as DXT1
+        # blocks; only a .dds too short for the texture was refused
+        cases = [(20, 24, "this .dds is DXT5, the texture is DXT1"),
+                 (20, 40, "this .dds is uncompressed 32-bit, the texture is DXT1"),
+                 (24, 20, "this .dds is DXT1, the texture is DXT5"),
+                 (31, 24, "this .dds is DXT5, the texture is ATI2"),
+                 (40, 20, "this .dds is DXT1, the texture is uncompressed 32-bit")]
+        for tmpl, fmt, said in cases:
+            with self.subTest(template=tmpl, dds=fmt), self.assertRaises(FormatError) as cm:
+                tex.dds_to_tex(tex.to_dds(make(fmt, 8, 8, 1)), template=make(tmpl, 8, 8, 1))
+            self.assertIn(said, str(cm.exception))
+        # one family is one .dds format: the texture keeps its own id
+        self.assertEqual(tex.dds_to_tex(tex.to_dds(make(20, 8, 8, 1)), template=make(25, 8, 8, 1)).fmt, 25)
+        # the pixels must be exactly what the header announces (more is another surface, or not this format)
+        with self.assertRaises(FormatError):
+            tex.dds_to_tex(tex.to_dds(make(20, 8, 8, 1)) + bytes(8), template=make(20, 8, 8, 1))
+        from riftstone import skins                     # Studio's texture drop and tex from-dds --like
+        bc1 = tex.build(tex.Tex(0x20000, tex.VERSION, 1, 8, 8, 1, 20, 1, struct.pack("<I", 20) + bytes(32)))
+        dxt5 = tex.to_dds(tex.Tex(0x20000, tex.VERSION, 1, 8, 8, 1, 24, 1, struct.pack("<I", 20) + bytes(range(64))))
+        with self.assertRaises(FormatError):
+            skins.texture_like(dxt5, bc1)
+
+    def test_uncompressed_dds_layouts(self):
+        # a .dds without a four-cc was taken as B, G, R, A bytes whatever its masks said: A8B8G8R8 came in
+        # with red and blue swapped, X8R8G8B8 took alpha from its padding; DXT3 was read as DXT5
+        def dds(masks, flags, bits=32):
+            hdr = bytearray(tex.to_dds(make(40, 2, 2, 1))[:128])
+            struct.pack_into("<I", hdr, 80, flags)
+            struct.pack_into("<5I", hdr, 88, bits, *masks)
+            return bytes(hdr) + bytes([10, 20, 30, 40]) * 4
+        bgra, rgba = (0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000), (0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000)
+        rgb, alpha = tex._DDPF_RGB, tex._DDPF_ALPHAPIXELS
+        cases = [(bgra, rgb | alpha, [10, 20, 30, 40]),                 # A8R8G8B8: the game's own byte order
+                 (rgba, rgb | alpha, [30, 20, 10, 40]),                 # A8B8G8R8
+                 (bgra[:3] + (0,), rgb, [10, 20, 30, 255]),             # X8R8G8B8: opaque
+                 (rgba, rgb, [30, 20, 10, 255])]                        # X8B8G8R8 (an alpha mask without the flag)
+        for masks, flags, want in cases:
+            for template in (None, make(40, 2, 2, 1)):
+                with self.subTest(masks=masks, flags=flags, template=template is not None):
+                    t = tex.dds_to_tex(dds(masks, flags), template)
+                    self.assertEqual((t.fmt, t.body[4:]), (40, bytes(want) * 4))
+        refused = [(bgra, rgb | alpha, 24), ((0xF800, 0x07E0, 0x001F, 0), rgb, 32), (bgra, 0x20000, 32),
+                   ((0x3FF00000, 0x000FFC00, 0x000003FF, 0xC0000000), rgb | alpha, 32), (bgra[:3] + (0xFF,), rgb | alpha, 32)]
+        for masks, flags, bits in refused:
+            with self.subTest(masks=masks, flags=flags, bits=bits), self.assertRaises(FormatError):
+                tex.dds_to_tex(dds(masks, flags, bits))
+        dxt3 = bytearray(tex.to_dds(make(24, 8, 8, 1)))
+        dxt3[84:88] = b"DXT3"
+        for template in (None, make(24, 8, 8, 1)):
+            with self.assertRaises(FormatError) as cm:
+                tex.dds_to_tex(bytes(dxt3), template)
+            self.assertIn("save it as DXT5", str(cm.exception))
+
     def test_inspect(self):
         rep = inspect.describe(tex.build(make(24, 256, 128, 4)), typemap.BY_EXT["tex"])
         out = rep.text("x")

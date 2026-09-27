@@ -29,6 +29,7 @@ from pathlib import Path
 
 from . import arcfolder, fsmap, mrl, params, skins, tex, texcodec, typemap, xfs
 from .errors import RiftError
+from .game import KINDS
 from .mod import MOD_FILE, Mod
 
 ASIDE = "aside"
@@ -81,10 +82,20 @@ def _mods(studio) -> list[Path]:
     return [d for d in sorted(studio.workspace.iterdir(), key=lambda p: p.name.lower()) if (d / MOD_FILE).is_file()]
 
 
-def _keys(studio) -> dict[str, dict]:
-    """Every mod's active resources: {mod name: {(archive or None, name, type): rel}}."""
+def _game_of(d: Path) -> str | None:
+    try:
+        return Mod.load(d).game
+    except RiftError:
+        return None
+
+
+def _keys(studio, game: str) -> dict[str, dict]:
+    """Every mod's active resources, of one game's mods (the two games never share an install, so a mod of the
+    other game clashes with nothing here): {mod name: {(archive or None, name, type): rel}}."""
     out = {}
     for d in _mods(studio):
+        if _game_of(d) != game:
+            continue
         keys = {}
         for rel in _mod_files(d):
             if rel.startswith(ASIDE + "/"):
@@ -102,13 +113,13 @@ def _overlaps(a: tuple, b: tuple) -> bool:
     return a[1:] == b[1:] and (a[0] is None or b[0] is None or a[0].lower() == b[0].lower())
 
 
-def clashes(studio, mod: str | None, key: tuple, keys: dict | None = None) -> list[str]:
-    """The other mods in the workspace holding the same resource (key: archive or None, name, type)."""
-    keys = _keys(studio) if keys is None else keys
+def clashes(studio, mod: str | None, key: tuple, game: str, keys: dict | None = None) -> list[str]:
+    """The other mods of ``game`` holding the same resource (key: archive or None, name, type)."""
+    keys = _keys(studio, game) if keys is None else keys
     return sorted(m for m, ks in keys.items() if m != mod and any(_overlaps(key, k) for k in ks))
 
 
-def classify(studio, idx, mod: str, rel: str, keys: dict | None = None) -> dict:
+def classify(studio, idx, mod: str, rel: str, game: str, keys: dict | None = None) -> dict:
     r = resource_of(rel)
     if r is None:
         return {"status": "other", "also": []}
@@ -120,8 +131,12 @@ def classify(studio, idx, mod: str, rel: str, keys: dict | None = None) -> dict:
     else:
         status = "changes" if any(a.lower() == arc_name.lower() for a in arcs) else "adds"
         where = 1
-    return {"status": status, "archives": where, "also": clashes(studio, mod, r, keys), "type": typemap.extension(tid),
-            "resource": name.decode("latin-1"), "archive": arc_name}
+    # a Dark Arisen group list several mods change is merged at install, every mod's groups kept (gplmerge.py), and so
+    # is a layout the game has, every mod's placements kept (lotmerge.py)
+    merges = game == "ddda" and (tid == typemap.BY_EXT["gpl"] or (tid == typemap.BY_EXT["lot"] and status == "changes"))
+    aside = rel.startswith(ASIDE + "/")         # not built: it clashes with nothing
+    return {"status": status, "archives": where, "also": [] if aside else clashes(studio, mod, r, game, keys),
+            "type": typemap.extension(tid), "resource": name.decode("latin-1"), "archive": arc_name, "merges": merges}
 
 
 def skin_of_file(rel: str) -> tuple[skins.Family, int] | None:
@@ -141,12 +156,13 @@ def list_files(studio, mod: str) -> dict:
     root = studio.mod_root(mod)
     idx = studio.open_index()
     try:
-        keys = _keys(studio)
+        game = _game_of(root) or studio.need_game().kind     # a damaged riftstone-mod.json still lists
+        keys = _keys(studio, game)
         rows = []
         for rel in _mod_files(root):
             if rel.startswith(f"{ASIDE}/{HISTORY}/"):
                 continue
-            info = classify(studio, idx, mod, rel, keys)
+            info = classify(studio, idx, mod, rel, game, keys)
             p = root / rel
             rows.append({"rel": rel, "size": p.stat().st_size, "aside": rel.startswith(ASIDE + "/"), **info})
     finally:
@@ -253,6 +269,7 @@ def replace(studio, body: dict) -> dict:
     mod, rel = body.get("mod"), body.get("rel")
     f = _file(studio, mod, rel)
     new = _upload(body)
+    sent = new
     old = f.read_bytes()
     suffix = f.suffix.lower()
     if suffix == ".tex":
@@ -286,8 +303,24 @@ def replace(studio, body: dict) -> dict:
     root = studio.mod_root(mod)
     kept = _keep_history(root, rel, old)
     arcfolder.write_file(f, new)
+    _replaced_by_hand(root, rel, sent)
     studio.log("ok", f"Replaced {rel} in {mod} ({note}); the old one is in {kept.relative_to(root).as_posix()}")
     return {"ok": True, "note": note, "kept": kept.relative_to(root).as_posix()}
+
+
+def _replaced_by_hand(root: Path, rel: str, sent: bytes) -> None:
+    """A file replaced by an upload: no recipe made it any more; a texture of the other game's revision is
+    that game's content, which a package refuses to carry (sources.py)."""
+    from . import sources
+    from .mod import Mod
+    sources.forget(root, [rel])
+    if len(sent) >= 8 and sent[:4] == b"TEX\0":
+        rev = int.from_bytes(sent[4:8], "little") & 0xFFF
+        mine = tex.GAME_VERSION.get(Mod.load(root).game)
+        other = next((k for k, v in tex.GAME_VERSION.items() if v == rev and v != mine), None)
+        if other is not None:
+            from .game import KINDS
+            sources.mark_foreign(root, [rel], KINDS[other]["title"])
 
 
 def preset(studio, body: dict) -> dict:
@@ -300,15 +333,57 @@ def preset(studio, body: dict) -> dict:
     if f.suffix.lower() != ".tex":
         raise RiftError("presets apply to textures (.tex)")
     strength = body.get("strength", 1.0)
-    if isinstance(strength, bool) or not isinstance(strength, (int, float)):
-        raise RiftError("strength is a number from 0 to 1")
+    try:            # float() refuses an int past 1e308 (a 400-digit JSON number)
+        if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+            raise ValueError
+        strength = float(strength)
+    except (ValueError, OverflowError):
+        raise RiftError("strength is a number from 0 to 1") from None
     old = f.read_bytes()
-    new = texfx.apply(old, str(body.get("preset", "")), float(strength))
+    new = texfx.apply(old, str(body.get("preset", "")), strength)
     root = studio.mod_root(mod)
     kept = _keep_history(root, rel, old)
     arcfolder.write_file(f, new)
+    _record_preset(studio, root, rel, old, str(body.get("preset", "")), float(strength))
     studio.log("ok", f"{body.get('preset')} preset on {rel} in {mod}; the old one is in {kept.relative_to(root).as_posix()}")
     return {"ok": True, "preset": body.get("preset"), "kept": kept.relative_to(root).as_posix()}
+
+
+def _record_preset(studio, root: Path, rel: str, old: bytes, preset_name: str, strength: float) -> None:
+    """A preset on the game's own texture, or on what a recipe made, is a recipe too: a package carries it and
+    each player recolours their own copy (sources.py).  On a texture of the author's own, it is their work."""
+    import hashlib
+
+    from . import arc as arclib, fsmap, sources
+    from .mod import Mod
+    key = sources.norm(rel)
+    args = {"path": key, "preset": preset_name, "strength": strength, "seed": 1}
+    digest = hashlib.sha256(old).hexdigest()
+    if any(key in r.get("files", []) for r in sources.load(root)["recipes"]):
+        sources.record(root, "texfx", {**args, "on": {"path": key, "sha256": digest}}, [key], keep_earlier=True)
+        return
+    game = studio.need_game()
+    if Mod.load(root).game != game.kind:
+        return
+    parts = key.split("/")
+    try:
+        if parts[0] == "archives":
+            cut = next(i for i, p in enumerate(parts) if p.lower().endswith(".arc"))
+            arcs = ["/".join(parts[1:cut] + [parts[cut][:-4]])]
+            name, tid = fsmap.decode_path("/".join(parts[cut + 1:]))
+        else:
+            name, tid = fsmap.decode_path("/".join(parts[1:]))
+            idx = studio.open_index()
+            try:
+                arcs = idx.archives_with(name, tid)
+            finally:
+                idx.close()
+        e = arclib.Archive.read(game.vanilla_arc(arcs[0])).find(name, tid) if arcs else None
+    except (StopIteration, RiftError, OSError):
+        return
+    if e is not None and hashlib.sha256(e.data()).hexdigest() == digest:
+        on = {"game": game.kind, "archive": arcs[0], "name": name.decode("latin-1"), "type": tid, "sha256": digest}
+        sources.record(root, "texfx", {**args, "on": on}, [key])
 
 
 def aside(studio, body: dict) -> dict:
@@ -346,8 +421,59 @@ def aside(studio, body: dict) -> dict:
     return out
 
 
+def share_package(studio, mod: str) -> dict:
+    """A package of one mod to share (package.py): deltas and recipes, no game data."""
+    import tempfile
+
+    from . import package, sources
+    root = studio.mod_root(mod)
+    game = studio.need_game()
+    m = Mod.load(root)
+    if m.game != game.kind:
+        from .game import KINDS
+        raise RiftError(f"{m.name} is a {KINDS[m.game]['title']} mod: switch Studio to that game to share it")
+    idx = studio.open_index()
+    games = sources.Games({game.kind: game}, {game.kind: idx})
+    try:
+        with tempfile.TemporaryDirectory(prefix="riftstone-share-") as tmp:
+            out = Path(tmp) / "package.zip"
+            r = package.build(games, [root], [], out)
+            data = out.read_bytes()
+    finally:
+        games.close()
+        idx.close()
+    studio.log("ok", f"Package of {m.name}: {len(data):,} bytes, {r['new_bytes']:,} of them the author's own, "
+                     "no game data")
+    return {"name": f"{root.name} - package.zip", "mime": "application/zip",
+            "b64": base64.b64encode(data).decode("ascii"), "bytes": len(data), "new_bytes": r["new_bytes"],
+            "needs": r["needs"]}
+
+
+def install_package(studio, body: dict) -> dict:
+    """Make a package's mods in the workspace from this PC's games (package.install)."""
+    import tempfile
+
+    from . import package, sources
+    data = _upload(body)
+    game = studio.need_game()
+    idx = studio.open_index()
+    games = sources.Games({game.kind: game}, {game.kind: idx})
+    try:
+        with tempfile.TemporaryDirectory(prefix="riftstone-receive-") as tmp:
+            p = Path(tmp) / "package.zip"
+            p.write_bytes(data)
+            r = package.install(p, studio.workspace, games)
+    finally:
+        games.close()
+        idx.close()
+    names = [Path(m).name for m in r["mods"]]
+    studio.log("ok", f"Made {', '.join(names)} from the package, from this PC's game files (every file checked)")
+    return {"ok": True, "mods": names, "plugins": r["plugins"], "needs": r["needs"]}
+
+
 def export_zip(studio, mod: str) -> dict:
-    """The whole mod folder (not its build output) as a .zip, to keep a copy somewhere else."""
+    """The whole mod folder (not its build output) as a .zip: a private copy to keep somewhere else.  It holds
+    the game's data the mod changes, so it is not for sharing (share_package is)."""
     root = studio.mod_root(mod)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -366,13 +492,18 @@ def export_zip(studio, mod: str) -> dict:
 _BAD = re.compile(r'[\\/:*?"<>|]')
 
 
-def destination(studio, body: dict) -> tuple[Path, str | None]:
-    """The mod that gets produced files: ``mod`` (an existing one) or ``new_mod`` (the name of a new one,
-    checked here and created by ``make_mod`` once the work is ready, so a step that fails leaves no
-    empty mod behind).  Returns (its folder, the new mod's name or None)."""
+def destination(studio, body: dict, game: str | None = None) -> tuple[Path, str | None]:
+    """The mod that gets produced files: ``mod`` (an existing one; with ``game``, a mod of that game) or
+    ``new_mod`` (the name of a new one, checked here and created by ``make_mod`` once the work is ready, so a
+    step that fails leaves no empty mod behind).  Returns (its folder, the new mod's name or None)."""
     new = body.get("new_mod")
     if new in (None, ""):
-        return studio.mod_root(body.get("mod")), None
+        root = studio.mod_root(body.get("mod"))
+        kind = Mod.load(root).game if game is not None else None
+        if kind != game:
+            raise RiftError(f"{root.name} is a {KINDS[kind]['title']} mod: choose a {KINDS[game]['title']} mod, "
+                            "or a new one")
+        return root, None
     if not isinstance(new, str) or not new.strip() or new != new.strip() or _BAD.search(new) or new in (".", ".."):
         raise RiftError("give the new mod a name without \\ / : * ? \" < > |")
     root = studio.workspace / new
@@ -384,9 +515,9 @@ def destination(studio, body: dict) -> tuple[Path, str | None]:
 
 
 def make_mod(studio, root: Path, new: str | None) -> None:
-    """Create the new mod ``destination`` checked (nothing to do for an existing one)."""
+    """Create the new mod ``destination`` checked, for the game at hand (nothing to do for an existing one)."""
     if new is not None:
-        Mod.create(root, new)
+        Mod.create(root, new, game=studio.need_game().kind)
         studio.log("ok", f"Created mod {new}")
 
 
@@ -400,15 +531,9 @@ def _thumb(p: Path, side: int = 128) -> str | None:
 
 
 def ddo_tool():
-    """tools/ddo_skins.py (the Riftstone checkout's), or None when it is not here."""
-    import importlib.util
-    path = Path(__file__).resolve().parents[2] / "tools" / "ddo_skins.py"
-    if not path.is_file():
-        return None
-    spec = importlib.util.spec_from_file_location("riftstone_ddo_skins", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    """What makes Dragon's Dogma Online's chimera variants into skin textures (ddoskins.py)."""
+    from . import ddoskins
+    return ddoskins
 
 
 def skins_list(studio) -> dict:
@@ -457,7 +582,7 @@ def skin_make(studio, body: dict) -> dict:
     same mod) replaces it; the files it replaces are kept in aside/_history."""
     fam = skins.family(str(body.get("family", "chimera")))
     game = studio.need_game()
-    root, new = destination(studio, body)
+    root, new = destination(studio, body, game.kind)
     n = body.get("number")
     if n in (None, ""):
         n = next_number(studio, fam)
@@ -465,6 +590,9 @@ def skin_make(studio, body: dict) -> dict:
         raise RiftError("number is a skin number, 1..99")
     skins.check_number(n)
     skins.check_free(root, fam, n)
+    # a broken skins.json is refused before any file is kept in aside/_history or written
+    if not isinstance(skins.read_manifest(root).get(fam.key, {}), dict):
+        raise RiftError(f"{root / skins.MANIFEST}: its {fam.key} entry is not an object of skins")
     textures = {}
     ups = body.get("textures")
     ups = {} if ups is None else ups
@@ -481,8 +609,8 @@ def skin_make(studio, body: dict) -> dict:
     if ddo:
         tool = ddo_tool()
         if not isinstance(ddo, str) or tool is None or ddo not in getattr(tool, "VARIANTS", {}):
-            raise RiftError("Dragon's Dogma Online import needs tools/ddo_skins.py, the ddon toolkit and one of its "
-                            "variants")
+            raise RiftError("Dragon's Dogma Online import takes one of its chimera variants: "
+                            + ", ".join(sorted(getattr(tool, "VARIANTS", {}))))
         if textures:
             raise RiftError("either upload pictures or import from Dragon's Dogma Online, not both")
         textures = tool.build(ddo)
@@ -501,6 +629,10 @@ def skin_make(studio, body: dict) -> dict:
         if f.is_file() and f.read_bytes() != data:
             kept.append(_keep_history(root, rel, f.read_bytes()).relative_to(root).as_posix())
     files = skins.write(root, fam, n, res, title, source)
+    if ddo:                 # a package carries the recipe; each player makes the maps from their own client
+        skins.record_ddo(root, fam, n, ddo, res)
+    else:
+        skins.mark_other_game(root, fam, n, textures)
     studio.log("ok", f"{fam.key} skin {n} ({title or 'untitled'}) -> {root.name}: {len(textures)} map(s) of "
                      f"{len(fam.textures)} replaced" + (f"; {len(kept)} old file(s) kept in aside/_history" if kept else ""))
     return {"ok": True, "mod": root.name, "number": n, "written": [p.relative_to(root).as_posix() for p in files],
@@ -551,6 +683,10 @@ def api(studio, method: str, route: str, q: dict, body: dict) -> dict | None:
         return preset(studio, body)
     if route == "files/export" and method == "GET":
         return export_zip(studio, q.get("mod"))
+    if route == "files/package" and method == "GET":
+        return share_package(studio, q.get("mod"))
+    if route == "files/receive" and method == "POST":
+        return install_package(studio, body)
     if route == "skins" and method == "GET":
         return skins_list(studio)
     if route == "skins/make" and method == "POST":

@@ -820,9 +820,10 @@ def write(root: Path, p: Plan) -> list[str]:
         m.description = "One player with pawns: solo twins of every named enemy parameter, and solo pacing"
         m.save()
     before = []
-    try:
-        before = list(json.loads((root / RECORD).read_text(encoding="utf-8")).get("files", {}))
-    except (OSError, ValueError, AttributeError):
+    try:           # a hand-edited record is read as far as it goes: only paths (strings) are taken
+        before = [rel for rel in json.loads((root / RECORD).read_text(encoding="utf-8")).get("files", {})
+                  if isinstance(rel, str)]
+    except (OSError, ValueError, AttributeError, TypeError, RecursionError):
         pass
     written = []
     for rel, data in sorted(p.files.items()):

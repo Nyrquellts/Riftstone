@@ -16,6 +16,51 @@ def quat7(x, y, z, w, delta):
     return struct.pack("<I", delta << 28 | x << 21 | y << 14 | z << 7 | w)
 
 
+def long_buffers(n):
+    """One motion whose n tracks' buffers all run from 0x10 + 4t to the end of the file: n distinct
+    buffers of nearly the whole file (36 KB for n = 1,000 held 34 MB of copies)."""
+    end = 0x4C + n * lmt.TRACK_SIZE + 64
+    b = bytearray(b"LMT\0" + struct.pack("<HHI", 66, 1, 0x10) + bytes(4))
+    b += struct.pack("<IIIi16s16sIII", 0x4C, n, 1, 0, ZERO16, ZERO16, 0, 0, 0)
+    for t in range(n):
+        off = 0x10 + 4 * t
+        b += struct.pack("<BBBB4sII16sI", 1, 1, 0, 0, bytes(4), (end - off) // 12 * 12, off, ZERO16, 0)
+    return bytes(b + bytes(end - len(b)))
+
+
+def overlapping_arrays(motions, nt):
+    """`motions` motions whose nt-track arrays start 36 bytes apart, so they overlap: each is a distinct
+    array (77 KB for 50 x 2,000 held 100,000 tracks)."""
+    head = 8 + 4 * motions
+    head += -head % 16
+    tracks = head + 64 * motions
+    b = bytearray(tracks + lmt.TRACK_SIZE * (nt + motions))
+    b[:8] = b"LMT\0" + struct.pack("<HH", 66, motions)
+    for i in range(motions):
+        struct.pack_into("<I", b, 8 + 4 * i, head + 64 * i)
+        struct.pack_into("<IIIi16s16sIII", b, head + 64 * i, tracks + lmt.TRACK_SIZE * i, nt, 1, 0, ZERO16,
+                         ZERO16, 0, 0, 0)
+    return bytes(b)
+
+
+def one_header(slots):
+    """Every slot pointing at one trackless header with an event block and 31 float groups: each slot
+    became its own motion (9 KB for 2,000 slots rebuilt to 1.4 MB)."""
+    head = 8 + 4 * slots
+    head += -head % 16
+    ev = head + 64
+    fl = ev + lmt.EVENT_GROUPS * 72
+    b = bytearray(fl + 31 * 12)
+    b[:8] = b"LMT\0" + struct.pack("<HH", 66, slots)
+    struct.pack_into(f"<{slots}I", b, 8, *([head] * slots))
+    struct.pack_into("<IIIi16s16sIII", b, head, 0, 0, 1, 0, ZERO16, ZERO16, lmt.FLAG_EVENTS | 31 << 16, ev, fl)
+    for g in range(lmt.EVENT_GROUPS):
+        struct.pack_into("<I", b, ev + 72 * g + 68, fl)
+    for g in range(31):
+        struct.pack_into("<I", b, fl + 12 * g + 8, len(b))
+    return bytes(b)
+
+
 def sample(version=66, share_tracks=True, floats=True):
     """Two motions in three slots (slot 1 empty); motion 2 shares motion 0's track array; two tracks
     share one buffer; motion 0 has events and (optionally) one group of float frames."""
@@ -117,6 +162,30 @@ class LmtTest(unittest.TestCase):
                 lmt.parse(raw[:n])
             except FormatError:
                 pass
+
+    def test_overlapping_blocks_refused(self):
+        # review: parse copied each distinct buffer and parsed each distinct track array or header however
+        # much they overlapped, so memory grew with the square of the file (288 KB of long_buffers(8000)
+        # took ~2 GiB). A file holds each of its blocks once: together they cannot need more bytes than it has.
+        import tracemalloc
+
+        for label, data in (("buffers", long_buffers(1000)), ("track arrays", overlapping_arrays(50, 2000)),
+                            ("headers", one_header(2000))):
+            with self.subTest(label):
+                tracemalloc.start()
+                try:
+                    with self.assertRaises(FormatError) as e:
+                        lmt.parse(data)
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                self.assertIn("overlap", str(e.exception))
+                self.assertLess(peak, 4 * len(data) + (1 << 20))     # nothing copied once per reference
+        # what the game's writer shares stays shared and readable: one array for two motions, one buffer and
+        # one extremes block for two tracks, and every rebuilt file (sample) is read back
+        for m in (sample(), sample(share_tracks=False), sample(floats=False)):
+            raw = lmt.build(m)
+            self.assertEqual(lmt.build(lmt.parse(raw)), raw)
 
     def test_codecs_round_trip(self):
         rnd = random.Random(7)

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 
 from .errors import FormatError, ParamError
+from .params import shown_value
 
 MAGIC = b"lot\0"
 VERSION = 138
@@ -67,7 +68,7 @@ def _flat(fields: list) -> list[tuple[str, str]]:
 def _layout(kind: int) -> tuple[str, tuple[tuple[str, str], ...]]:
     g = grammar().get(kind)
     if g is None:
-        raise FormatError("lot", f"record kind {kind} is not one DDO.exe loads")
+        raise FormatError("lot", f"record kind {shown_value(kind)} is not one DDO.exe loads")
     return g["class"], tuple(_flat(g["fields"]))
 
 
@@ -165,11 +166,12 @@ def build(lot: LotDdo) -> bytes:
     for r in lot.records:
         fields = _layout(r.kind)[1]
         if len(r.values) != len(fields):
-            raise FormatError("lot", f"record {r.id} ({r.cls}) has {len(r.values)} values for {len(fields)} fields")
+            raise FormatError("lot", f"record {shown_value(r.id)} ({r.cls}) has {len(r.values)} values for "
+                                     f"{len(fields)} fields")
         try:
             out += struct.pack("<iI", r.id, r.kind)
         except struct.error:
-            raise FormatError("lot", f"record id {r.id} is out of range") from None
+            raise FormatError("lot", f"record id {shown_value(r.id)} is out of range") from None
         for (name, t), v in zip(fields, r.values):
             try:
                 if t == "str":
@@ -192,7 +194,7 @@ def build(lot: LotDdo) -> bytes:
                 else:
                     out += struct.pack(_FMT[t], v)
             except struct.error:
-                raise FormatError("lot", f"{name}: {v!r} does not fit a {t}") from None
+                raise FormatError("lot", f"{name}: {shown_value(v)} does not fit a {t}") from None
             except UnicodeError:
                 raise FormatError("lot", f"{name}: the text has characters the game's encoding (Shift-JIS) lacks") from None
     return bytes(out)
@@ -291,7 +293,12 @@ def from_yaml(text: str, source: str | None = None) -> LotDdo:
             rid, kind = int(node.get("id").text, 0), int(node.get("kind").text, 0)
         except (AttributeError, ValueError):
             raise ParamError("a record needs a numeric id and kind", *where) from None
-        cls, fields = _layout(kind)
+        if not -(1 << 31) <= rid < 1 << 31:
+            raise ParamError(f"a record's id is a 32-bit whole number, not {shown_value(rid)}", *where)
+        try:
+            cls, fields = _layout(kind)
+        except FormatError as e:
+            raise ParamError(str(e), *where) from None
         vals = []
         for fname, t in fields:
             v = node.get(fname)
@@ -366,24 +373,51 @@ def yaml_to_bytes(text: str, source: str | None = None) -> bytes:
     return build(from_yaml(text, source))
 
 
+def _position(at) -> tuple[int, int, int]:
+    """(x, y, z) as a position's f32 bit patterns: three finite numbers a float holds (NaN and inf were
+    written as they were, 1e39 raised OverflowError), as Dark Arisen's Record.set_vec refuses them."""
+    try:
+        v = [float(x) for x in at]
+    except (TypeError, ValueError):
+        raise ParamError("mPosition is three numbers") from None
+    if len(v) != 3 or not all(math.isfinite(x) and abs(x) < 3.4e38 for x in v):
+        raise ParamError("mPosition is three finite numbers")
+    return tuple(struct.unpack("<I", struct.pack("<f", x))[0] for x in v)
+
+
 def copy(lot: LotDdo, index: int, at: tuple[float, float, float] | None = None) -> LotDdo:
     """A copy of record `index` appended with the next free id (moved to `at` when given)."""
+    return copies(lot, index, [at])
+
+
+def copies(lot: LotDdo, index: int, spots) -> LotDdo:
+    """A copy of record `index` for each spot, appended with the next free ids: moved to the spot, or left
+    where it is for None.  The layout is copied once, however many records are added."""
     import copy as _copy
 
     if not 0 <= index < len(lot.records):
         raise ParamError(f"record {index} does not exist (0..{len(lot.records) - 1})")
+    src = lot.records[index]
+    names = [n for n, _ in src.fields]
+    moves = [None if at is None else _position(at) for at in spots]      # all checked before anything is added
+    if any(p is not None for p in moves) and "mPosition" not in names:
+        raise ParamError(f"a {src.cls} record has no position")
     new = _copy.deepcopy(lot)
-    rec = _copy.deepcopy(lot.records[index])
     used = {r.id for r in lot.records}
-    rec.id = max(used, default=-1) + 1
-    if rec.id > 0x7FFFFFFF:   # the top id is taken: the lowest free one
-        rec.id = next(i for i in range(len(used) + 1) if i not in used)
-    if at is not None:
-        names = [n for n, _ in rec.fields]
-        if "mPosition" not in names:
-            raise ParamError(f"a {rec.cls} record has no position")
-        rec.values[names.index("mPosition")] = tuple(struct.unpack("<I", struct.pack("<f", v))[0] for v in at)
-    new.records.append(rec)
+    top, low = max(used, default=-1), 0
+    for p in moves:
+        rec = _copy.deepcopy(src)
+        if top < 0x7FFFFFFF:
+            top += 1
+            rec.id = top
+        else:                   # the top id is taken: the lowest free one
+            while low in used:
+                low += 1
+            rec.id = low
+        used.add(rec.id)
+        if p is not None:
+            rec.values[names.index("mPosition")] = p
+        new.records.append(rec)
     return new
 
 

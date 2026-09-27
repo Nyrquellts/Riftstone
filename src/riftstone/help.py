@@ -75,14 +75,18 @@ TABS: dict[str, dict] = {
         "body": _t(
             "The library: the loader, its plugins (on or off, with their settings and logs) and your mod projects. Each "
             "mod's Files panel says what every file does: adds something new (never clashes) or changes a game resource "
-            "(clashes with another mod changing the same one, which it names). Install rebuilds only the archives your "
-            "files touch and keeps the originals; uninstall and restore are hash-checked. Plugins load when the game "
-            "starts, so switching one or changing its settings takes effect at the next start.",
+            "(clashes with another mod changing the same one, which it names; a stage's group list and the game's "
+            "layouts are the exception: several mods' copies are merged at install and every mod's groups and "
+            "placements kept). Install rebuilds only the archives your files touch and keeps the originals; uninstall "
+            "and restore are hash-checked. Plugins load when the game starts, so switching one or changing its "
+            "settings takes effect at the next start.",
             "ライブラリです：ローダー、そのプラグイン（オン・オフ、設定、ログ）、そして MOD プロジェクト。各 MOD の"
             "「ファイル」パネルには、各ファイルの役割が表示されます：新規追加（競合しません）か、ゲームのリソースの変更"
-            "（同じリソースを変更する他の MOD と競合し、その MOD 名を表示します）です。インストール時は、変更に関わる"
-            "アーカイブだけを再構築し、元のファイルは保管されます。アンインストールと復元はハッシュで検証されます。"
-            "プラグインはゲーム起動時に読み込まれるため、オン・オフや設定の変更は次回の起動から有効になります。")},
+            "（同じリソースを変更する他の MOD と競合し、その MOD 名を表示します。ただしステージのグループリストとゲームの"
+            "レイアウトは例外で、複数の MOD の内容がインストール時に統合され、各 MOD のグループと配置がすべて残ります）"
+            "です。インストール時は、"
+            "変更に関わるアーカイブだけを再構築し、元のファイルは保管されます。アンインストールと復元はハッシュで検証"
+            "されます。プラグインはゲーム起動時に読み込まれるため、オン・オフや設定の変更は次回の起動から有効になります。")},
     "tab:game": {
         "title": _t("Diagnostics", "診断"),
         "body": _t(
@@ -175,12 +179,18 @@ FORMATS: dict[str, dict] = {
             "Where enemies, NPCs and objects stand. Decoded completely with DDDA.exe's own grammar (74 record classes, "
             "every field by its engine name; all 6,209 files byte-exact). Layout `st<S>_<X>m<Z>n_<t>N` is group N of the "
             "stage's group list `st<S>_<t>.gpl` in map cell (X, Z). Record ids are ids, not positions: a copy takes "
-            "max+1, a removal renumbers nothing, ids stay in 0..1023.",
+            "max+1 (clear of the ids its group uses in its other cells, and under 32 for enemies while one is free: "
+            "the game keeps one kill bit per id), a removal renumbers nothing, ids stay in 0..1023. Several mods that "
+            "change one of the game's "
+            "layouts are merged at install record by record; an id two mods both add goes to a free one.",
             "敵・NPC・オブジェクトの配置です。DDDA.exe 自身の読み込み処理から完全に解析済みです（74 種類のレコード、"
             "全フィールドをエンジン上の名前で表示。6,209 ファイルすべてバイト単位で一致）。レイアウト "
             "`st<S>_<X>m<Z>n_<t>N` は、マップセル (X, Z) にある、ステージのグループリスト `st<S>_<t>.gpl` の"
-            "グループ N です。レコード ID は位置ではなく識別子です：コピーすると最大値＋1 が割り当てられ、削除しても"
-            "番号は振り直されません。ID は 0〜1023 の範囲に収めてください。")},
+            "グループ N です。レコード ID は位置ではなく識別子です：コピーすると最大値＋1 が割り当てられ（同じグループの"
+            "他のセルで使われている ID は避け、敵は空きがあれば 32 未満にします。ゲームは ID ごとに撃破ビットを 1 つ"
+            "持つためです）、削除しても"
+            "番号は振り直されません。ID は 0〜1023 の範囲に収めてください。ゲームのレイアウトを変更する複数の MOD は、"
+            "インストール時にレコード単位で統合されます。2 つの MOD が同じ ID を追加した場合は空いている ID に移します。")},
     "lot-ddo": {
         "title": _t("Online layout (.lot v138)", "DDO レイアウト（.lot v138）"),
         "body": _t(
@@ -194,9 +204,13 @@ FORMATS: dict[str, dict] = {
         "title": _t("Enemy group list (.gpl)", "敵グループリスト（.gpl）"),
         "body": _t(
             "A stage's groups: which enemies (mUnitKindList), when they appear, how many in total, and where they live. "
-            "194 files byte-exact. mGroupList is the 295-slot group table, so group numbers are 0..294.",
+            "194 files byte-exact. mGroupList is the 295-slot group table, so group numbers are 0..294. Several mods "
+            "that change one list are merged at install, group by group; a number two mods both add goes to a free "
+            "one, its layouts renamed with it.",
             "ステージのグループ定義です：どの敵か（mUnitKindList）、いつ出現するか、合計何体か、どの範囲にいるか。"
-            "194 ファイルがバイト単位で一致。mGroupList は 295 スロットのグループ表なので、グループ番号は 0〜294 です。"),
+            "194 ファイルがバイト単位で一致。mGroupList は 295 スロットのグループ表なので、グループ番号は 0〜294 です。"
+            "同じリストを変更する複数の MOD は、インストール時にグループ単位で統合されます。2 つの MOD が同じ番号を"
+            "追加した場合は空いている番号に移し、そのレイアウトの名前も合わせて変更します。"),
         "fields": {
             "mSetCountMax": _t("The group's total output. With respawn type 5 its placements are spawn points it refills "
                                "(stage 330 group 35: 100 goblins from 7 points). The on-screen limit is still the exe's "
@@ -822,16 +836,26 @@ TOPICS: dict[str, dict] = {**TABS, **FORMATS}
 LANGS = ("en", "ja")
 
 _TAG = re.compile(r"^riftstone:\s*([A-Za-z0-9_\-]+)/", re.M)
+# XFS YAML (params.to_yaml): the root object's first key is its class, and the resource line names the file
+_ROOT_CLASS = re.compile(r"^root:[ \t]*(?:\{[ \t]*|\r?\n[ \t]+)_class:[ \t]*['\"]?([A-Za-z0-9_:]+)", re.M)
+_RESOURCE = re.compile(r"^resource:[ \t]*([^\r\n]*)", re.M)
 
 
 def topic_for(path_or_tag: str, yaml_text: str | None = None) -> str | None:
-    """The help topic for a resource path (by extension, `.yaml` suffix ignored) or a YAML file's tag."""
-    if yaml_text:
-        m = _TAG.search(yaml_text[:4096])
+    """The help topic for a resource path (by extension, `.yaml` suffix ignored) or a YAML file's tag
+    (only text is read for it: Studio passes its request's "text" as it came). XFS text says which by
+    its root object's class: an AI state machine (rAIFSM, as fsm.py reads one) is "fsm", else "xfs"."""
+    if isinstance(yaml_text, str) and yaml_text:
+        head = yaml_text[:4096]
+        m = _TAG.search(head)
+        if m and m.group(1) in ("xfs", "params"):     # before the tag's own topic: an .fsm is XFS too
+            root = _ROOT_CLASS.search(head)
+            if root is not None:
+                return "fsm" if root.group(1) == "rAIFSM" else "xfs"
+            res = _RESOURCE.search(head)            # the root reordered by hand: the file it came from
+            return "fsm" if res and res.group(1).strip().strip("'\"").lower().endswith(".fsm") else "xfs"
         if m and m.group(1) in TOPICS:
             return m.group(1)
-        if m and m.group(1) in ("xfs", "params"):
-            return "fsm" if "rAIFSM" in yaml_text[:4096] else "xfs"
     p = (path_or_tag or "").lower()
     if p.endswith(".yaml"):
         p = p[:-5]

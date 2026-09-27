@@ -215,6 +215,30 @@ class PluginsTest(unittest.TestCase):
         with self.assertRaises(RiftError):
             plugins.toggle(self.game, "absent", False)
 
+    def test_toggle_moves_nothing_while_a_copy_is_in_the_way(self):
+        """A stale off\\enemy_cap.ini: the .asi went to off\\ before the .ini was refused, so the plugin was left
+        half moved (off, its settings behind).  The same the other way, and through Studio's route."""
+        d = plugins.plugins_dir(self.game)
+
+        def files():
+            return sorted(p.relative_to(d).as_posix() for p in d.rglob("*"))
+
+        plugins.off_dir(self.game).mkdir()
+        (plugins.off_dir(self.game) / "enemy_cap.ini").write_text("[enemy_cap]\nslots = 12\n", encoding="utf-8")
+        before = files()
+        with self.assertRaisesRegex(RiftError, "already exists"):
+            plugins.toggle(self.game, "enemy_cap", False)
+        with self.assertRaisesRegex(RiftError, "already exists"):
+            studio.Studio(self.game, Path(self.tmp.name) / "mods").api(
+                "POST", "plugins/toggle", {}, {"name": "enemy_cap", "on": False})
+        self.assertEqual(files(), before)
+        (plugins.off_dir(self.game) / "enemy_cap.ini").unlink()
+        plugins.toggle(self.game, "enemy_cap", False)
+        (d / "enemy_cap.ini").write_text("[enemy_cap]\nslots = 12\n", encoding="utf-8")   # stale, the other way
+        before = files()
+        with self.assertRaisesRegex(RiftError, "already exists"):
+            plugins.toggle(self.game, "enemy_cap", True)
+        self.assertEqual(files(), before)
     def test_the_command_line_adds_a_built_plugin_by_name(self):
         """`riftstone loader plugin add free_sprint` works as Studio's Add does; a file path still works too."""
         from riftstone import cli
@@ -247,6 +271,165 @@ class PluginsTest(unittest.TestCase):
             plugins.add(self.game, "not_built")
 
 
+def windows_reads(path: Path, section: str, key: str) -> str | None:
+    """What the loader and the plugins read for a key: GetPrivateProfileStringW itself (None when absent)."""
+    import ctypes
+
+    buf = ctypes.create_unicode_buffer(1024)
+    ctypes.WinDLL("kernel32").GetPrivateProfileStringW(section, key, "\x01", buf, len(buf), str(path))
+    return None if buf.value == "\x01" else buf.value
+
+
+# save_backup.ini as a German owner keeps it: Notepad saved it in the Windows code page (no mark), as the
+# plugin reads it.
+SAVE_INI = ("; save_backup -- Kopien der Spielstände, während du spielst.\r\n"
+            "[backup]\r\n"
+            "; Wie viele Kopien (je 512 KB).\r\n"
+            "Keep = 20\r\n"
+            "; Wohin: ein Ordner für die Kopien.\r\n"
+            "Folder = D:\\Spielstände\r\n")
+
+
+@unittest.skipUnless(os.name == "nt", "the loader and the plugins read their settings with Windows' own reader")
+class IniEncodingTest(unittest.TestCase):
+    """Python read the inis as UTF-8 and wrote them as UTF-8, while the loader and the plugins read them with
+    GetPrivateProfileStringW, which reads a file without a UTF-16 mark in the ANSI code page."""
+
+    def setUp(self):
+        try:
+            self.ansi = SAVE_INI.encode("mbcs")
+        except UnicodeEncodeError:
+            self.skipTest("this PC's code page has no ä")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.game = Game(Path(self.tmp.name) / "game")
+        self.game.root.mkdir()
+        (self.game.root / "DDDA.exe").write_bytes(b"stub")
+        d = plugins.plugins_dir(self.game)
+        d.mkdir(parents=True)
+        (d / "save_backup.asi").write_bytes(b"MZ")
+        self.ini = d / "save_backup.ini"
+        self.ini.write_bytes(self.ansi)
+        self.closed = mock.patch.object(install, "game_running", lambda g: False)
+        self.closed.start()
+
+    def tearDown(self):
+        self.closed.stop()
+        self.tmp.cleanup()
+
+    def test_a_setting_changes_its_line_and_nothing_else(self):
+        """Setting Keep turned every other non-ASCII byte of an ANSI file (comments, the untouched Folder) into
+        EF BF BD."""
+        self.assertEqual(windows_reads(self.ini, "backup", "Folder"), "D:\\Spielstände")
+        plugins.set_value(self.game, "save_backup", "backup", "Keep", "30")
+        self.assertEqual(self.ini.read_bytes(), self.ansi.replace(b"Keep = 20", b"Keep = 30"))
+        self.assertEqual(windows_reads(self.ini, "backup", "Folder"), "D:\\Spielstände")
+        self.assertEqual(windows_reads(self.ini, "backup", "Keep"), "30")
+
+    def test_studio_the_plugin_and_save_list_read_one_folder(self):
+        """A Folder set in Studio was written in UTF-8: the plugin read 'D:\\SpielstÃ¤nde', save list
+        'D:\\Spielstände'."""
+        from riftstone import saves
+
+        plugins.set_value(self.game, "save_backup", "backup", "Folder", "E:\\Spielstände")
+        shown = {s["key"]: s["value"] for s in plugins.read_settings(self.ini)}["Folder"]
+        self.assertEqual(windows_reads(self.ini, "backup", "Folder"), "E:\\Spielstände")
+        self.assertEqual((shown, saves.backup_root(self.game)), ("E:\\Spielstände", Path("E:\\Spielstände")))
+        self.assertEqual(self.ini.read_bytes(), self.ansi.replace(b"D:", b"E:"))
+
+    def test_studio_shows_what_the_plugin_reads(self):
+        """A file saved as UTF-8 reads as the plugin reads it (in the code page), and one with a UTF-8 mark hides
+        its first section from the plugin: save list then falls back to the default folder as the plugin does."""
+        from riftstone import saves
+
+        self.ini.write_bytes(SAVE_INI.encode("utf-8"))
+        shown = {s["key"]: s["value"] for s in plugins.read_settings(self.ini)}["Folder"]
+        self.assertEqual(shown, windows_reads(self.ini, "backup", "Folder"))
+        self.assertEqual(saves.backup_root(self.game), Path(shown))
+        self.ini.write_bytes(b"\xef\xbb\xbf[backup]\r\nFolder = D:\\Elsewhere\r\n")
+        self.assertIsNone(windows_reads(self.ini, "backup", "Folder"))
+        self.assertEqual(saves.backup_root(self.game).name, "saves")
+        self.assertNotIn(("backup", "Folder"), {(s["section"], s["key"]) for s in plugins.read_settings(self.ini)})
+
+    def test_a_value_the_code_page_cannot_hold_is_refused(self):
+        try:
+            "\U0001F600".encode("mbcs")
+            self.skipTest("this PC's code page holds every character")
+        except UnicodeEncodeError:
+            pass
+        with self.assertRaisesRegex(RiftError, "code page"):
+            plugins.set_value(self.game, "save_backup", "backup", "Folder", "D:\\\U0001F600")
+        self.assertEqual(self.ini.read_bytes(), self.ansi)
+
+    def test_line_ends_stay_as_they_were(self):
+        self.ini.write_bytes(b"[backup]\nKeep = 20\rFolder = auto\r\n; the end")
+        plugins.set_value(self.game, "save_backup", "backup", "Keep", "25")
+        self.assertEqual(self.ini.read_bytes(), b"[backup]\nKeep = 25\rFolder = auto\r\n; the end")
+        plugins.set_value(self.game, "save_backup", "backup", "Folder", "C:\\x")
+        self.assertEqual(self.ini.read_bytes(), b"[backup]\nKeep = 25\rFolder = C:\\x\r\n; the end")
+        self.assertEqual(windows_reads(self.ini, "backup", "Keep"), "25")
+
+    def test_a_line_is_what_windows_reads_as_one(self):
+        """Windows ends a line at CR or LF only (a form feed, \\x0b or \\x1c is part of the value) and does not
+        read a UTF-8 mark as one: the key's whole line is replaced, and the rest keeps its bytes, the mark and a
+        CR CR included."""
+        raw = b"\xef\xbb\xbf; mark\r\n[backup]\r\r\nKeep = 20\x0cjunk\nFolder = auto\x0b\r\n"
+        self.ini.write_bytes(raw)
+        self.assertEqual(windows_reads(self.ini, "backup", "Keep"), "20\x0cjunk")
+        self.assertEqual({s["key"]: s["value"] for s in plugins.read_settings(self.ini)}["Keep"], "20\x0cjunk")
+        plugins.set_value(self.game, "save_backup", "backup", "Keep", "25")
+        self.assertEqual(self.ini.read_bytes(), raw.replace(b"Keep = 20\x0cjunk", b"Keep = 25"))
+        self.assertEqual((windows_reads(self.ini, "backup", "Keep"), windows_reads(self.ini, "backup", "Folder")),
+                         ("25", "auto"))                                         # (a trailing \x0b is trimmed)
+
+    def test_a_utf16_file_is_read_and_kept_as_utf16(self):
+        """A file with a UTF-16 mark Windows reads as UTF-16, every character, and keeps UTF-16 when it writes;
+        it was read in the code page, shown garbled and written back wrong."""
+        from riftstone import saves
+
+        text = SAVE_INI.replace("Folder = D:\\Spielstände", "Folder = D:\\Spielstände 日本")
+        raw = b"\xff\xfe" + text.encode("utf-16-le")
+        self.ini.write_bytes(raw)
+        self.assertEqual(windows_reads(self.ini, "backup", "Folder"), "D:\\Spielstände 日本")
+        shown = {s["key"]: (s["value"], s["help"]) for s in plugins.read_settings(self.ini)}
+        self.assertEqual(shown["Folder"], ("D:\\Spielstände 日本", "Wohin: ein Ordner für die Kopien."))
+        self.assertEqual(saves.backup_root(self.game), Path("D:\\Spielstände 日本"))
+        plugins.set_value(self.game, "save_backup", "backup", "Keep", "30")
+        self.assertEqual(self.ini.read_bytes(),
+                         b"\xff\xfe" + text.replace("Keep = 20", "Keep = 30").encode("utf-16-le"))
+        plugins.set_value(self.game, "save_backup", "backup", "Folder", "E:\\日本")   # no code page needed
+        self.assertEqual((windows_reads(self.ini, "backup", "Keep"), windows_reads(self.ini, "backup", "Folder")),
+                         ("30", "E:\\日本"))
+        with self.assertRaises(RiftError):                  # not UTF-16 behind the mark: refused, file untouched
+            self.ini.write_bytes(b"\xff\xfe[backup]\r\x00")
+            plugins.set_value(self.game, "save_backup", "backup", "Keep", "30")
+        self.assertEqual(self.ini.read_bytes(), b"\xff\xfe[backup]\r\x00")
+
+    def test_an_update_keeps_a_utf16_file_utf16(self):
+        build = Path(self.tmp.name) / "build"
+        build.mkdir()
+        (build / "save_backup.asi").write_bytes(b"MZ v2")
+        (build / "save_backup.ini").write_bytes(b"[backup]\r\nKeep = 20\r\nFolder = auto\r\nCheckSeconds = 2\r\n")
+        self.ini.write_bytes(b"\xff\xfe" + "[backup]\r\nKeep = 5\r\nFolder = D:\\日本\r\n".encode("utf-16-le"))
+        with mock.patch.object(plugins, "built", lambda: {"save_backup": build / "save_backup.asi"}):
+            plugins.add(self.game, "save_backup")
+        self.assertTrue(self.ini.read_bytes().startswith(b"\xff\xfe"))
+        self.assertEqual([windows_reads(self.ini, "backup", k) for k in ("Keep", "Folder", "CheckSeconds")],
+                         ["5", "D:\\日本", "2"])
+
+    def test_an_update_keeps_the_owners_values_in_the_code_page(self):
+        """plugins.add merged the owner's ini read as UTF-8 and wrote UTF-8: Folder came out as EF BF BD."""
+        build = Path(self.tmp.name) / "build"
+        build.mkdir()
+        (build / "save_backup.asi").write_bytes(b"MZ v2")
+        (build / "save_backup.ini").write_bytes(b"; save_backup -- copies\r\n[backup]\r\nKeep = 20\r\n"
+                                                b"Folder = auto\r\nCheckSeconds = 2\r\n")
+        with mock.patch.object(plugins, "built", lambda: {"save_backup": build / "save_backup.asi"}):
+            plugins.add(self.game, "save_backup")
+        self.assertIn("Folder = D:\\Spielstände".encode("mbcs"), self.ini.read_bytes())
+        self.assertEqual(windows_reads(self.ini, "backup", "Folder"), "D:\\Spielstände")
+        self.assertEqual(windows_reads(self.ini, "backup", "CheckSeconds"), "2")
+
+
 class StudioRoutesTest(PluginsTest):
     def studio(self):
         return studio.Studio(self.game, Path(self.tmp.name) / "mods")
@@ -264,6 +447,15 @@ class StudioRoutesTest(PluginsTest):
         for route, body in (("plugins/set", {"name": 3}), ("plugins/toggle", {}), ("plugins/add", {"name": "x/y"})):
             with self.assertRaises(RiftError, msg=route):
                 s.api("POST", route, {}, body)
+
+    def test_a_damaged_enemy_cap_log_reads_no_peak(self):
+        """enemy_cap.log's "peak: N of M slots" went through int(): a number of more than 4,300 digits (a damaged
+        log) raised ValueError and the plugins route answered 500 (as parse_report did for reports)."""
+        logs = self.game.state_dir / "logs"
+        logs.mkdir(parents=True)
+        (logs / "enemy_cap.log").write_text("peak: 12 of 30 slots\npeak: " + "9" * 5000 + " of 30 slots\n",
+                                            encoding="utf-8")
+        self.assertEqual(self.studio().api("GET", "plugins", {}, {})["enemy_peak"], 12)
 
     def test_launch(self):
         s = self.studio()

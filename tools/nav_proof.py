@@ -101,8 +101,10 @@ def main() -> int:
     print(f"3. {on_mesh} of {doors} doors of the {len(stages)} stages with a mesh stand on it, {on_main} on its main "
           f"region; the rest: " + ", ".join(f"st{s} {n}" for s, n in sorted(elsewhere.items())))
 
-    # 4. flat rings against ground placement
-    root = Mod.create(Path(tempfile.mkdtemp()) / "proof", "Proof").root
+    # 4. flat rings against ground placement (a scratch mod that receives nothing, removed at the end: mkdtemp's
+    # folder used to stay behind after every run)
+    scratch = tempfile.TemporaryDirectory(prefix="riftstone-nav-proof-", ignore_cleanup_errors=True)
+    root = Mod.create(Path(scratch.name) / "proof", "Proof").root
     old_on = old_all = new_on = new_all = refused = 0
     for s in stages:
         mesh = nav.stage_mesh(game, idx, s)
@@ -166,9 +168,12 @@ def main() -> int:
         except RiftError as e:
             still[s, seed] = str(e)
     small = sorted({s for s, _ in still})
-    # the director's three refusals for want of space: no place roomy enough, fewer places than beats, none in order
-    space = ("fits the mission's", "fewer places than the mission has beats", "no arrangement of places")
+    # the director's refusals for want of space: no place roomy enough, fewer places than beats, none in order, and
+    # no place at all 12 m from the doors (then no mission fits, however short)
+    space = ("fits the mission's", "fewer places than the mission has beats", "no arrangement of places",
+             "too small for a dungeon")
     other = {k: why for k, why in still.items() if not any(m in why for m in space)}
+    empty = sorted({s for (s, _), why in still.items() if "too small for a dungeon" in why})
     short = {name: mission.grammar({"format": mission.FORMAT, "start": "D", "rules": {"D": [beats]}})
              for name, beats in (("three fights", ["Fight", "Fight", "Fight"]), ("one fight", ["Fight"]))}
     fits = Counter()
@@ -179,7 +184,7 @@ def main() -> int:
                 fits[name] += 1
             except RiftError:
                 pass
-    ok &= tally["points"] == tally["good"] and not other and fits["one fight"] == len(small)
+    ok &= tally["points"] == tally["good"] and not other and fits["one fight"] == len(small) - len(empty)
     rest = len(refused) - sum(1 for s, _ in refused if s in bare)
     print(f"5. director: {own} dungeons from the stages' own enemies over {len(stages)} stages x {a.seeds} seeds; "
           f"{len(bare)} stages place no enemy group to copy ({', '.join(f'st{s}' for s in bare)}: refused); "
@@ -187,11 +192,13 @@ def main() -> int:
           f"{len(small)} stages ({', '.join(f'st{s}' for s in small)}), "
           f"{'all' if not other else 'NOT all'} for want of places in the doors' region, where a shorter mission fits: "
           + ", ".join(f"{name} on {fits[name]}" for name in short)
+          + (f" ({', '.join(f'st{s}' for s in empty)} no place {dungeon.DOOR_CLEAR:.0f} m from the doors)" if empty else "")
           + f"; {tally['good']} of {tally['points']} spawn points on the mesh in the doors' region")
     for (s, seed), why in sorted(other.items()):
         print(f"     st{s} seed {seed}: {why[:140]}")
     print("OK" if ok else "SOMETHING DIFFERS FROM THE DOCS")
     idx.close()
+    scratch.cleanup()
     return 0 if ok else 1
 
 

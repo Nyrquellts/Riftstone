@@ -18,6 +18,8 @@ from riftstone import arc, cli, ddodye, mod, mrl, port, tex, texcodec, typemap
 from riftstone.errors import FormatError, RiftError
 from riftstone.index import Index
 
+setUpModule, tearDownModule = helpers.module_env("RIFTSTONE_HOME")
+
 TEX, MRL = typemap.BY_EXT["tex"], typemap.BY_EXT["mrl"]
 CM = ddodye.ColourMask((1.0, 1.0, 1.0), (1.0, 1.0, 0.9), ((0.5, 0.5, 0.5), (0.6, 0.4, 0.3), (0.3, 0.2, 0.1)))
 
@@ -408,6 +410,41 @@ class PortTest(StandIn):
         built = self.built(root)
         names = {e.name.decode("latin-1") for e in built["rom/eq/test/m_armor"].entries}
         self.assertTrue({shown[h[0]], shown[h[1]], "ddo\\" + df.ALBEDO} <= names)
+
+    def test_the_recipe_carries_the_colour_and_a_replay_makes_the_same_files(self):
+        """A package ships the port as a recipe (sources.py): it names the colour, and replaying it on the player's
+        own games makes every dyed file byte for byte (without the colour it would re-port the armour undyed)."""
+        from riftstone import sources
+
+        root = mod.Mod.create(self.base / "mods" / "Dyed Recipe", "Dyed Recipe", game="ddda").root
+        res = port.into_mod(root, self.g, self.games["ddda"], self.i, self.idxs["ddda"],
+                            "obj/ab/ab219999/model/ab219999_00.mod",
+                            as_="model/pl/m/m_wst_b/m_wst_b999/m_wst_b999.mod", dye="red")
+        self.assertTrue(res.dyed is not None and res.dyed.written and res.dye_label)
+        (recipe,) = [r for r in sources.load(root)["recipes"] if r["kind"] == "port"]
+        self.assertEqual(recipe["args"]["dye"], "red")
+        have = sources._mod_files(root)
+        self.assertEqual(set(recipe["files"]), set(have), "the recipe lists exactly the files the mod holds")
+        self.assertTrue(any("_d" in f for f in recipe["files"]), "the dyed copies are among them")
+
+        games, idxs = self.games, self.idxs
+
+        class Here:
+            def game(self, kind):
+                return games[kind]
+
+            def index(self, kind):
+                return idxs[kind]
+
+        made = sources.replay([recipe], Here())
+        self.assertEqual(set(made), set(have))
+        for rel, data in have.items():
+            self.assertEqual(made[rel], data, rel)
+        plain = mod.Mod.create(self.base / "mods" / "Plain Recipe", "Plain Recipe", game="ddda").root
+        port.into_mod(plain, self.g, self.games["ddda"], self.i, self.idxs["ddda"], "obj/ab/ab219999/model/ab219999_00.mod",
+                      as_="model/pl/m/m_wst_b/m_wst_b999/m_wst_b999.mod")
+        (undyed,) = [r for r in sources.load(plain)["recipes"] if r["kind"] == "port"]
+        self.assertNotIn("dye", undyed["args"])                  # an undyed port's recipe is what it always was
 
     def test_red_shared_and_undyed_removed(self):
         root = mod.Mod.create(self.base / "mods" / "Red", "Red", game="ddda").root

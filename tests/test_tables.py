@@ -68,6 +68,16 @@ class TablesTest(unittest.TestCase):
             with self.assertRaises(ParamError):
                 tables.yaml_to_bytes(bad, "m.yaml")
 
+    def test_unknown_top_level_keys_are_refused(self):
+        # was: passed over, so a misspelled version wrote version 0 without a word
+        m = tables.to_yaml(tables.parse(MIX))
+        self.assertIn("version: 4\n", m)
+        for bad in (m.replace("version: 4\n", "verison: 4\n"), m.replace("version: 4\n", "version: 4\ncolour: red\n"),
+                    tables.to_yaml(tables.parse(SETS)).replace("sets:", "recipes: []\nsets:")):
+            with self.assertRaises(ParamError) as e:
+                tables.yaml_to_bytes(bad, "m.yaml")
+            self.assertIn("m.yaml: line ", str(e.exception))
+
     def test_inspect(self):
         out = inspect.describe(SETS, typemap.BY_EXT["ist"]).text("x")
         self.assertIn("set     7  1227:30, 1228:8, none:35, 283:27", out)

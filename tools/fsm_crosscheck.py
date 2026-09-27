@@ -3,7 +3,7 @@
     python tools/fsm_crosscheck.py [--game ddda|ddo|PATH] [--max-states 400] [--out report.json]
 
 For every machine (the root machine and every sub-machine) with a start state, fsmcheck.model writes it
-as a NYR-Lang formal FSM model and NYR-Lang's explicit checker (C:\\Dev\\NyrLang, or $NYRLANG;
+as a NYR-Lang formal FSM model and NYR-Lang's explicit checker (<path>, or $NYRLANG;
 formal/fsm.py) explores it.  The states it PROVES are never entered must be exactly the states
 fsmcheck.reachable leaves out.  Both start from fsmcheck's reading of the transition rules (the model
 is built from it), so this checks the graph search and the model export, not the rules themselves:
@@ -43,7 +43,7 @@ def main() -> int:
     a = ap.parse_args()
     formal = nyrlang()
     if formal is None:
-        print("NYR-Lang's formal/fsm.py is not at C:\\Dev\\NyrLang (set NYRLANG)")
+        print("NYR-Lang's formal/fsm.py is not at <path> (set NYRLANG)")
         return 2
     game = find_game(a.game)
     t0 = time.time()

@@ -254,6 +254,8 @@ class Record:
             vals = [float(v) for v in xyz]
         except (TypeError, ValueError):
             raise ParamError(f"{key} is three numbers") from None
+        except OverflowError:                             # an integer past a float's range
+            raise ParamError(f"{key} is three finite numbers") from None
         if len(vals) != 3 or not all(math.isfinite(v) and abs(v) < 3.4e38 for v in vals):
             raise ParamError(f"{key} is three finite numbers")
         self.fields[key] = struct.unpack("<3I", struct.pack("<3f", *vals))
@@ -468,10 +470,20 @@ def check_ids(lot: Lot) -> None:
 
 
 # -- editing -----------------------------------------------------------------------------------
-def free_id(lot: Lot) -> int:
-    """A new record id: the largest + 1, else the smallest unused one; within the game's 0..1023."""
-    ids = {r.id for r in lot.records}
+KILL_BITS = 32      # an enemy group's kill record: one bit a placement id, past 31 the bit wraps (0x004A653D)
+
+
+def free_id(lot: Lot, reserved=(), below: int | None = None) -> int:
+    """A new record id, within the game's 0..1023: the largest + 1 of the layout's ids and ``reserved`` (ids the
+    record's group uses in its other layouts, and ones the game's own copy of the layout has), else the smallest
+    unused one.  With ``below`` (``KILL_BITS`` for an enemy group) the smallest unused id under it comes first when
+    the largest + 1 is not under it."""
+    ids = {r.id for r in lot.records} | {i for i in reserved if isinstance(i, int) and not isinstance(i, bool)}
     nxt = max(ids) + 1 if ids else 0
+    if below is not None and nxt >= below:
+        low = next((i for i in range(min(below, MAX_ID + 1)) if i not in ids), None)
+        if low is not None:
+            return low
     if 0 <= nxt <= MAX_ID:
         return nxt
     for i in range(MAX_ID + 1):
@@ -480,12 +492,13 @@ def free_id(lot: Lot) -> int:
     raise ParamError(f"the layout's ids are used up (the game indexes 0..{MAX_ID})")
 
 
-def copy(lot: Lot, number: int, position: tuple[float, float, float] | None = None) -> Lot:
-    """A new record: record ``number`` copied to the end with a new id, optionally moved."""
+def copy(lot: Lot, number: int, position: tuple[float, float, float] | None = None, reserved=(),
+         below: int | None = None) -> Lot:
+    """A new record: record ``number`` copied to the end with a new id (``free_id``), optionally moved."""
     if isinstance(number, bool) or not isinstance(number, int) or not 0 <= number < len(lot.records):
         raise ParamError(f"there is no record {number} (the layout has {len(lot.records)})")
     rec = lot.records[number].copy()
-    rec.id = free_id(lot)
+    rec.id = free_id(lot, reserved, below)
     if position is not None:
         if "mPosition" not in rec.fields:
             raise ParamError(f"record {number} ({rec.cls}) has no position")
@@ -656,7 +669,11 @@ def _value(t: str, node, name: str, source):
             raise ParamError(f"{name} is text", *_where(node), source)
         if "\0" in node.text:
             raise ParamError(f"{name} cannot contain a NUL", node.line, node.col, source)
-        b = node.text.encode("utf-8", "surrogateescape")
+        try:
+            b = node.text.encode("utf-8", "surrogateescape")
+        except UnicodeEncodeError:        # a lone surrogate outside \udc80-\udcff (the escapes of stored bytes)
+            raise ParamError(f"{name} holds a character that is not valid text (a lone surrogate)", node.line,
+                             node.col, source) from None
         limit = _STR_MAX.get(name, STR_MAX)
         if len(b) > limit:
             raise ParamError(f"{name} is {len(b)} bytes; the game reads at most {limit}", node.line, node.col, source)
@@ -806,8 +823,9 @@ def _legacy_bytes(doc, source) -> bytes:
             raise ParamError("offset is a number", off.line, off.col, source) from None
         raw_name = nm.text.encode("ascii", "replace") + b"\0"
         if not (HEADER.size + len(raw_name) <= o <= len(data) - _BLOCK) or data[o - len(raw_name):o] != raw_name:
-            raise ParamError(f"no placement named {nm.text!r} sits at offset {o}; name and offset must stay as "
-                             "they were", off.line, off.col, source)
+            from .params import shown           # the offset as written: a huge hex one has no decimal form
+            raise ParamError(f"no placement named {shown(nm.text)!r} sits at offset {shown(off.text)}; name and "
+                             "offset must stay as they were", off.line, off.col, source)
         if o in seen:
             raise ParamError(f"offset {o} is listed twice", off.line, off.col, source)
         seen.add(o)

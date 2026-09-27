@@ -9,32 +9,26 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-# DDO's ARCC cipher key is neither shipped nor committed.  Synthetic-archive tests just need *some*
-# key (round-trips are key-agnostic); tests that read the real client's archives need the real key.
-STANDIN_DDO_KEY = "riftstone-test-ddo-cipher-key"
+from riftstone import cipher, typemap, xfs  # noqa: E402
+from riftstone.errors import RiftError  # noqa: E402
 
-
-def _ddo_key_file() -> bool:
-    local = os.environ.get("LOCALAPPDATA")
-    return bool(local and (Path(local) / "Riftstone" / "ddo.key").is_file())
+# Riftstone ships no Online key: cipher.find_arc_key takes the one a player supplies (RIFTSTONE_DDO_KEY or
+# %LOCALAPPDATA%\Riftstone\ddo.key), else reads it from the player's own client.  With Online on this PC the
+# tests use its key, so the corpus tests can read the real client; without it, the ARCC archives the tests build
+# and read use this stand-in, and the tests that need the real client skip (ddo_key_present).
+TEST_ARC_KEY = b"Riftstone's tests only, not Dragon's Dogma Online's key"
+try:
+    cipher.arc_cipher()
+    _REAL_DDO_KEY = True
+except RiftError:
+    cipher._key, cipher._default = TEST_ARC_KEY, None
+    _REAL_DDO_KEY = False
 
 
 def ddo_key_present() -> bool:
-    """True when a real DDO ARCC key is available (RIFTSTONE_DDO_KEY or %LOCALAPPDATA%\\Riftstone\\ddo.key),
-    not the tests' stand-in: the real-client corpus tests need it and skip without it."""
-    v = os.environ.get("RIFTSTONE_DDO_KEY", "")
-    if v and v != STANDIN_DDO_KEY:
-        return True
-    if v == STANDIN_DDO_KEY:
-        return False
-    return _ddo_key_file()
-
-
-# Supply the stand-in only when no real key is provided, so real-archive tests run when one is.
-if not os.environ.get("RIFTSTONE_DDO_KEY") and not _ddo_key_file():
-    os.environ["RIFTSTONE_DDO_KEY"] = STANDIN_DDO_KEY
-
-from riftstone import typemap, xfs  # noqa: E402
+    """True when Online's real archive key is in use, not the tests' stand-in: the tests that read the real
+    client need it and skip without it."""
+    return _REAL_DDO_KEY
 
 
 def module_env(*names: str):
@@ -55,6 +49,20 @@ def module_env(*names: str):
                 os.environ[n] = v
 
     return set_up, tear_down
+
+
+def stand_in_loader(game, idx, folder: Path) -> None:
+    """Put a stand-in Riftstone loader into a stand-in game (Dark Arisen mods install only through the loader):
+    a dinput8.dll with the loader's marker, installed by loader.install_loader as a built one would be."""
+    from unittest import mock
+
+    from riftstone import install, loader
+
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "dinput8.dll").write_bytes(b"MZ " + loader.MARKER + b" RiftstoneLoaderVersion=0.3.1\0")
+    with mock.patch.object(loader, "built_loader", return_value=folder), \
+            mock.patch.object(install, "game_running", return_value=False):
+        loader.install_loader(game, idx)
 
 
 def prop(name: str, tname: str, attr: int = 0, size: int | None = None) -> xfs.Prop:

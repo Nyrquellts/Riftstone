@@ -273,6 +273,12 @@ def _yf(f, v):
     return Seq([_yv(f[2], x) for x in v], flow=isinstance(f[2], str))
 
 
+def _num(v: int, text: str) -> str:
+    """A number for a message: in decimal, or its text cut short past 64 bits (int -> str refuses over
+    4,300 digits, and a hex number has no such limit)."""
+    return str(v) if v.bit_length() <= 64 else repr(text.strip()[:16] + "...")
+
+
 class _Y:
     def __init__(self, source):
         self.source = source
@@ -299,7 +305,7 @@ class _Y:
             raise self.err(f"{what}: {node.text!r} is not a whole number", node) from None
         lo, hi = _RANGE[t]
         if not lo <= v <= hi:
-            raise self.err(f"{what}: {v} is outside {lo}..{hi} ({t})", node)
+            raise self.err(f"{what}: {_num(v, node.text)} is outside {lo}..{hi} ({t})", node)
         return v
 
     def seq(self, node, n, what):
@@ -333,9 +339,10 @@ def to_yaml(m, name: str | None = None) -> str:
     from .yamlish import Map, Scalar, Seq
 
     items = []
+    shown = " -- " + "".join(c if c.isprintable() else " " for c in name) if name else ""   # stays in its comment
     if isinstance(m, MsgSet):
         tag = TAG_MSS
-        head = ["Riftstone message set (.mss, rMsgSet)" + (f" -- {name}" if name else ""),
+        head = ["Riftstone message set (.mss, rMsgSet)" + shown,
                 f"{len(m.params)} conversation(s) (cParam), found by mNo. mMsgTbl: the lines in order (-1 ends),",
                 "each with a motion, face and condition (GSF flag, or quest + flag; -1 = none); mSelMsgTbl the",
                 "choices (-1 ends) and mSelMsgJump the conversation each leads to. Fixed-size lists keep their",
@@ -343,12 +350,12 @@ def to_yaml(m, name: str | None = None) -> str:
         body = [(Scalar("mpParam"), Seq([_yv(PARAM, p) for p in m.params], flow=not m.params))]
     elif isinstance(m, MsgSerial):
         tag = TAG_MSL
-        head = ["Riftstone message serial list (.msl, rMsgSerial)" + (f" -- {name}" if name else ""),
+        head = ["Riftstone message serial list (.msl, rMsgSerial)" + shown,
                 f"{len(m.serials)} serial number(s) (mNo, 0..65535). Rebuilds byte-for-byte when untouched."]
         body = [(Scalar("mpParam"), Seq([Scalar(str(v)) for v in m.serials], flow=True))]
     elif isinstance(m, MsgSetDdo):
         tag = TAG_DDO
-        head = ["Riftstone message set (.mss, rMsgSet, Dragon's Dogma Online)" + (f" -- {name}" if name else ""),
+        head = ["Riftstone message set (.mss, rMsgSet, Dragon's Dogma Online)" + shown,
                 f"{len(m.groups)} group(s) of lines (cMsgGroup / cMsgData, the engine's names); an empty slot is",
                 "null. Rebuilds byte-for-byte when untouched."]
         groups = []

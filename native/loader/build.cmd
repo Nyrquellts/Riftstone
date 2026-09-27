@@ -1,7 +1,8 @@
 @echo off
 rem Build the Riftstone loader (32-bit, static CRT) and its test harness.
 rem Output: native\loader\out\dinput8.dll, riftstone_loader.dll, harness.exe, harness_ddda.exe,
-rem         marker_plugin.asi, crash_plugin.asi, chain_d3d9.dll, engine_stub.exe + engine_harness_core.dll
+rem         marker_plugin.asi, crash_plugin.asi, chain_plugin.asi, cap_plugin.asi, fwd_chain.dll, chain_d3d9.dll,
+rem         engine_stub.exe + engine_harness_core.dll
 setlocal
 set "HERE=%~dp0"
 set "OUT=%HERE%out"
@@ -18,7 +19,7 @@ if not exist "%OUT%\proxy" mkdir "%OUT%\proxy"
 if not exist "%OUT%\noproxy" mkdir "%OUT%\noproxy"
 pushd "%OUT%"
 set "CFLAGS=/nologo /O2 /MT /W4 /EHsc /GS /guard:cf /DUNICODE /D_UNICODE /std:c++17"
-set "SRC="%HERE%loader.cpp" "%HERE%stability.cpp" "%HERE%live.cpp" "%HERE%fixes.cpp" "%HERE%session.cpp" "%HERE%overlay.cpp" "%HERE%graphics.cpp""
+set "SRC="%HERE%loader.cpp" "%HERE%stability.cpp" "%HERE%live.cpp" "%HERE%fixes.cpp" "%HERE%session.cpp" "%HERE%overlay.cpp" "%HERE%graphics.cpp" "%HERE%resources.cpp""
 set "LIBS=kernel32.lib user32.lib advapi32.lib gdi32.lib"
 cl %CFLAGS% /LD %SRC% /Fo:proxy\ /Fe:dinput8.dll /link /DEF:"%HERE%dinput8.def" /DYNAMICBASE /NXCOMPAT %LIBS% || goto :fail
 cl %CFLAGS% /LD /DRIFTSTONE_NO_PROXY %SRC% /Fo:noproxy\ /Fe:riftstone_loader.dll /link /DYNAMICBASE /NXCOMPAT %LIBS% || goto :fail
@@ -28,6 +29,9 @@ rem of exit_sites.h are its to fill (run_tests.py gives the copy build 2364871's
 cl /nologo /O2 /MT /W4 /EHsc /GS /DUNICODE /D_UNICODE /std:c++17 /DHARNESS_DDDA_LAYOUT "%HERE%test\harness.cpp" /Fo:harness_ddda.obj /Fe:harness_ddda.exe /link /BASE:0x400000 /FIXED /DYNAMICBASE:NO /NXCOMPAT dinput8.lib dxguid.lib d3d9.lib user32.lib kernel32.lib || goto :fail
 cl %CFLAGS% /LD "%HERE%test\marker_plugin.cpp" /Fe:marker_plugin.asi /link /DYNAMICBASE /NXCOMPAT kernel32.lib || goto :fail
 cl %CFLAGS% /LD "%HERE%test\crash_plugin.cpp" /Fe:crash_plugin.asi /link /DYNAMICBASE /NXCOMPAT kernel32.lib || goto :fail
+cl %CFLAGS% /LD "%HERE%test\chain_plugin.cpp" /Fe:chain_plugin.asi /link /DYNAMICBASE /NXCOMPAT kernel32.lib || goto :fail
+cl %CFLAGS% /LD "%HERE%test\cap_plugin.cpp" /Fe:cap_plugin.asi /link /DYNAMICBASE /NXCOMPAT kernel32.lib || goto :fail
+cl %CFLAGS% /LD "%HERE%test\fwd_chain.cpp" /Fe:fwd_chain.dll /link /DYNAMICBASE /NXCOMPAT kernel32.lib || goto :fail
 rem A stand-in for DXVK's d3d9.dll ([d3d9] chain): notes the call, then hands out Windows' own Direct3D 9.
 cl %CFLAGS% /LD "%HERE%test\chain_d3d9.cpp" /Fe:chain_d3d9.dll /link /DEF:"%HERE%test\chain_d3d9.def" /DYNAMICBASE /NXCOMPAT kernel32.lib || goto :fail
 rem Engine harness: a CRT-free stub exe that owns DDDA.exe's fixed range (0x00400000 + 0x160C000) as
@@ -36,7 +40,7 @@ cl /nologo /O1 /GS- /c "%HERE%test\engine_stub.cpp" /Fo:engine_stub.obj || goto 
 link /nologo engine_stub.obj /OUT:engine_stub.exe /ENTRY:Start /NODEFAULTLIB /SUBSYSTEM:CONSOLE /BASE:0x400000 /FIXED /DYNAMICBASE:NO /NXCOMPAT:NO /SAFESEH:NO kernel32.lib || goto :fail
 cl %CFLAGS% /LD "%HERE%test\engine_harness.cpp" /Fo:engine_harness.obj /Fe:engine_harness_core.dll /link /SAFESEH:NO kernel32.lib user32.lib advapi32.lib shell32.lib || goto :fail
 popd
-echo built: %OUT%\dinput8.dll %OUT%\riftstone_loader.dll %OUT%\harness.exe %OUT%\harness_ddda.exe %OUT%\marker_plugin.asi %OUT%\crash_plugin.asi %OUT%\chain_d3d9.dll
+echo built: %OUT%\dinput8.dll %OUT%\riftstone_loader.dll %OUT%\harness.exe %OUT%\harness_ddda.exe %OUT%\marker_plugin.asi %OUT%\crash_plugin.asi %OUT%\chain_plugin.asi %OUT%\cap_plugin.asi %OUT%\fwd_chain.dll %OUT%\chain_d3d9.dll
 exit /b 0
 :fail
 popd

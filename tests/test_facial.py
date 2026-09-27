@@ -60,6 +60,15 @@ class FacialTest(unittest.TestCase):
         raw2 = facial.build(odd)
         self.assertEqual(facial.yaml_to_bytes(facial.to_yaml(facial.parse(raw2))), raw2)
 
+    def test_yaml_name_stays_in_its_comment(self):
+        # the resource name went into the header comment as it was: a newline in it began a YAML line
+        # of its own (here a second 'riftstone:' key, which also fooled params' tag detection)
+        from riftstone import params
+        raw = facial.build(sample())
+        y = facial.to_yaml(sample(), "x\nriftstone: xfs/1\r\t\"#")
+        self.assertEqual(facial.yaml_to_bytes(y), raw)
+        self.assertEqual(params.yaml_to_resource(y), raw)
+
     def test_value_at(self):
         t = sample().tracks[0]
         self.assertAlmostEqual(facial.value_at(t, 0), 0.0)
@@ -102,6 +111,18 @@ class FacialTest(unittest.TestCase):
             self.assertNotEqual(bad, y)
             with self.assertRaises(ParamError):
                 facial.from_yaml(bad)
+
+    def test_yaml_long_hex_number(self):
+        # base 16 has no digit limit, but 3,572 hex digits are over 4,300 decimal ones: the range message
+        # printed the number and leaked int -> str's ValueError
+        big = "0x" + "f" * 3572
+        y = facial.to_yaml(sample())
+        for bad in (y.replace("FrameNum: 10", "FrameNum: " + big), y.replace("- track: 1", "- track: " + big),
+                    y.replace("{frame: 3,", "{frame: -" + big + ",")):
+            self.assertNotEqual(bad, y)
+            with self.assertRaises(ParamError) as cm:
+                facial.from_yaml(bad)
+            self.assertLess(len(str(cm.exception)), 200)
 
     @unittest.skipUnless(ddda_found(), "Dragon's Dogma: Dark Arisen not found")
     def test_corpus_byte_exact(self):

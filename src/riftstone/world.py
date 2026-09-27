@@ -364,10 +364,15 @@ class World:
         return [g for g in self.groups if g["stage"] == stage and (type_ is None or g["type"] == type_)]
 
     def group(self, stage: int, type_: str, number: int) -> dict | None:
+        """The stage's group of that number: its own list's, else a DLC list's (st443_e_dlc01's 20-22), which share
+        the number space."""
+        dlc = None
         for g in self.groups:
-            if (g["stage"], g["type"], g["number"]) == (stage, type_, number) and not g["dlc"]:
-                return g
-        return None
+            if (g["stage"], g["type"], g["number"]) == (stage, type_, number):
+                if not g["dlc"]:
+                    return g
+                dlc = dlc or g
+        return dlc
 
     def layouts_of(self, stage: int, type_: str, number: int) -> list[str]:
         return sorted(self._by_group.get((stage, type_, number), []))
@@ -449,9 +454,11 @@ def load(game: Game, idx, rebuild: bool = False, progress_factory=None, lang: st
     if not rebuild and path.is_file():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            if data.get("schema") == SCHEMA and data.get("signature") == sig and data.get("lang") == lang:
+            # a cache that is not the map's object (JSON null, a list: data.get raised AttributeError) is rebuilt
+            if isinstance(data, dict) and data.get("schema") == SCHEMA and data.get("signature") == sig \
+                    and data.get("lang") == lang:
                 return World(data)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):   # nesting deeper than the decoder goes
             pass
     bar = progress_factory() if progress_factory else None
     data = build(game, idx, bar, lang)

@@ -30,6 +30,7 @@ MAX_BODY = 64 * 1024 * 1024       # uploads: an edited 2048 px texture as PNG, b
 PREVIEW_LIMIT = 400_000
 # The only files served besides the page: the display font and two drawings (no token: nothing private).
 STATIC = {"fonts/riftstone-blade.woff2": "font/woff2", "mark.svg": "image/svg+xml", "spiral.svg": "image/svg+xml"}
+TEXT_FILES = (".yaml", ".txt", ".json")    # what the editor opens and saves
 SERVER_EXE = "Arrowgene.Ddon.Cli.exe"   # the local Dragon's Dogma Online server the DDO toolkit runs
 
 
@@ -124,6 +125,8 @@ class Studio:
             self.workspace = workspace
             self.exe_ok = None
             self.index_state = {"ready": False, "done": 0, "total": 0, "error": None}
+            self._world = None              # the last game's map and "is it running" answer
+            self._running_at = 0
         self.log("ok", f"Switched to {game.title}" + (f"; mods folder {workspace}" if self.follow else ""))
         self.start_index()
 
@@ -309,7 +312,8 @@ class Studio:
         except OSError:
             return None
         import re
-        found = re.findall(r"peak: (\d+) of \d+ slots", text)
+        # at most 9 digits, whole: int() refuses more than 4,300 (a damaged log)
+        found = re.findall(r"peak: (\d{1,9}) of \d+ slots", text)
         return int(found[-1]) if found else None
 
     def mod_root(self, name: str) -> Path:
@@ -356,7 +360,15 @@ class Studio:
             if g:
                 if self.exe_ok is None:
                     self.exe_ok = install.sha256_file(g.exe) == g.known_build_sha256
-                s = install.status(g)
+                try:
+                    s = install.status(g)
+                except RiftError as e:       # a damaged state.json: the rest still shows, the log says why (once)
+                    s = {"loader": g.loader_installed(), "mode": install.mode_for(g), "archives": [],
+                         "drift": ["state.json"]}
+                    with self.lock:
+                        told = any(a["msg"] == str(e) for a in self.activity)
+                    if not told:
+                        self.log("fail", str(e))
                 from . import runtime
 
                 rstate = runtime.runtime_state(g.root)
@@ -420,9 +432,13 @@ class Studio:
                 idx.close()
         if route == "help":
             from . import help as helpmod
-            tag = q.get("tag", "")
-            topic = q.get("topic") or (tag if tag in helpmod.TOPICS else None) \
-                or helpmod.topic_for(q.get("path", ""), body.get("text") if body else None)
+            tag, text = q.get("tag", ""), body.get("text")
+            if text is not None and not isinstance(text, str):
+                raise RiftError("text is the editor's text")
+            known = tag if tag in helpmod.TOPICS else None
+            # every parameter file's YAML is tagged xfs/1: its path says more (a state machine, .fsm)
+            topic = q.get("topic") or (known if known != "xfs" else None) \
+                or helpmod.topic_for(q.get("path", ""), None if known == "xfs" else text) or known
             h = helpmod.get(topic, q.get("field") or None) if topic else None
             return {"help": h}
         if route == "search":
@@ -430,9 +446,11 @@ class Studio:
                 limit = max(1, min(int(q.get("limit", "200")), 1000))
             except ValueError:
                 raise RiftError("limit must be a number") from None
+            tid = typemap.type_for_extension(q["type"]) if q.get("type") else None
+            if q.get("type") and tid is None:              # was: an unknown type searched every type
+                raise RiftError(f"no resource type {q['type']!r}")
             idx = self.open_index()
             try:
-                tid = typemap.type_for_extension(q.get("type", "")) if q.get("type") else None
                 rows = idx.search(q.get("q", ""), tid, limit)
             finally:
                 idx.close()
@@ -466,8 +484,8 @@ class Studio:
             if not name or any(c in name for c in '\\/:*?"<>|') or name in (".", ".."):
                 raise RiftError("give the mod a name without \\ / : * ? \" < > |")
             kind = body.get("game") or (self.game.kind if self.game else "ddda")
-            if kind not in KINDS:
-                raise RiftError(f"unknown game {kind!r}")
+            if not isinstance(kind, str) or kind not in KINDS:
+                raise RiftError(f"game is one of {', '.join(KINDS)}")
             m = Mod.create(self.workspace / name, name, str(body.get("author", "")), kind)
             self.log("ok", f"Created mod {m.name}")
             return {"ok": True}
@@ -480,6 +498,9 @@ class Studio:
             m = Mod.load(root)
             if m.game == game.kind:
                 raise RiftError(f"{root.name} is a {game.title} mod: use Add to mod")
+            for key in ("as", "like"):
+                if body.get(key) and not isinstance(body[key], str):
+                    raise RiftError(f"{key} is a resource's engine path, e.g. model/em/e52/e5200/e5200.mod")
             other = next((g for k, g in (getattr(self, "_found", None) or {}).items() if k == m.game), None) \
                 or find_game(m.game)
             src_idx, dst_idx = self.open_index(), Index(other)
@@ -507,6 +528,8 @@ class Studio:
                 raise RiftError(f"{root.name} is a {KINDS[kind]['title']} mod; bring {game.title} files into it "
                                 f"with: riftstone port <resource> --mod \"{root}\"")
             rel = body.get("path", "")
+            if not isinstance(rel, str):
+                raise RiftError("path is a resource's engine path, e.g. param/status/enemy.statusparam")
             name, tid = fsmap.decode_path(rel)
             idx = self.open_index()
             try:
@@ -524,7 +547,7 @@ class Studio:
             return {"ok": True, "file": target.relative_to(root).as_posix()}
         if route == "file" and method == "GET":
             f = self.mod_file(q.get("mod"), q.get("rel", ""))
-            if f.suffix.lower() not in (".yaml", ".txt", ".json"):
+            if f.suffix.lower() not in TEXT_FILES:
                 raise RiftError("only text files open in the editor")
             if not f.is_file():
                 raise RiftError("that file does not exist")
@@ -532,6 +555,8 @@ class Studio:
         if route == "file" and method == "POST":
             f = self.mod_file(body.get("mod"), body.get("rel", ""))
             text = str(body.get("text", ""))
+            if f.suffix.lower() not in TEXT_FILES:          # as for opening one: a texture became the text
+                raise RiftError("only text files are saved from the editor")
             if not f.is_file():
                 raise RiftError("that file does not exist")
             try:
@@ -545,7 +570,7 @@ class Studio:
         if route == "validate" and method == "POST":
             return self.validate(str(body.get("text", "")), "editor")
         if route == "lot" and method == "POST":
-            return self.lot_edit(body)
+            return self.lot_edit(body, self.lot_reserved(body))
         if route == "world" and method == "GET":
             return self.world_overview(self.world())
         if route == "world/stage" and method == "GET":
@@ -567,6 +592,8 @@ class Studio:
         if route == "install" and method == "POST":
             game = self.need_game()
             names = body.get("mods", [])
+            if not isinstance(names, list):
+                raise RiftError("mods is the list of mod names to install")
             roots = [self.mod_root(n) for n in names]
             idx = self.open_index()
             try:
@@ -575,8 +602,16 @@ class Studio:
                 idx.close()
             msg = f"Installed {len(roots)} mod(s): {len(rep.written)} archive(s) written, {len(rep.restored)} restored"
             self.log("ok", msg)
+            from .merging import kept
+            for m in rep.merged:
+                self.log("ok", f"{m['resource']}: merged from {' and '.join(m['mods'])}, every mod's {kept(m)} kept")
+            for r in rep.renumbered:
+                what = (f"record {r['record']} of {r['layout']} is record {r['as']}" if "record" in r else
+                        f"group {r['group']} of stage {r['stage']} ({r['type']}) is group {r['as']}")
+                self.log("info", f"{r['mod']}: {what} in the game (another mod adds the same number there)")
             return {"ok": True, "message": msg, "written": rep.written, "restored": rep.restored,
-                    "conflicts": rep.conflicts, "mode": rep.mode}
+                    "conflicts": rep.conflicts, "mode": rep.mode, "merged": rep.merged,
+                    "renumbered": rep.renumbered, "unmoved": rep.unmoved}
         if route == "restore" and method == "POST":
             done = install.restore_all(self.need_game())
             self.log("ok", f"Restored {len(done)} archive(s) to the originals")
@@ -587,13 +622,16 @@ class Studio:
         if route == "loader" and method == "POST":
             from . import loader
 
+            action = body.get("action")
+            if action not in ("install", "remove"):         # anything else removed the loader
+                raise RiftError("action is install or remove")
             game = self.need_game()
             idx = self.open_index()
             try:
-                r = loader.install_loader(game, idx) if body.get("action") == "install" else loader.remove_loader(game, idx)
+                r = loader.install_loader(game, idx) if action == "install" else loader.remove_loader(game, idx)
             finally:
                 idx.close()
-            self.log("ok", f"Loader {'installed' if body.get('action') == 'install' else 'removed'}")
+            self.log("ok", f"Loader {'installed' if action == 'install' else 'removed'}")
             return {"ok": True, **r}
         if route == "crash" and method == "GET":
             game = self.need_game()
@@ -604,10 +642,11 @@ class Studio:
             report = game.state_dir / "logs" / name
             if not report.is_file():
                 raise RiftError("no such crash report")
-            from . import runtime
+            from . import legal, runtime
 
             text = report.read_text(encoding="utf-8", errors="replace")
-            return {"text": text, "explanation": runtime.explain(runtime.parse_report(text), game.root)}
+            return {"text": text, "explanation": runtime.explain(runtime.parse_report(text), game.root),
+                    "support": legal.SUPPORT}
         if route == "live" and method == "GET":
             from . import runtime
 
@@ -653,9 +692,36 @@ class Studio:
             self._running_at = now
         return self._running
 
+    def lot_reserved(self, body: dict) -> tuple[set[int], int | None]:
+        """What a record copied in the editor keeps clear of (``modfiles.group_ids``): its group's other layouts as
+        the editor's mod holds them and the game's own ids; nothing when the layout or the game cannot be read."""
+        from . import lot, modfiles, yamlish
+
+        if body.get("op") != "copy" or not isinstance(body.get("text"), str) or not self.game or self.game.is_ddo:
+            return set(), None
+        try:
+            res = yamlish.parse(body["text"], "editor").get("resource")
+            name = res.text.replace("/", "\\") if isinstance(res, yamlish.Scalar) else ""
+            if name.lower().endswith(".lot"):
+                name = name[:-4]
+            if lot.parse_name(name) is None:
+                return set(), None
+            mod = body.get("mod")
+            root = self.mod_root(mod) if isinstance(mod, str) and mod else None
+            idx = self.open_index()
+        except RiftError:
+            return set(), None
+        try:
+            return modfiles.group_ids(self.game, idx, root, name.encode("latin-1"))
+        except (RiftError, UnicodeEncodeError, OSError):
+            return set(), None
+        finally:
+            idx.close()
+
     @staticmethod
-    def lot_edit(body: dict) -> dict:
-        """Copy or remove a record in the editor's layout text; returns the new text (writes nothing)."""
+    def lot_edit(body: dict, keep_clear: tuple = (set(), None)) -> dict:
+        """Copy or remove a record in the editor's layout text; returns the new text (writes nothing).  A copy's id
+        keeps clear of ``keep_clear`` (``lot_reserved``)."""
         from . import lot, yamlish
 
         text, op, number = body.get("text"), body.get("op"), body.get("number")
@@ -668,7 +734,7 @@ class Studio:
                                    and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in at)):
             raise RiftError("at is [x, y, z]")
         lt = lot.from_yaml(text, "editor")
-        new = lot.copy(lt, number, tuple(at) if at else None) if op == "copy" else lot.remove(lt, number)
+        new = lot.copy(lt, number, tuple(at) if at else None, *keep_clear) if op == "copy" else lot.remove(lt, number)
         res = yamlish.parse(text, "editor").get("resource")
         name = res.text if isinstance(res, yamlish.Scalar) else None
         return {"text": lot.to_yaml(new, name), "count": new.count}
@@ -742,17 +808,27 @@ class Studio:
         game = self.need_game()
 
         def num(key, default=None, kind=int):
-            v = body.get(key, default)
-            if v is None:
-                return None
-            if isinstance(v, bool) or not isinstance(v, (int, float)) or (kind is int and not float(v).is_integer()):
+            v = body.get(key)
+            if v is None:                   # absent or null: the default ({"spread": null} reached plan as None)
+                return default
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise RiftError(f"{key} is a number")
-            return kind(v)
+            try:
+                if kind is int and not float(v).is_integer():
+                    raise RiftError(f"{key} is a whole number")
+                return kind(v)
+            except OverflowError:           # float() refuses an int past 1e308 (a 400-digit JSON number)
+                raise RiftError(f"{key} is far too large") from None
+
+        def finite(v) -> bool:
+            try:
+                return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            except OverflowError:
+                return False
 
         at = body.get("at")
         if isinstance(at, list):
-            if len(at) != 3 or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
-                                       for v in at):
+            if len(at) != 3 or not all(finite(v) for v in at):
                 raise RiftError("at is [x, y, z] or \"group:N\"")
             at = ",".join(repr(float(v)) for v in at)
         if not isinstance(at, str):
@@ -775,7 +851,7 @@ class Studio:
             hours = encounter.parse_hours(hours)
         w = self.world()
         # a new mod is only created when the encounter is written; until then it plans against the game
-        root, new = studiofiles.destination(self, body)
+        root, new = studiofiles.destination(self, body, game.kind)
         idx = self.open_index()
         try:
             enc = encounter.plan(game, idx, w, root, str(body.get("stage", "")), str(body.get("enemy", "")),
@@ -784,7 +860,7 @@ class Studio:
         finally:
             idx.close()
         gpl_key = (None, enc.gpl_name.encode("latin-1"), typemap.BY_EXT["gpl"])
-        clash = studiofiles.clashes(self, None if new else root.name, gpl_key)
+        clash = studiofiles.clashes(self, None if new else root.name, gpl_key, game.kind)
         notes = list(enc.notes)
         for n in (skin or []):
             owner = studiofiles.skin_owners(self, skins.family_of_enemy(enc.enemy)).get(n)
@@ -801,10 +877,10 @@ class Studio:
                "mod": root.name, "new_mod": new is not None, "like": like, "skin": skin, "written": [],
                "shared": [enc.gpl_name.replace("\\", "/") + ".gpl"], "clashes": clash,
                "note": (f"{' and '.join(clash)} also change{'s' if len(clash) == 1 else ''} this stage's group list: "
-                        f"installed together, the later mod's list wins and the other's groups disappear. Put this "
-                        f"encounter in {clash[0]} to keep both." if clash else
-                        "adds a layout (never clashes) and changes the stage's group list: another mod that changes "
-                        "the same list would clash with this one")}
+                        "installed together, the lists are merged and every mod's groups kept (a number two mods both "
+                        "add goes to a free one at install, its layouts renamed with it)." if clash else
+                        "adds a layout (never clashes) and changes the stage's group list: another mod changing the "
+                        "same list is merged with this one at install, every mod's groups kept")}
         if not body.get("dry_run"):
             studiofiles.make_mod(self, root, new)
             out["written"] = [p.relative_to(root).as_posix() for p in encounter.write(enc, root)]
@@ -826,29 +902,34 @@ class Studio:
         exclude = body.get("exclude") or ""
         if not isinstance(pool, str) or not isinstance(exclude, str):
             raise RiftError("pool is stage or game; exclude is a list of enemies, e.g. death,bats")
-        spacing = body.get("spacing", dungeon.SPACING)
-        if isinstance(spacing, bool) or not isinstance(spacing, (int, float)):
-            raise RiftError("spacing is a number of metres between places")
+        # checked before float(): a JSON whole number of 400 digits overflowed it (OverflowError, not a refusal)
+        spacing = dungeon._spacing(body.get("spacing", dungeon.SPACING))
         w = self.world()
-        root, new = studiofiles.destination(self, body)
+        root, new = studiofiles.destination(self, body, game.kind)     # never an Online mod for a Dark Arisen dungeon
         dry = bool(body.get("dry_run"))
         stage = encounter.parse_stage(str(body.get("stage", "")))
         # the mods that change this stage's group list, before anything is written (a new mod is not one of them)
         gpl_key = (None, f"scr\\st{stage:03d}\\etc\\st{stage:03d}_e".encode("latin-1"), typemap.BY_EXT["gpl"])
-        clash = studiofiles.clashes(self, None if new else root.name, gpl_key)
+        clash = studiofiles.clashes(self, None if new else root.name, gpl_key, game.kind)
         idx = self.open_index()
         try:
             b = bestiary.load(game, idx, w)
             excl = {w.find_enemy(e) for e in exclude.split(",") if e.strip()}
-            d = dungeon.direct(game, idx, w, stage, seed=seed, which=pool, exclude=excl, b=b, spacing=float(spacing),
-                               keep_lots=bool(body.get("keep_lot_flags")))
+            d = dungeon.direct(game, idx, w, stage, seed=seed, which=pool, exclude=excl, b=b, spacing=spacing,
+                               keep_lots=bool(body.get("keep_lot_flags")), mod_root=root)
             entries = encounter_plan.parse(dungeon.plan_text(d))
+            # checked before anything is written, or a new mod made: every encounter planned in a scratch copy of the
+            # mod first (a refusal there left a new, empty mod behind), every spawn point found on the ground
+            done = encounter_plan.apply(game, idx, w, root, entries, dry_run=True)
+            proof = dungeon.check(d.space, [enc for _, enc, _ in done])
             if not dry:
+                if proof.problems:
+                    raise RiftError(f"{len(proof.problems)} spawn point(s) are not on ground reached from the doors "
+                                    f"({proof.problems[0]}); nothing written")
                 studiofiles.make_mod(self, root, new)
-            done = encounter_plan.apply(game, idx, w, root, entries, dry_run=dry)
+                done = encounter_plan.apply(game, idx, w, root, entries)
         finally:
             idx.close()
-        proof = dungeon.check(d.space, [enc for _, enc, _ in done])
         warnings = [f"{enc.enemy}: {n}" for _, enc, _ in done for n in enc.notes
                     if ("spawn point" in n and ("fit" in n or "from walkable" in n)) or "open ground" in n]
         out = {"stage": d.stage, "nav_stage": d.space.nav_stage, "seed": d.seed, "mission": mission.describe(d.beats),
@@ -908,6 +989,12 @@ class Studio:
         return out
 
 
+def _token_ok(given: str, token: str) -> bool:
+    """compare_digest on bytes: on str it raises TypeError for any non-ASCII character, and a web page picks
+    what the link or the header holds."""
+    return secrets.compare_digest(given.encode("utf-8", "replace"), token.encode("ascii"))
+
+
 def make_handler(studio: Studio, port_ref: list):
     page = _res.files("riftstone").joinpath("studio/index.html").read_text(encoding="utf-8")
 
@@ -944,7 +1031,7 @@ def make_handler(studio: Studio, port_ref: list):
             u = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             if u.path in ("/", "/index.html") and method == "GET":
-                if not secrets.compare_digest(q.get("t", ""), studio.token):
+                if not _token_ok(q.get("t", ""), studio.token):
                     self._send(403, b"Open Riftstone Studio from the link the 'riftstone studio' command printed.",
                                "text/plain; charset=utf-8")
                     return
@@ -965,18 +1052,22 @@ def make_handler(studio: Studio, port_ref: list):
             if not u.path.startswith("/api/"):
                 self._send(404, b"not found", "text/plain")
                 return
-            if not secrets.compare_digest(self.headers.get("X-Riftstone-Token", ""), studio.token):
+            if not _token_ok(self.headers.get("X-Riftstone-Token", ""), studio.token):
                 self._json(403, {"error": "missing or wrong session token"})
                 return
             body = {}
             if method == "POST":
-                n = int(self.headers.get("Content-Length") or 0)
+                length = (self.headers.get("Content-Length") or "0").strip()
+                if not re.fullmatch(r"[0-9]{1,12}", length):          # "-1": read(-1) waited for the client to close
+                    self._json(400, {"error": "bad Content-Length"})
+                    return
+                n = int(length)
                 if n > MAX_BODY:
                     self._json(413, {"error": "request too large"})
                     return
                 try:
                     body = json.loads(self.rfile.read(n) or b"{}")
-                except ValueError:
+                except (ValueError, RecursionError):                        # RecursionError: nested too deep
                     self._json(400, {"error": "bad JSON"})
                     return
                 if not isinstance(body, dict):

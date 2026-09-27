@@ -5,6 +5,7 @@ one end to end)."""
 from __future__ import annotations
 
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -321,6 +322,33 @@ class ReportTest(unittest.TestCase):
         self.assertIn("archives changed by: DDO Chimeras", text)
         self.assertIn("missing_textures = 1", text)
 
+    def test_numbers_too_long_to_read_are_left_out(self):
+        """A number of more than 4,300 digits made int() raise ValueError, so `riftstone crash` and Studio's crash
+        route failed on damaged text, which parse_report tolerates."""
+        big = "9" * 5000
+        text = (CRASH.replace("stage       100", "stage       " + big).replace("#01 0x004a21b0", f"#{big} 0x004a21b0")
+                .replace("3950 MB of 4096 MB", f"{big} MB of {big} MB").replace("42 MB", big + " MB")
+                .replace("3100 MB", big + " MB").replace("9000 MB", big + " MB"))
+        r = runtime.parse_report(text)
+        self.assertIsNone(r["stage"])
+        self.assertEqual([f["frame"] for f in r["stack"]], [0])
+        self.assertEqual([r["memory"].get(k) for k in ("used_mb", "largest_free_mb", "private_mb", "ram_free_mb")],
+                         [None] * 4)
+        self.assertTrue(runtime.explain(r))
+        r = runtime.parse_report(FATAL.replace("did not find: 1", "did not find: " + big)
+                                 .replace("2100 MB of 4096 MB", f"{big}9 MB of 4096 MB"))
+        self.assertEqual((r["missing_count"], r["memory"].get("used_mb")), (0, None))
+        self.assertTrue(runtime.explain(r))
+
+    def test_a_damaged_install_record_explains_what_it_can(self):
+        """An archive record whose mods are a number crashed explain (TypeError): Studio's crash route answered 500."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "riftstone").mkdir()
+            for doc in ({"archives": {"rom/enemy/em5200": {"mods": 5}}}, {"archives": []}, [1],
+                        {"mods": [{"path": 5}], "archives": {"rom/x": None}}):
+                (root / "riftstone" / "state.json").write_text(json.dumps(doc), encoding="utf-8")
+                self.assertIn("fatal error", "\n".join(runtime.explain(runtime.parse_report(FATAL), root)), doc)
     def test_out_of_memory_under_windows_direct3d_names_dxvk(self):
         text = CRASH.replace("  handles              1200\n", "  handles              1200\n"
                              "  large-address aware  NO (2048 MB of address space)\n"
@@ -547,8 +575,77 @@ class SafeModeTest(unittest.TestCase):
             self.assertFalse(st["safe_mode"])
             self.assertTrue(st["last_clean"])
 
+    @unittest.skipUnless(os.name == "nt", "the loader writes the file with Windows' own writer")
+    def test_names_stay_in_the_code_page(self):
+        """The loader writes runtime-state.ini with WritePrivateProfileStringW, in the code page; Python read it as
+        UTF-8, so a quarantined 'Übersicht.asi' could not be released, and safe_mode_off wrote every such name
+        back as EF BF BD (the loader then read another name)."""
+        import ctypes
+
+        name = "Übersicht.asi"
+        try:
+            raw = name.encode("mbcs")
+        except UnicodeEncodeError:
+            self.skipTest("this PC's code page has no Ü")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "riftstone" / "runtime-state.ini"
+            state.parent.mkdir()
+            write = ctypes.WinDLL("kernel32").WritePrivateProfileStringW
+            for sec, key, value in (("safe_mode", "on", "1"), ("quarantine", name, "52-01dc"), ("strikes", name, "2"),
+                                    ("strikes", "other.asi", "1")):
+                write(sec, key, value, str(state))
+            self.assertIn(raw + b"=52-01dc", state.read_bytes())
+            self.assertEqual(runtime.runtime_state(root)["quarantine"], [name])
+            self.assertTrue(runtime.safe_mode_off(root))
+            self.assertIn(raw + b"=52-01dc", state.read_bytes())
+            self.assertTrue(runtime.release_plugin(root, name))
+            self.assertEqual(runtime.runtime_state(root)["quarantine"], [])
+            self.assertNotIn(raw, state.read_bytes())
+            self.assertIn(b"other.asi=1", state.read_bytes())
+
+    def test_the_loaders_encoded_plugin_names_read_as_names(self):
+        """Loader 0.4.1 keys an unusual plugin name ('=' in it, not ASCII) as ~ and the hex of its lower-case UTF-8;
+        runtime_state showed that key and release_plugin wanted it, not the plugin's name."""
+        for name, key in (("crash=plugin.asi", "~63726173683d706c7567696e2e617369"), ("Übersicht.asi", None),
+                          ("plain.asi", "plain.asi"), (";odd.asi", None), ("trail .asi ", None)):
+            self.assertEqual(runtime.plugin_name(runtime.plugin_key(name)), name if key == name else name.lower())
+            if key:
+                self.assertEqual(runtime.plugin_key(name), key)
+        self.assertEqual(runtime.plugin_name("~zz"), "~zz")                     # not the loader's form: as it is
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "riftstone" / "runtime-state.ini"
+            state.parent.mkdir()
+            k = runtime.plugin_key("crash=plugin.asi")
+            state.write_bytes(f"[quarantine]\r\n{k}=52-01dc\r\n[strikes]\r\n{k}=3\r\nother.asi=1\r\n".encode())
+            self.assertEqual(runtime.runtime_state(root)["quarantine"], ["crash=plugin.asi"])
+            self.assertEqual(runtime.runtime_state(root)["strikes"], {"crash=plugin.asi": "3", "other.asi": "1"})
+            self.assertTrue(runtime.release_plugin(root, "Crash=Plugin.asi"))        # Windows ignores the case
+            self.assertEqual(runtime.runtime_state(root)["quarantine"], [])
+            self.assertNotIn(k.encode(), state.read_bytes())
+            self.assertIn(b"other.asi=1", state.read_bytes())
+
 
 class SavesTest(unittest.TestCase):
+    def test_a_folder_of_the_owners_is_no_backup(self):
+        # was: every folder there counted as a backup: the owner's own was taken as the newest (so an unchanged
+        # save was compared with it) and pruned with the old backups, files and all
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = Path(tmp) / "userdata" / "920192618" / "367500" / "remote"
+            remote.mkdir(parents=True)
+            root = Path(tmp) / "backups"
+            own = root / "920192618" / "(my own copy)"
+            own.mkdir(parents=True)
+            (own / "DDDA.sav").write_bytes(b"v2" * 50)
+            (own / "notes.txt").write_bytes(b"keep me")
+            for i in range(1, 5):
+                (remote / "DDDA.sav").write_bytes(f"v{i}".encode() * 50)
+                self.assertEqual(len(runtime.backup_saves([remote], root, keep=2, stamp=f"20260101-00000{i}")), 1, i)
+            self.assertEqual((own / "notes.txt").read_bytes(), b"keep me")
+            self.assertEqual([b["stamp"] for b in runtime.list_save_backups(root)],
+                             ["20260101-000004", "20260101-000003"])
+
     def test_backup_dedupe_keep_and_restore(self):
         with tempfile.TemporaryDirectory() as tmp:
             remote = Path(tmp) / "userdata" / "920192618" / "367500" / "remote"
@@ -612,7 +709,8 @@ class LoaderSettingsTest(unittest.TestCase):
         (root / "riftstone" / "overlay" / "rom" / "enemy").mkdir(parents=True)
         (root / "riftstone" / "overlay" / "rom" / "enemy" / "em5200.arc").write_bytes(b"MOD")
         (root / "riftstone" / "state.json").write_text(json.dumps(
-            {"schema": "riftstone.state/1", "mods": [{"path": str(tmp / "mods" / "X"), "name": "X"}],
+            {"schema": "riftstone.state/1",
+             "mods": [{"path": str(tmp / "mods" / "X"), "name": "X", "version": "0.1.0", "priority": 0}],
              "archives": {"rom/enemy/em5200": {"sha256": "0" * 64, "replaced": [], "added": [], "mods": ["X"]}}}))
         built = tmp / "built"
         built.mkdir()
@@ -639,6 +737,24 @@ class LoaderSettingsTest(unittest.TestCase):
             self.assertEqual(v["loader"]["chain"], "my_tweak.dll")       # a hand-made chain stays
             self.assertIn("guard", v)                                     # new settings arrive
             self.assertEqual((game.overlay_dir / "rom" / "enemy" / "em5200.arc").read_bytes(), b"MOD")
+
+    def test_the_owners_values_stay_in_the_code_page(self):
+        """The loader reads its ini in the code page; _write_ini read it as UTF-8 and wrote UTF-8, so a chained
+        dinput8 named in the code page ('dinput8_Übersetzt.dll') came back as EF BF BD and was not found."""
+        try:
+            name = "dinput8_Übersetzt.dll".encode("mbcs")
+        except UnicodeEncodeError:
+            self.skipTest("this PC's code page has no Ü")
+        with tempfile.TemporaryDirectory() as tmp:
+            game, _ = self._stand_in(Path(tmp), "")
+            ini = game.root / "riftstone_loader.ini"
+            ini.write_bytes(b"; mine\r\n[loader]\r\noverlay = 0\r\nchain = " + name + b"\r\n")
+            loader._write_ini(game, "")
+            raw = ini.read_bytes()
+            self.assertIn(b"\r\nchain = " + name + b"\r\n", raw)
+            self.assertIn(b"\r\noverlay = 0\r\n", raw)
+            self.assertNotIn(b"\r\r", raw)
+            self.assertEqual(loader._ini_values(runtime.ini_text(raw))["loader"]["chain"], "dinput8_Übersetzt.dll")
 
     def test_first_install_moves_mods(self):
         from unittest import mock

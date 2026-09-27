@@ -4,8 +4,9 @@ A plugin is a ``.asi``/``.dll`` in ``<game>\\riftstone\\plugins``; the loader lo
 start, in name order.  A plugin switched off waits in ``riftstone\\plugins\\off\\`` with its settings
 (the loader reads only the folder itself, never a subfolder).  A plugin's settings are the ``.ini`` of
 the same name next to it; Studio changes only the values of keys the file already has and keeps every
-comment, so the file stays as readable as it was.  The loader's own settings (``riftstone_loader.ini``
-next to the game) are handled the same way under the name ``loader``.
+other byte (comments included), so the file stays as readable as it was.  Like the plugins, it reads and
+writes the file in the Windows code page (runtime.ini_text).  The loader's own settings
+(``riftstone_loader.ini`` next to the game) are handled the same way under the name ``loader``.
 
 Everything here waits for the game to close before moving a file: plugins load once, at start.
 """
@@ -19,6 +20,7 @@ from pathlib import Path
 from . import install
 from .errors import RiftError
 from .game import Game
+from .runtime import INI_UTF16, ini_bytes, ini_text, ini_value
 
 SUFFIXES = (".asi", ".dll")
 OFF = "off"
@@ -92,6 +94,7 @@ _RULES: dict[tuple[str, str, str], tuple] = {
     ("lod_tuner", "lod", "maxdistance"): ("int", 100, 100000),
     ("lod_tuner", "lod", "screenheight"): ("auto_int", 240, 8640),
     ("lod_tuner", "lod", "fieldofview"): ("auto_float", 10.0, 170.0),
+    ("compat", "compat", "enabled"): ("int", 0, 1),
     ("compat", "levels", "unlearned"): ("int", 1, 10),
     ("compat", "levels", "learned"): ("int", 1, 10),
     ("compat", "levels", "level2"): ("int", 1, 10),
@@ -165,12 +168,13 @@ def _check_name(name: str) -> str:
 # -- ini files, comments kept -------------------------------------------------------------------------
 
 def read_settings(path: Path) -> list[dict]:
-    """Every ``key = value`` in an ini, in file order, with its section and the comment lines above it."""
+    """Every ``key = value`` in an ini, in file order, with its section and the comment lines above it, read
+    as the game reads it: in the code page (runtime.ini_text), a line ending at CR or LF only."""
     if not path.is_file():
         return []
     out, section, notes, above_section, first = [], "", [], [], False
-    for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
-        line = raw.strip()
+    for text in _ini_lines(path.read_bytes()):
+        line = text.strip()
         if not line:
             notes = []
             continue
@@ -244,29 +248,58 @@ def _valid(stem: str, section: str, key: str, value) -> str:
     return text
 
 
-def write_setting(path: Path, section: str, key: str, value: str) -> str:
-    """Set one existing key; every other line (comments, spacing, other keys) stays as it was."""
-    if not path.is_file():
-        raise RiftError(f"{path.name} does not exist")
-    lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
-    current, done = "", False
-    for i, raw in enumerate(lines):
-        line = raw.strip()
+def _ini_lines(raw: bytes) -> list[str]:
+    """An ini's lines as Windows reads them: split at CR or LF only, UTF-16 behind its mark, else the code page."""
+    if raw.startswith(INI_UTF16):
+        return re.split(r"\r\n|\r|\n", ini_text(raw))
+    return [ini_text(line) for line in raw.splitlines()]
+
+
+def _find_setting(lines: list[str], section: str, key: str) -> int | None:
+    """The index of the line that holds [section] key, among an ini's lines (as _ini_lines gives them)."""
+    current = ""
+    for i, text in enumerate(lines):
+        line = text.strip()
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1].strip()
-            continue
-        if done or line.startswith(";") or "=" not in line or current.lower() != section.lower():
-            continue
-        k = line.partition("=")[0].strip()
-        if k.lower() == key.lower():
-            indent = raw[: len(raw) - len(raw.lstrip())]
-            lines[i] = f"{indent}{k} = {value}"
-            done = True
-    if not done:
-        raise RiftError(f"{path.name} has no {key} in [{section}]")
+        elif not line.startswith(";") and "=" in line and current.lower() == section.lower() \
+                and line.partition("=")[0].strip().lower() == key.lower():
+            return i
+    return None
+
+
+def write_setting(path: Path, section: str, key: str, value: str) -> str:
+    """Set one existing key.  Every other line (comments, spacing, other keys, line ends) keeps its bytes; the
+    value is written as the game reads the file: UTF-16 in a file with a UTF-16 mark, else the code page
+    (runtime.ini_text)."""
+    if not path.is_file():
+        raise RiftError(f"{path.name} does not exist")
+    raw = path.read_bytes()
+    if raw.startswith(INI_UTF16):           # was: read as the code page, shown garbled and never written right
+        try:
+            text = raw[2:].decode("utf-16-le")          # strict: every other line must come back the same
+        except UnicodeDecodeError:
+            raise RiftError(f"{path.name} starts with a UTF-16 mark but does not read as UTF-16") from None
+        parts = re.split(r"(\r\n|\r|\n)", text)          # line, end, line, end, ..., line
+        i = _find_setting(parts[::2], section, key)
+        if i is None:
+            raise RiftError(f"{path.name} has no {key} in [{section}]")
+        ini_value(value, key, utf16=True)
+        line = parts[2 * i]
+        parts[2 * i] = line[:line.index("=")].rstrip(" \t") + " = " + value
+        data = INI_UTF16 + "".join(parts).encode("utf-16-le")
+    else:
+        lines = raw.splitlines(keepends=True)
+        i = _find_setting([ini_text(x) for x in raw.splitlines()], section, key)
+        if i is None:
+            raise RiftError(f"{path.name} has no {key} in [{section}]")
+        body = lines[i].rstrip(b"\r\n")
+        # the key keeps its bytes ("=" is byte 0x3D in every Windows code page, never part of a character)
+        head = body[:body.index(b"=")].rstrip(b" \t")
+        lines[i] = head + b" = " + ini_value(value, key) + lines[i][len(body):]
+        data = b"".join(lines)
     tmp = path.with_name(path.name + ".riftstone-tmp")
-    # bytes, not write_text: text mode would turn each "\r\n" into "\r\r\n" on Windows (fuzz finding, plugin_ini)
-    tmp.write_bytes(("\r\n".join(lines) + "\r\n").encode("utf-8"))
+    tmp.write_bytes(data)
     os.replace(tmp, path)
     return value
 
@@ -370,13 +403,13 @@ def toggle(game: Game, name: str, on: bool) -> dict:
     if enabled == on:
         return {"ok": True, "enabled": on, "changed": False}
     dest_dir = plugins_dir(game) if on else off_dir(game)
+    moves = [(f, dest_dir / f.name) for f in (p, p.with_suffix(".ini")) if f.is_file()]
+    for _, target in moves:             # every target first: a plugin is never left half moved
+        if target.exists():
+            raise RiftError(f"{target} already exists; sort the two copies out first")
     dest_dir.mkdir(parents=True, exist_ok=True)
-    for f in (p, p.with_suffix(".ini")):
-        if f.is_file():
-            target = dest_dir / f.name
-            if target.exists():
-                raise RiftError(f"{target} already exists; sort the two copies out first")
-            os.replace(f, target)
+    for f, target in moves:
+        os.replace(f, target)
     return {"ok": True, "enabled": on, "changed": True}
 
 
@@ -399,7 +432,10 @@ def add(game: Game, name: str) -> dict:
     os.replace(tmp, folder / src.name)
     ini_src, ini_dst = src.with_suffix(".ini"), folder / (src.stem + ".ini")
     if ini_src.is_file():
-        template = ini_src.read_text(encoding="utf-8-sig", errors="replace")
-        mine = ini_dst.read_text(encoding="utf-8-sig", errors="replace") if ini_dst.is_file() else ""
-        ini_dst.write_text(merge_ini(template, mine) if mine else template, encoding="utf-8")
+        template = ini_src.read_bytes()
+        owners = ini_dst.read_bytes() if ini_dst.is_file() else b""
+        mine = ini_text(owners)
+        tmp = ini_dst.with_name(ini_dst.name + ".riftstone-tmp")
+        tmp.write_bytes(ini_bytes(merge_ini(ini_text(template), mine), like=owners) if mine else template)
+        os.replace(tmp, ini_dst)
     return {"ok": True, "file": src.name, "enabled": enabled}

@@ -122,6 +122,33 @@ class SnapshotTests(unittest.TestCase):
             args.out = str(root / "base" / "new.json")
             with self.assertRaises(RiftError): args.fn(args)
 
+    def test_missing_folder_manifest_layer_and_file_refused(self):
+        # review: vfs --mount on a folder without vfs.json, a layer path with a typo and reading a file the
+        # snapshot lacks raised FileNotFoundError tracebacks; each is a refusal naming what is missing
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "base").mkdir()
+            for folder, manifest, missing in (
+                    (root / "nope", None, "nope"),
+                    (root, None, "vfs.json"),
+                    (root, {"schema": "riftstone.vfs/1", "base": "bsae", "layers": []}, "bsae"),
+                    (root, {"schema": "riftstone.vfs/1", "base": "base",
+                            "layers": [{"name": "low", "priority": 1, "path": "lwo"}]}, "lwo")):
+                with self.subTest(missing=missing):
+                    if manifest is not None:
+                        (root / "vfs.json").write_text(json.dumps(manifest))
+                    with self.assertRaises(RiftError) as e:
+                        vfs.mount_manifest(folder)
+                    self.assertIn(missing, str(e.exception))
+                    args = cli.build_parser().parse_args(["vfs", "--mount", str(folder)])
+                    with self.assertRaises(RiftError):
+                        args.fn(args)
+        view = vfs.Snapshot({"a.bin": b"x"}, [])
+        with self.assertRaises(RiftError) as e:
+            view.open("b.bin")
+        self.assertIn("b.bin", str(e.exception))
+        self.assertIsInstance(e.exception, FileNotFoundError)          # still what a file system says
+
     def test_deterministic_order_and_rejected_duplicate_names(self):
         layers = [vfs.Layer("a", 1, {"x": b"a"}), vfs.Layer("b", 1, {"x": b"b"})]
         self.assertEqual(vfs.Snapshot({}, layers).report, vfs.Snapshot({}, list(reversed(layers))).report)

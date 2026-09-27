@@ -347,10 +347,6 @@ def _scan_brackets(s: str, depth: int, quote):
     return depth, quote
 
 
-def _bracket_balance(s: str) -> int:
-    return _scan_brackets(s, 0, None)[0]
-
-
 def _quoted(s: str, i: int, line: int, col: int, p: _Parser) -> tuple[Scalar, int]:
     q = s[i]
     out = []
@@ -517,8 +513,10 @@ def dquote(text: str) -> str:
 
 
 def emit(node: Node, header: list[str] | None = None) -> str:
-    """Text for a node tree.  Scalars are written exactly as given (callers format them)."""
-    lines: list[str] = [("# " + h).rstrip() if h else "#" for h in (header or [])]
+    """Text for a node tree.  Scalars are written exactly as given (callers format them).  Each header
+    line is one comment line: a character that is not printable (a line break in a name) becomes '?'."""
+    lines: list[str] = [("# " + "".join(c if c.isprintable() else "?" for c in h)).rstrip() if h else "#"
+                        for h in (header or [])]
     _emit_block(node, 0, lines)
     return "\n".join(lines) + "\n"
 

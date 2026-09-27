@@ -21,8 +21,7 @@ reads and rewrites files in the copy of the game *you own*, on your own machine.
 
 **1. Modernizes Dark Arisen** — a drop-in loader (`dinput8.dll`) plus native plugins that lift old engine
 limits. **The loader and plugins never modify your game files** — your mods load from an overlay folder,
-and `nativePC` is left untouched. (The toolkit can *also* build conventional archive mods on request; that
-path writes into the game, but backs up and restores the originals.)
+and `nativePC` is left untouched: since 1.0.1 Dark Arisen mods install only through that overlay.
 
 - **Bigger battles** — the engine's hard 10-enemy limit becomes **30 by default, up to 64**.
 - **Pawn inclination lock** — Come! / Help! / Go! stop dragging your main pawn toward Guardian.
@@ -30,6 +29,9 @@ path writes into the game, but backs up and restores the originals.)
 - **Less pop-in**, **longer draw distance**, a **six-skill Warrior**, and automatic **save backups**.
 - **Missing-texture guard** — a missing texture draws a neutral placeholder and is logged instead of
   crashing to desktop (catches a common crash, not all of them).
+- **Archive guard** (1.0.1) — when the game asks for a file before its archive has been read (a skipped
+  cutscene, a slow drive), it gets that file's own bytes from the archive instead of stopping with
+  "Failed open file".
 - **F10 diagnostics panel** — active enemies, frame rate, memory headroom, plugin status.
 - **DXVK integration** — chains DXVK's `d3d9.dll` to relieve the 32-bit game's address-space pressure.
 
@@ -46,6 +48,9 @@ path writes into the game, but backs up and restores the originals.)
   reachable on foot.
 - Add custom items (shops, recipes, drops); rebalance any enemy.
 - Port resources and body-matched monsters between Dark Arisen and DDO.
+- Share mods as **packages with no game data**: deltas and recipes that each player's Riftstone turns back
+  into the mod from their own game. Mods that change the same group lists or layouts **merge** instead of
+  hiding each other.
 
 **3. Dragon's Dogma Online preservation** (if you own DDO) — solo rebalance, a monster bridge, and gear
 dyes, all generated from *your own* DDO files. See [docs/ddo-solo.md](docs/ddo-solo.md).
@@ -62,7 +67,8 @@ dyes, all generated from *your own* DDO files. See [docs/ddo-solo.md](docs/ddo-s
 
 Download the player package, unzip it into your game folder (where `DDDA.exe` is), and launch. Press
 **F10** in-game for the diagnostics panel. To uninstall, delete `dinput8.dll`, `riftstone_loader.ini` and
-the `riftstone` folder.
+the `riftstone` folder. `optional\ninput` holds Ninput, an experimental plugin host: it stays off unless you
+copy its `xinput1_3.dll` next to `DDDA.exe` (its README says more).
 
 ## Use the toolkit
 

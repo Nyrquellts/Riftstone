@@ -96,6 +96,47 @@ class LotTest(unittest.TestCase):
         with self.assertRaises(ParamError):
             lot.copy(lt, 0, (float("inf"), 0.0, 0.0))
 
+    def test_a_coordinate_past_a_float_is_refused(self):
+        # was: OverflowError converting a 400-digit integer to float (Studio's lot copy with "at")
+        from riftstone.studio import Studio
+
+        lt = lot.parse(SAMPLE)
+        for at in ((10 ** 400, 0, 0), (0.0, -10 ** 400, 0.0)):
+            with self.assertRaises(ParamError):
+                lot.copy(lt, 0, at)
+            with self.assertRaises(ParamError):
+                goblin().set_vec("mPosition", at)
+            with self.assertRaises(ParamError):
+                Studio.lot_edit({"text": lot.to_yaml(lt), "op": "copy", "number": 0, "at": list(at)})
+        self.assertEqual(lot.copy(lt, 0, (10 ** 6, 0, 0)).records[-1].vec(), (1e6, 0.0, 0.0))
+
+    def test_text_that_cannot_be_written_is_refused_on_its_line(self):
+        # was: UnicodeEncodeError ('surrogates not allowed'; surrogateescape covers only \udc80-\udcff), which
+        # Studio's validate answered with a 500 and a build with a traceback
+        text = lot.to_yaml(lot.parse(SAMPLE))
+        for field, old in (("mFsmFilePath", '"ai\\\\em0100.fsm"'), ("mName", '"em0100"')):
+            line = next(i for i, x in enumerate(text.splitlines(), 1) if x.strip() == f"{field}: {old}")
+            bad = text.replace(f"{field}: {old}", f'{field}: "a\\ud800b"', 1)
+            with self.assertRaises(ParamError) as e:
+                lot.yaml_to_bytes(bad, "t.yaml")
+            self.assertEqual(e.exception.line, line, field)
+            self.assertIn(field, str(e.exception))
+        kept = text.replace('mName: "em0100"', 'mName: "em\\udc800100"', 1)      # a byte that is not UTF-8
+        self.assertEqual(lot.parse(lot.yaml_to_bytes(kept)).records[0].fields["mName"], b"em\x800100")
+
+    def test_a_copy_keeps_clear_of_its_group(self):
+        """Reserved ids (the group's other layouts, the game's own) are never taken; for an enemy group (below=32,
+        the kill record's bits) an id under 32 comes first when the largest + 1 is not under it."""
+        lt = lot.parse(SAMPLE)
+        top = max(r.id for r in lt.records)
+        self.assertEqual(lot.free_id(lt, reserved={top + 1, top + 2}), top + 3)
+        self.assertEqual(lot.copy(lt, 0, None, {top + 1}).records[-1].id, top + 2)
+        self.assertEqual(lot.free_id(lot.Lot([goblin(3)]), reserved={0, 1, 2, 4}, below=32), 5)   # largest + 1
+        self.assertEqual(lot.free_id(lot.Lot([goblin(31)]), below=32), 0)          # 32 would share 0's bit
+        self.assertEqual(lot.free_id(lot.Lot([goblin(31)]), reserved={0, 1}, below=32), 2)
+        self.assertEqual(lot.free_id(lot.Lot([goblin(i) for i in range(32)]), below=32), 32)   # none under 32
+        self.assertEqual(lot.free_id(lot.Lot([goblin(31)])), 32)                   # other groups: largest + 1
+
     def test_ids_stay_in_the_games_table(self):
         full = lot.Lot([goblin(1023)])
         self.assertEqual(lot.free_id(full), 0)                      # past 1023: the smallest unused id
@@ -125,6 +166,10 @@ class LotTest(unittest.TestCase):
         new = lot.parse(lot.yaml_to_bytes(old))
         self.assertEqual(new.records[0].vec(), (8.0, 2.0, 3.0))
         self.assertEqual(lot.parse(lot.yaml_to_bytes("riftstone: lot/1\nbody: " + body + "\n")).count, 4)
+        # a huge hex offset: the message wrote it in decimal, a ValueError past 4,300 digits
+        with self.assertRaises(ParamError) as e:
+            lot.yaml_to_bytes(old.replace(f"offset: {o - 4}", "offset: 0x" + "f" * 3572), "t.yaml")
+        self.assertLess(len(str(e.exception)), 200)
 
     def test_names(self):
         n = lot.parse_name("scr\\st100\\etc\\st100_43m55n_e67")

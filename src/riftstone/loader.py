@@ -2,9 +2,10 @@
 
 Installing keeps any other dinput8.dll (DDDA Tweak and similar) working: it is
 renamed to dinput8_chain.dll and named in riftstone_loader.ini, and the
-loader passes DirectInput through to it.  Removing puts it back.  Mods move
-between direct and overlay mode with the loader, so the game never ends up
-with both the original-replacement and the overlay copies of an archive.
+loader passes DirectInput through to it.  Removing puts it back.  Dark Arisen
+mods run only through the loader (install.py): removing it takes them out of
+the game and they wait for it (state.json); installing it brings them back,
+and moves mods an older Riftstone installed directly into the overlay.
 
 The loader can also give the game another Direct3D 9 ([d3d9] chain): DXVK's
 32-bit d3d9.dll, kept in <game>\\riftstone\\dxvk, so nothing goes into the game
@@ -24,6 +25,7 @@ from pathlib import Path
 from . import install, pe
 from .errors import FormatError, RiftError
 from .game import Game
+from .runtime import ini_bytes, ini_text
 
 MARKER = "Riftstone loader".encode("utf-16-le")
 CHAIN_NAME = "dinput8_chain.dll"
@@ -180,31 +182,43 @@ def _template_ini() -> str:
     here = Path(__file__).resolve().parents[2]
     templates = [here / "loader" / "riftstone_loader.ini", here / "native" / "loader" / "riftstone_loader.ini"]
     template = next((t for t in templates if t.is_file()), None)
-    return template.read_text(encoding="utf-8") if template else "[loader]\noverlay = 1\n"
+    return ini_text(template.read_bytes()) if template else "[loader]\noverlay = 1\n"
 
 
 def _write_ini(game: Game, chain: str) -> None:
-    """Write riftstone_loader.ini from the template, keeping every value the owner already set."""
+    """Write riftstone_loader.ini from the template, keeping every value the owner already set, in the code
+    page the loader reads it in (runtime.ini_text)."""
     target = game.root / "riftstone_loader.ini"
     try:
-        existing = target.read_text(encoding="utf-8-sig", errors="replace")
+        owners = target.read_bytes()
     except OSError:
-        existing = ""
+        owners = b""
+    existing = ini_text(owners)
     # A chain the owner set by hand (another name than dinput8_chain.dll) stays unless one was just made.
     text = merge_ini(_template_ini(), existing, {"loader": {"chain": chain}} if chain or not existing else None)
     tmp = target.with_name(target.name + ".riftstone-tmp")
-    tmp.write_text(text, encoding="utf-8")
+    tmp.write_bytes(ini_bytes(text, like=owners))               # a UTF-16 file stays UTF-16, as Windows keeps it
     os.replace(tmp, target)
 
 
+WAITING = "waiting_for_loader"     # state.json: the mods that were on when the loader was removed
+
+
 def _switch_mods(game: Game, index, to_mode: str) -> list[str]:
-    """Take mods out in the old mode, then put them back in the new one."""
+    """Take mods out in the old mode, then put them back in the new one (with the mods that waited for the
+    loader since it was removed)."""
     state = install.load_state(game)
     roots = [Path(m["path"]) for m in state.get("mods", [])]
+    roots += [p for p in map(Path, state.get(WAITING, [])) if p not in roots and p.is_dir()]
     if state.get("archives"):
         install.restore_all(game)
     if roots:
         install.apply(game, index, roots, mode=to_mode)
+    if WAITING in install.load_state(game):
+        with install.Lock(game):
+            st = install.load_state(game)
+            st.pop(WAITING, None)
+            install.save_state(game, st)
     return [r.name for r in roots]
 
 
@@ -442,6 +456,9 @@ def remove_loader(game: Game, index) -> dict:
     if chain.is_file():
         os.replace(chain, dll)
         restored_chain = True
-    if roots:
-        install.apply(game, index, roots, mode="direct")
-    return {"restored_other_dinput8": restored_chain, "mods_moved_to_direct": [r.name for r in roots]}
+    if roots:           # Dark Arisen mods run only through the loader: they wait for it to come back
+        with install.Lock(game):
+            st = install.load_state(game)
+            st[WAITING] = [str(r) for r in roots]
+            install.save_state(game, st)
+    return {"restored_other_dinput8": restored_chain, "mods_waiting": [r.name for r in roots]}

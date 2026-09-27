@@ -1,6 +1,7 @@
 #include "clone_sync.hpp"
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <thread>
 #include <limits>
 
@@ -11,9 +12,27 @@ void check(bool value,const char* message) {
     ++checks;
     if (!value) { ++failures; std::printf("FAIL: %s\n",message); }
 }
+// What the factory does inside one call before it builds its actor (clone_host.exe nested <mode>): call
+// the hooked factory again on this thread or on another it waits for, or disable the hook from this thread
+// or from another it waits for.  One level deep: the nested call builds a plain actor.
+enum Nested : int { none, same_thread, other_thread, disable_here, disable_thread };
+static std::atomic<int> g_nested{none};
+static Factory g_factory=nullptr;                  // the export, reached through the hook while it is on
+static std::atomic<int> g_innerSync{-1}, g_disableResult{-1};
+static void Inner(Actor* source) {
+    std::unique_ptr<Actor> inner(g_factory(source,false));
+    g_innerSync=inner?static_cast<int>(inner->last_sync.load()):-2;
+}
 extern "C" const char RsSyntheticCloneAbiV1[]="riftstone.synthetic-clone/1";
 extern "C" __declspec(noinline) Actor* __cdecl RsSyntheticCreateCloneV1(Actor* source,bool incompatible) {
     if (!source) return nullptr;
+    switch (g_nested.exchange(none)) {
+    case same_thread: Inner(source); break;
+    case other_thread: { std::thread t(Inner,source); t.join(); break; }
+    case disable_here: g_disableResult=static_cast<int>(RsClone_Disable()); break;
+    case disable_thread: { std::thread t([] { g_disableResult=static_cast<int>(RsClone_Disable()); }); t.join(); break; }
+    default: break;
+    }
     auto actor=std::make_unique<Actor>();
     { std::lock_guard lock(source->mutex); actor->skeleton=source->skeleton; }
     if (incompatible) actor->skeleton[0].id+=100;
@@ -30,8 +49,37 @@ std::shared_ptr<Appearance> appearance(uint64_t id=42) {
     value->equipment.push_back(std::move(part)); value->morphs={float(id),0.125f};
     return value;
 }
-int main() {
+// clone_host.exe nested <same-thread|other-thread|disable-here|disable-thread>: one factory call through
+// the hook that does that inside itself.  run_tests.py gives each its own process and a time limit, so a
+// deadlock is a failure, not a hang.
+static int NestedMode(const char* mode) {
+    const int want=!std::strcmp(mode,"same-thread")?same_thread:!std::strcmp(mode,"other-thread")?other_thread:
+                   !std::strcmp(mode,"disable-here")?disable_here:!std::strcmp(mode,"disable-thread")?disable_thread:none;
+    if (want==none) { std::printf("NESTED %s unknown\n",mode); return 2; }
+    Actor player; player.appearance=appearance(); player.skeleton=player.appearance->skeleton; player.generation=42;
+    g_factory=reinterpret_cast<Factory>(GetProcAddress(GetModuleHandleW(nullptr),"RsSyntheticCreateCloneV1"));
+    check(g_factory&&RsClone_EnableSyntheticHost(GetModuleHandleW(nullptr))==Status::ok,"factory interception on");
+    if (failures) { std::printf("NESTED %s checks=%d failures=%d\n",mode,checks,failures); return 1; }
+    g_nested=want;
+    std::unique_ptr<Actor> outer(g_factory(&player,false));
+    if (want==same_thread||want==other_thread) {
+        check(g_innerSync==static_cast<int>(Status::ok),"the factory call made inside a factory call is synchronized");
+        check(outer&&outer->last_sync==Status::ok&&outer->appearance&&outer->appearance->equipment[0].mesh->identity==42,
+              "the call around it is synchronized too");
+    } else {
+        check(g_disableResult==static_cast<int>(Status::ok),"RsClone_Disable inside a factory call returns ok");
+        check(outer&&outer->last_sync==Status::unavailable&&!outer->appearance&&!outer->render_ready,
+              "the result that came back after the hook went off is left unsynchronized");
+        std::unique_ptr<Actor> after(g_factory(&player,false));
+        check(after&&!after->appearance&&after->last_sync==Status::unavailable,"later calls reach the factory directly");
+    }
+    std::printf("NESTED %s checks=%d failures=%d\n",mode,checks,failures);
+    return failures?1:0;
+}
+
+int main(int argc,char** argv) {
     SetErrorMode(SEM_NOGPFAULTERRORBOX|SEM_FAILCRITICALERRORS);
+    if (argc>2&&!std::strcmp(argv[1],"nested")) return NestedMode(argv[2]);
     Actor primary,clone;
     primary.appearance=appearance(); primary.skeleton=primary.appearance->skeleton; primary.generation=42;
     clone.skeleton=primary.skeleton; clone.entity_id=100; clone.animation_frame=8;

@@ -802,6 +802,12 @@ def _one(node, what: str, source):
     return node.text.strip()
 
 
+def _num(v: int, text: str) -> str:
+    """A number for a message: in decimal, or its text cut short past 64 bits (int -> str refuses over
+    4,300 digits, and a hex number has no such limit)."""
+    return str(v) if v.bit_length() <= 64 else repr(text.strip()[:16] + "...")
+
+
 def _int_text(t: str) -> int:
     """A whole number: decimal or 0x hex, one optional sign (ValueError otherwise)."""
     t = t.replace("_", "")
@@ -836,7 +842,7 @@ def _from_scalar(t: str, node, what: str, source):
         raise ParamError(f"'{what}' must be a whole number, not {text!r}", *_where(node, source)) from None
     lo, hi = _RANGE[t]
     if not lo <= v <= hi:
-        raise ParamError(f"'{what}': {v} is out of range ({lo}..{hi})", *_where(node, source))
+        raise ParamError(f"'{what}': {_num(v, text)} is out of range ({lo}..{hi})", *_where(node, source))
     return v
 
 

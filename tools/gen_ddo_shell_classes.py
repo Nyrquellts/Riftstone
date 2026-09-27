@@ -1,11 +1,11 @@
 """Generate src/riftstone/data/ddo_shell_classes.json: the classes Dragon's Dogma Online's player shell
 lists use (every obj\\pl\\pl000000\\param\\shellparam\\job*.shl), each with its parent chain, from the
-MtDTI registry map of DDO.exe (C:\\Dev\\DDO\\re\\out\\classes.json, the ddon toolkit's static RE output).
+MtDTI registry map of DDO.exe (<path>, the ddon toolkit's static RE output).
 
 compat_pack re-tags an object of a class Dark Arisen does not have as its nearest ancestor that Dark
 Arisen's XFS schema knows; this table is the only DDO knowledge it needs for that.
 
-    python tools/gen_ddo_shell_classes.py [--classes C:\\Dev\\DDO\\re\\out\\classes.json]
+    python tools/gen_ddo_shell_classes.py [--classes <path>]
 """
 from __future__ import annotations
 

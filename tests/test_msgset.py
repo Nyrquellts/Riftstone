@@ -74,6 +74,16 @@ class MsgSetTest(unittest.TestCase):
         self.assertEqual(msgset.yaml_to_bytes(y), raw)
         self.assertIn("3 group(s), 2 line(s)", msgset.info(m))
 
+    def test_yaml_name_stays_in_its_comment(self):
+        # the resource name went into the header comment as it was: a newline in it began a YAML line
+        # of its own (here a second 'riftstone:' key, which also fooled params' tag detection)
+        from riftstone import params
+        for m in (MsgSet([param(1, [0, 1])]), MsgSerial([7, 8]), ddo_sample()):
+            raw = msgset.build(m)
+            y = msgset.to_yaml(m, "x\nriftstone: xfs/1\r\t\"#")
+            self.assertEqual(msgset.yaml_to_bytes(y), raw)
+            self.assertEqual(params.yaml_to_resource(y), raw)
+
     def test_refusals(self):
         raw = msgset.build(MsgSet([param(1, [0])]))
         for bad in (b"msx\0" + raw[4:], raw[:10], raw[:4] + struct.pack("<I", 0x21) + raw[8:],
@@ -119,6 +129,17 @@ class MsgSetTest(unittest.TestCase):
             self.assertNotEqual(bad, yd)
             with self.assertRaises(ParamError):
                 msgset.from_yaml(bad)
+
+    def test_yaml_long_hex_number(self):
+        # base 16 has no digit limit, but 3,572 hex digits are over 4,300 decimal ones: the range message
+        # printed the number and leaked int -> str's ValueError
+        big = "0x" + "f" * 3572
+        y, yd = msgset.to_yaml(MsgSet([param(1, [0, 1])])), msgset.to_yaml(ddo_sample())
+        for bad in ("riftstone: msl/1\nmpParam: [" + big + "]\n", y.replace("mNpcId: -1", "mNpcId: -" + big),
+                    yd.replace("mVoiceReqNo: 12", "mVoiceReqNo: " + big)):
+            with self.assertRaises(ParamError) as cm:
+                msgset.from_yaml(bad)
+            self.assertLess(len(str(cm.exception)), 200)
 
     def _corpus(self, kind: str, exts: tuple, want: dict):
         from riftstone import corpus, typemap

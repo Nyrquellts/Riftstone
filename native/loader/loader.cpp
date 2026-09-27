@@ -145,6 +145,9 @@ static BOOL ReadOnlyOpen(DWORD access, DWORD disposition) {
     return (access & writes) == 0 && disposition == OPEN_EXISTING;
 }
 
+const wchar_t* NativePrefix() { return g_nativePrefix; }
+const wchar_t* OverlayRootIfOn() { return g_overlay ? g_overlayRoot : NULL; }
+
 // The part of <path> after <root>\nativePC\, normalised into full; NULL when the path is elsewhere.
 static const wchar_t* NativeRelative(const wchar_t* path, wchar_t* full, DWORD cap) {
     if (!path || !*path) return NULL;
@@ -284,7 +287,9 @@ static void** ImportSlot(HMODULE mod, const char* dll, const char* func) {
     return NULL;
 }
 
-struct HookSpec { const char* dll; const char* name; void* hook; void** real; };
+// One import hook: what the slot held when it was hooked (*real) and the export itself, the two values a
+// restored table can hold; and the last other value seen in the slot (another module's hook, logged once).
+struct HookSpec { const char* dll; const char* name; void* hook; void** real; void* exported; void* foreign; };
 #define MAX_HOOKS 32
 static HookSpec g_hooks[MAX_HOOKS];
 static int g_hookCount = 0;
@@ -292,10 +297,9 @@ static CRITICAL_SECTION g_hookLock;
 
 BOOL HookImport(const char* dll, const char* func, void* hook, void** real) {
     HMODULE game = GetModuleHandleW(NULL);
-    if (!*real) {
-        HMODULE lib = GetModuleHandleA(dll);
-        if (lib) *real = (void*)GetProcAddress(lib, func);
-    }
+    HMODULE lib = GetModuleHandleA(dll);
+    void* exported = lib ? (void*)GetProcAddress(lib, func) : NULL;
+    if (!*real) *real = exported;
     void** slot = ImportSlot(game, dll, func);
     BOOL ok = FALSE;
     if (slot) {
@@ -308,31 +312,66 @@ BOOL HookImport(const char* dll, const char* func, void* hook, void** real) {
             FlushInstructionCache(GetCurrentProcess(), NULL, 0);
             ok = TRUE;
         }
-        if (ok && g_hookCount < MAX_HOOKS) g_hooks[g_hookCount++] = HookSpec{dll, func, hook, real};
+        if (ok && g_hookCount < MAX_HOOKS) g_hooks[g_hookCount++] = HookSpec{dll, func, hook, real, exported, NULL};
         LeaveCriticalSection(&g_hookLock);
     }
     LogLine(L"hook     %S!%S %s", dll, func, ok ? L"installed" : L"not imported by the game (left alone)");
     return ok;
 }
 
-// If start-up code (e.g. a DRM wrapper) restored the import table after we patched it,
-// patch again.  Safe to call any time; logs only when it had to act.
+// "name.dll" of the module holding an address, or "?".
+static void ModuleNameAt(const void* addr, wchar_t* out, size_t cap) {
+    HMODULE mod = NULL;
+    wchar_t path[MAX_PATH];
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)addr, &mod) && mod && GetModuleFileNameW(mod, path, MAX_PATH)) {
+        const wchar_t* base = wcsrchr(path, L'\\');
+        wcsncpy_s(out, cap, base ? base + 1 : path, _TRUNCATE);
+    } else {
+        wcsncpy_s(out, cap, L"?", _TRUNCATE);
+    }
+}
+
+// If start-up code (e.g. a DRM wrapper) restored the import table after we patched it, patch again.
+// Only a slot that holds what it held before we hooked it, or the export itself, was restored.  Any other
+// value is another module's hook put over ours (a plugin hooking the game's CreateFileW from its DllMain):
+// it was handed ours as the function to call on, so taking it for the original and putting ours back in
+// front would make the two call each other until the stack runs out.  It is left in place and logged once.
+// Safe to call any time; logs only when it had to act.
 static void EnsureHooks(const wchar_t* when) {
+    struct Seen { const char* name; void* at; };
+    Seen reset[MAX_HOOKS], foreign[MAX_HOOKS];
+    int nReset = 0, nForeign = 0;
     HMODULE game = GetModuleHandleW(NULL);
     EnterCriticalSection(&g_hookLock);
     for (int i = 0; i < g_hookCount; i++) {
-        void** slot = ImportSlot(game, g_hooks[i].dll, g_hooks[i].name);
-        if (!slot || *slot == g_hooks[i].hook) continue;
+        HookSpec& h = g_hooks[i];
+        void** slot = ImportSlot(game, h.dll, h.name);
+        if (!slot || *slot == h.hook) continue;
         void* current = *slot;
+        if (current != *h.real && current != h.exported) {
+            if (h.foreign != current) {
+                h.foreign = current;
+                foreign[nForeign++] = Seen{h.name, current};
+            }
+            continue;
+        }
         DWORD old;
         if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
-            *g_hooks[i].real = current;
-            *slot = g_hooks[i].hook;
+            *h.real = current;
+            *slot = h.hook;
             VirtualProtect(slot, sizeof(void*), old, &old);
-            LogLine(L"hook     %S was reset %s; installed again", g_hooks[i].name, when);
+            reset[nReset++] = Seen{h.name, current};
         }
     }
     LeaveCriticalSection(&g_hookLock);
+    for (int i = 0; i < nReset; i++) LogLine(L"hook     %S was reset %s; installed again", reset[i].name, when);
+    for (int i = 0; i < nForeign; i++) {
+        wchar_t owner[MAX_PATH];
+        ModuleNameAt(foreign[i].at, owner, _countof(owner));
+        LogLine(L"hook     %S goes to another module first now (%s, 0x%p), found %s; left in place: it was handed "
+                L"ours to call on", foreign[i].name, owner, foreign[i].at, when);
+    }
 }
 
 static DWORD WINAPI Watchdog(LPVOID) {
@@ -423,6 +462,13 @@ static void LoadPlugins() {
 // ---------------------------------------------------------------------------
 // start-up
 
+// [loader] test_stack_fill = 1, the harness's way in: the stack the next call from Init will use is filled
+// with old data first (as earlier calls leave it), so a local that call forgets to set shows up.
+static __declspec(noinline) void TestFillStack() {
+    volatile wchar_t junk[8192];
+    for (int i = 0; i < 8192; i++) junk[i] = (i & 63) == 63 ? 0 : L'Z';
+}
+
 static void OpenLog() {
     wchar_t logPath[MAX_PATH], prev[MAX_PATH];
     _snwprintf_s(logPath, _countof(logPath), _TRUNCATE, L"%s\\loader.log", g_logDir);
@@ -484,6 +530,7 @@ static void Init() {
                 L"and runs out much sooner. Steam's DDDA.exe has the flag; 'Riftstone.cmd laa' checks an exe and writes a "
                 L"copy with it set (the game's own file is never changed)", g_exeName, ms.ullTotalVirtual >> 20);
 
+    if (IniInt(L"loader", L"test_stack_fill", 0)) TestFillStack();
     StabilityStart();                          // reads the last session; may start safe mode
     SessionStart();                            // why this one will close
     if (!OverlayAllowed()) g_overlay = FALSE;
@@ -517,32 +564,51 @@ extern "C" __declspec(dllexport) const char* RiftstoneLoaderVersion() {
 
 #ifndef RIFTSTONE_NO_PROXY
 typedef HRESULT(WINAPI* DirectInput8Create_t)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD version, REFIID riid, LPVOID* out, LPUNKNOWN outer);
+
+// The DirectInput8Create a chained dinput8 named in [loader] chain offers, or NULL.  One that is the loader
+// itself (chain = dinput8.dll, the proxy's own name) or leads back to it (an export forwarded to
+// dinput8.DirectInput8Create, which is this module) is refused: DirectInput8Create would call itself for ever.
+static DirectInput8Create_t ChainedDirectInput() {
+    wchar_t chain[MAX_PATH] = L"";
+    IniStr(L"loader", L"chain", L"", chain, MAX_PATH);
+    if (!chain[0]) return NULL;
+    wchar_t full[MAX_PATH];
+    _snwprintf_s(full, _countof(full), _TRUNCATE, L"%s\\%s", g_root, chain);
+    HMODULE lib = LoadLibraryW(full);
+    if (!lib) {
+        LogLine(L"chain    %s could not be loaded; using the system dinput8", full);
+        return NULL;
+    }
+    DirectInput8Create_t found = (DirectInput8Create_t)GetProcAddress(lib, "DirectInput8Create");
+    if (lib == g_self || found == (DirectInput8Create_t)DirectInput8Create) {
+        LogLine(L"chain    %s %s the Riftstone loader itself, so it would call itself; using the system dinput8", full,
+                lib == g_self ? L"is" : L"leads back to");
+        FreeLibrary(lib);                   // the count LoadLibrary added (the loader is pinned either way)
+        return NULL;
+    }
+    LogLine(L"chain    %s %s", full, found ? L"loaded" : L"has no DirectInput8Create; using the system dinput8");
+    return found;
+}
 
 extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD version, REFIID riid, LPVOID* out, LPUNKNOWN outer) {
     static DirectInput8Create_t real = NULL;
     EnsureHooks(L"before input start-up");
     if (!real) {
         // A chained dinput8 (e.g. DDDA Tweak renamed to dinput8_tweak.dll) gets the call first.
-        wchar_t chain[MAX_PATH] = L"";
-        IniStr(L"loader", L"chain", L"", chain, MAX_PATH);
-        HMODULE lib = NULL;
-        if (chain[0]) {
-            wchar_t full[MAX_PATH];
-            _snwprintf_s(full, _countof(full), _TRUNCATE, L"%s\\%s", g_root, chain);
-            lib = LoadLibraryW(full);
-            LogLine(L"chain    %s %s", full, lib ? L"loaded" : L"could not be loaded; using the system dinput8");
-        }
-        if (!lib) {
+        DirectInput8Create_t found = ChainedDirectInput();
+        if (!found) {
             wchar_t sys[MAX_PATH];
             GetSystemDirectoryW(sys, MAX_PATH);
             wcscat_s(sys, L"\\dinput8.dll");
-            lib = LoadLibraryW(sys);
+            HMODULE lib = LoadLibraryW(sys);
+            if (lib) found = (DirectInput8Create_t)GetProcAddress(lib, "DirectInput8Create");
         }
-        if (lib) real = (DirectInput8Create_t)GetProcAddress(lib, "DirectInput8Create");
-        if (!real) {
+        if (!found) {
             LogLine(L"dinput8  no DirectInput8Create found");
             return E_FAIL;
         }
+        real = found;
     }
     return real(inst, version, riid, out, outer);
 }

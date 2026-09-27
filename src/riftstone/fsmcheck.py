@@ -35,7 +35,7 @@ UNKNOWN), what the actions do, and what a variable can hold -- a condition is ta
 hold unless its own comparisons contradict each other.  So "never entered" means "not through the
 machine's own links and entries", and "never left" means "not by the machine itself".
 
-``model`` writes one level as a NYR-Lang formal FSM model (``C:\\Dev\\NyrLang``, ``nyrc formal fsm``),
+``model`` writes one level as a NYR-Lang formal FSM model (``<path>``, ``nyrc formal fsm``),
 so the reachability can be checked by that engine too, or other properties asked of it.
 """
 from __future__ import annotations
@@ -140,40 +140,56 @@ def _not(f):
         return TRUE
     if k == "lit":
         return ("lit", f[1], not f[2])
-    return ("or" if k == "and" else "and", [_not(g) for g in f[1]])
+    return f[1] if k == "not" else ("not", f)       # and/or: negated where the normal form is made
 
 
 def _join(kind, parts):
     stop, skip = (FALSE, TRUE) if kind == "and" else (TRUE, FALSE)
-    out = []
+    out, seen = [], set()
     for f in parts:
         if f == stop:
             return stop
-        if f != skip:
+        if f != skip and id(f) not in seen:            # the same operand in two pairs counts once
+            seen.add(id(f))
             out.append(f)
     return skip if not out else out[0] if len(out) == 1 else (kind, out)
 
 
-def _dnf(f):
-    """Disjunctive normal form as a list of literal sets, or None when it grows past MAX_TERMS."""
+def _dnf(f, neg: bool = False, memo: dict | None = None):
+    """Disjunctive normal form of f (or of not f) as a list of literal sets, or None when it grows past
+    MAX_TERMS.  Formulas share their parts (an operand between two pairs), so each part is done once."""
+    memo = {} if memo is None else memo
+    key = (id(f), neg)
+    if key in memo:
+        return memo[key]
     k = f[0]
-    if k == "true":
-        return [frozenset()]
-    if k == "false":
-        return []
-    if k == "lit":
-        return [frozenset([(f[1], f[2])])]
-    parts = [_dnf(g) for g in f[1]]
-    if any(p is None for p in parts):
-        return None
-    if k == "or":
-        out = [c for p in parts for c in p]
-        return None if len(out) > MAX_TERMS else out
-    out = [frozenset()]
-    for p in parts:
-        out = [a | b for a in out for b in p]
-        if len(out) > MAX_TERMS:
-            return None
+    if k == "not":
+        out = _dnf(f[1], not neg, memo)
+    elif k in ("true", "false"):
+        out = [frozenset()] if (k == "true") != neg else []
+    elif k == "lit":
+        out = [frozenset([(f[1], f[2] != neg)])]
+    else:
+        either = (k == "or") != neg                     # not (a and b) is (not a) or (not b)
+        out = [] if either else [set()]
+        for g in f[1]:
+            p = _dnf(g, neg, memo)
+            if p is None:
+                out = None
+                break
+            if either:
+                out += p
+            elif len(p) == 1:                           # one term: grow ours in place (a copy per operand
+                for a in out:                           # made a wide 'and' quadratic)
+                    a |= p[0]
+            else:
+                out = [a | b for a in out for b in p]
+            if len(out) > MAX_TERMS:
+                out = None
+                break
+        if out is not None and not either:
+            out = [frozenset(a) for a in out]
+    memo[key] = out
     return out
 
 
@@ -227,10 +243,11 @@ def _consistent(conj) -> bool:
 
 def verdict(f) -> str:
     """always / never / may for a condition formula."""
-    d = _dnf(f)
+    memo: dict = {}
+    d = _dnf(f, False, memo)
     if d is not None and not any(_consistent(c) for c in d):
         return "never"
-    d = _dnf(_not(f))
+    d = _dnf(f, True, memo)
     if d is not None and not any(_consistent(c) for c in d):
         return "always"
     return "may"
@@ -251,6 +268,7 @@ class _Logic:
     def __init__(self, view: fsm._View):
         self.v = view
         self.opaque = 0
+        self.read: dict = {}        # id(node) -> its formula: an operand between two pairs is read once
 
     def short(self, n) -> str:
         return self.v.cls(n).rsplit("::", 1)[-1]
@@ -275,6 +293,12 @@ class _Logic:
         return self.atom(f"#{self.opaque}")
 
     def truth(self, n, depth: int):
+        f = self.read.get(id(n))
+        if f is None:
+            f = self.read[id(n)] = self._truth(n, depth)
+        return f
+
+    def _truth(self, n, depth: int):
         k = self.kind(n)
         if k == "op":
             return self.condition(n, depth + 1)
@@ -396,8 +420,24 @@ def read(x: xfs.Xfs) -> Machine:
 @dataclass
 class _Graph:
     start: int | None
-    succ: dict                      # state index -> states that can follow it (in the engine's order)
+    links: dict                     # state index -> states its own links can lead to (in list order)
+    entries: list                   # states entered from any state when their condition can hold (in list order)
+    looks: dict                     # state index -> how many of entries the check looks at from there
     findings: list
+
+    def targets(self, i: int) -> list[int]:
+        """The states that can follow state i, in the engine's order (never itself by an entry)."""
+        return [e for e in self.entries[:self.looks[i]] if e != i] + self.links[i]
+
+    @property
+    def succ(self) -> dict:
+        """state index -> targets(i); as long as states x entries, so for writing a model, not for checks."""
+        return {i: self.targets(i) for i in self.links}
+
+    def leaves(self, i: int) -> bool:
+        """Whether state i can be followed by another state."""
+        n = self.looks[i]                   # entries are distinct states: one of two is another state
+        return n > 1 or (n == 1 and self.entries[0] != i) or any(t != i for t in self.links[i])
 
 
 def _graph(m: Machine, lv: Level) -> _Graph:
@@ -415,24 +455,25 @@ def _graph(m: Machine, lv: Level) -> _Graph:
                 "go to the first")
         else:
             first[s.id] = s.index
-    entries = [s for s in lv.states if s.entry]
-    for e in entries:
+    live = []
+    for e in (s for s in lv.states if s.entry):
         vd = m.verdict(e.entry_cond)
         if vd in ("missing", "never"):
             why = "is not in the file" if vd == "missing" else "can never hold"
             add(DEAD, "entry never used", e.index, None,
                 f"state {e.label} is entered from any state when c{e.entry_cond}, which {why}")
-    succ: dict = {}
+        else:
+            live.append(e)
+    # 0x00E06710: entries first, in list order, the current state excepted; the first that always holds
+    # (and not only once) ends the check.  From any state that is the same entry, but from itself the next.
+    stops = [i for i, e in enumerate(live) if m.verdict(e.entry_cond) == "always" and not e.setting & ONCE][:2]
+    links: dict = {}
+    looks: dict = {}
     for s in lv.states:
+        stop = next((i for i in stops if live[i].index != s.index), None)
+        blocker = None if stop is None else live[stop]
+        looks[s.index] = len(live) if stop is None else stop + 1
         targets: list[int] = []
-        blocker = None
-        for e in entries:                   # 0x00E06710: entries first, the current state excepted
-            if e.index == s.index or m.verdict(e.entry_cond) in ("missing", "never"):
-                continue
-            targets.append(e.index)
-            if m.verdict(e.entry_cond) == "always" and not e.setting & ONCE:
-                blocker = e
-                break
         before = None                       # a link that always holds: the later ones are never reached
         for k in s.links:
             vd = m.verdict(k.cond)
@@ -465,9 +506,9 @@ def _graph(m: Machine, lv: Level) -> _Graph:
                     targets.append(dest)
                 if vd == "always":
                     before = k
-        succ[s.index] = targets
+        links[s.index] = targets
     start = first.get(lv.initial)
-    return _Graph(start, succ, out)
+    return _Graph(start, links, [e.index for e in live], looks, out)
 
 
 def reachable(g: _Graph) -> set[int]:
@@ -476,8 +517,15 @@ def reachable(g: _Graph) -> set[int]:
         return seen
     todo = deque([g.start])
     seen.add(g.start)
+    walked: set[int] = set()                # entry lists already followed: from any state they add the same
     while todo:
-        for t in g.succ.get(todo.popleft(), ()):
+        s = todo.popleft()
+        n = g.looks.get(s, 0)
+        more = g.links.get(s, [])
+        if n not in walked:
+            walked.add(n)
+            more = g.entries[:n] + more
+        for t in more:
             if t not in seen:
                 seen.add(t)
                 todo.append(t)
@@ -520,7 +568,7 @@ def check(m: Machine) -> list[Finding]:
             if s.index not in reach[lv.index]:
                 out.append(Finding(NOTE, "never entered", lv.index, s.index, None,
                                    f"{where}state {s.label} is never entered by this machine's own links"))
-            elif not [t for t in g.succ[s.index] if t != s.index]:
+            elif not g.leaves(s.index):
                 stay = ("the machine stays there" if lv.parent is None
                         else "this sub-machine stays there until its parent state is left")
                 out.append(Finding(NOTE, "never left", lv.index, s.index, None,
@@ -614,7 +662,8 @@ def model(m: Machine, level: int = 0) -> dict:
     if g.start is None:
         raise ValueError(f"level {level} has no start state (no state has id {lv.initial})")
     n = len(lv.states)
-    width = max([len(t) for t in g.succ.values()] + [0])
+    succ = g.succ
+    width = max([len(t) for t in succ.values()] + [0])
 
     def eq(var: str, k: int) -> dict:
         return {"op": "==", "args": [{"var": var}, {"const": k, "type": "bv16"}]}
@@ -622,7 +671,7 @@ def model(m: Machine, level: int = 0) -> dict:
         raise ValueError("too many states or transitions for a 16-bit model")
     transitions = [{"name": "nothing fires", "guard": eq("pick", 0), "updates": {}}]
     for i in range(n):
-        for j, t in enumerate(g.succ[i], 1):
+        for j, t in enumerate(succ[i], 1):
             transitions.append({"name": f"{lv.states[i].label} -> {lv.states[t].label}",
                                 "guard": {"op": "and", "args": [eq("state", i), eq("pick", j)]},
                                 "updates": {"state": {"const": t, "type": "bv16"}}})

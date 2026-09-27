@@ -7,11 +7,14 @@ Dark Arisen: a terrain cell model st100_<m>m<n>n holds X/Z from its cell's corne
 
   1. the static layouts (_s00, world space) stand on their cell's terrain under the rule;
   2. the cell terrain moved by the rule meets the world-space area LOD models (area_index*);
-  3. every vanilla cell model passes terrain.check, a world-space copy of it fails, and localize undoes
-     worldize exactly.
+  3. every vanilla cell model (and 3b. cell collision) passes terrain.check, a world-space copy of it fails,
+     localize brings worldize's copy back to the original within float32 rounding (every moved value within
+     half a float32 step of its moved value plus half a step of the value moved back; the largest change is
+     printed), and moving it into the world a second time gives the same bytes.
 
 Dragon's Dogma Online: stage 0100's layouts stand on its field terrain (rom/scr/fd/sdl) with no transform.
-Reads the games only.  Exit 0 when every measurement comes out as documented (docs/terrain.md).
+Reads the games only, each archive as shipped (Riftstone's backup when an install replaced it).  Exit 0 when
+every measurement comes out as documented (docs/terrain.md).
 """
 from __future__ import annotations
 
@@ -22,13 +25,49 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.append(str(Path(__file__).resolve().parent))                       # check_corpus
 
-from riftstone import arc, lot, lot_ddo, terrain, typemap  # noqa: E402
+from riftstone import arc, lot, lot_ddo, sbc, terrain, typemap  # noqa: E402
 from riftstone.errors import RiftError  # noqa: E402
 from riftstone.game import find_game  # noqa: E402
 
 MOD, LOT = typemap.BY_EXT["mod"], typemap.BY_EXT["lot"]
 BUCKET = 400.0
+
+
+def moved_floats(data: bytes) -> list[tuple[int, int]]:
+    """(offset, axis) of every float terrain.translate moves: a collision's (sbc.moved_floats), or a model's
+    bounds, group spheres, envelope volumes and vertex positions."""
+    if data[:4] == sbc.MAGIC:
+        return sbc.moved_floats(data)
+    p = terrain._parts(data)
+    return [(off + 4 * a, a) for off in p.bounds + p.groups + p.envelopes + p.vertices for a in range(3)]
+
+
+def round_trip(data: bytes, cell: terrain.Cell) -> tuple[bool, bool, float, bool]:
+    """A cell piece moved into the world and back: (localize restored every moved value within float32
+    rounding, a second worldize gives worldize's bytes again, the largest change of a value in cm, localize
+    gave the original back byte for byte)."""
+    from check_corpus import moved_back
+
+    w = terrain.worldize(data, cell)
+    back = terrain.localize(w, cell)
+    worst, _, stray = moved_back(data, w, back, moved_floats(data))
+    return stray is None, terrain.worldize(back, cell) == w, worst, back == data
+
+
+def _moved_and_back(data: bytes, cell: terrain.Cell, counts: collections.Counter) -> float:
+    """round_trip, counted (a key starting in capitals is a failure); the largest change."""
+    restored, stable, worst, exact = round_trip(data, cell)
+    counts["localize restores it within float32 rounding" if restored else "LOCALIZE STRAYS PAST ROUNDING"] += 1
+    counts["localize gives it back byte for byte"] += exact
+    counts["moving twice gives the same bytes" if stable else "MOVING TWICE CHANGES BYTES"] += 1
+    return worst
+
+
+def _read(game, name: str) -> arc.Archive:
+    """An archive as the game shipped it (Riftstone's backup when an install replaced it)."""
+    return arc.Archive.read(game.vanilla_arc(name))
 
 
 class Ground:
@@ -67,7 +106,7 @@ def models_of(game, archives, want=None):
     out = {}
     for a in archives:
         try:
-            ar = arc.Archive.read(game.arc_path(a))
+            ar = _read(game, a)
         except (OSError, RiftError):
             continue
         for e in ar.entries:
@@ -87,7 +126,7 @@ def ddda(game) -> bool:
     for a in stage:
         if "/lot/" not in a.lower() and "/split" not in a.lower():
             continue
-        for e in arc.Archive.read(game.arc_path(a)).entries:
+        for e in _read(game, a).entries:
             if e.type_id != LOT or e.name in seen:
                 continue
             seen.add(e.name)
@@ -106,7 +145,7 @@ def ddda(game) -> bool:
     gaps = {k: [] for k in tests}
     total = 0
     for c in cells:
-        e = arc.Archive.read(game.arc_path(c.archive)).find(c.model.encode(), MOD)
+        e = _read(game, c.archive).find(c.model.encode(), MOD)
         if e is None:
             continue
         ground = Ground(terrain.positions(e.data()))
@@ -130,7 +169,7 @@ def ddda(game) -> bool:
     for i, c in enumerate(terrain.cells()):
         if i % 4:
             continue
-        e = arc.Archive.read(game.arc_path(c.archive)).find(c.model.encode(), MOD) if c.archive in rel else None
+        e = _read(game, c.archive).find(c.model.encode(), MOD) if c.archive in rel else None
         if e is None:
             continue
         dx, _, dz = c.offset
@@ -149,7 +188,7 @@ def ddda(game) -> bool:
     counts = collections.Counter()
     worst = 0.0
     for c in terrain.cells():
-        e = arc.Archive.read(game.arc_path(c.archive)).find(c.model.encode(), MOD) if c.archive in rel else None
+        e = _read(game, c.archive).find(c.model.encode(), MOD) if c.archive in rel else None
         if e is None:
             counts["split archive without its own terrain model"] += 1
             continue
@@ -160,17 +199,13 @@ def ddda(game) -> bool:
         if c.offset[0] or c.offset[2]:
             flagged = any("world coordinates" in x for x in terrain.check(w, c)[0])
             counts["world copy caught" if flagged else "WORLD COPY MISSED"] += 1
-        back = terrain.localize(w, c)
-        counts["localize undoes worldize" if terrain.worldize(back, c) == w else "LOCALIZE NOT EXACT"] += 1
-        for a, b in zip(terrain.positions(d), terrain.positions(back)):
-            worst = max(worst, *(abs(p - q) for p, q in zip(a, b)))
+        worst = max(worst, _moved_and_back(d, c, counts))
     print(" 3. every vanilla cell model")
     for k, v in sorted(counts.items()):
         print(f"  {k:<44} {v}")
-    print(f"  largest move after worldize + localize        {worst:.5f} cm")
+    print(f"  largest change after worldize + localize      {worst:.5f} cm")
     ok &= not any(k.isupper() or k.split()[0].isupper() for k in counts)
 
-    from riftstone import sbc
     SBC = typemap.BY_EXT["sbc"]
     counts = collections.Counter()
     worst = 0.0
@@ -178,7 +213,7 @@ def ddda(game) -> bool:
     for c in terrain.cells():
         if c.archive not in rel:
             continue
-        ar = arc.Archive.read(game.arc_path(c.archive))
+        ar = _read(game, c.archive)
         me = ar.find(c.model.encode(), MOD)
         ground = Ground(terrain.positions(me.data())) if me else None
         for name in c.collisions:
@@ -203,10 +238,7 @@ def ddda(game) -> bool:
                     counts["world copy reported as undecidable"] += 1
                 else:
                     counts["WORLD COPY MISSED"] += 1
-            back = terrain.localize(w, c)
-            counts["localize undoes worldize" if terrain.worldize(back, c) == w else "LOCALIZE NOT EXACT"] += 1
-            for a, b in zip(sbc.positions(d), sbc.positions(back)):
-                worst = max(worst, *(abs(p - q) for p, q in zip(a, b)))
+            worst = max(worst, _moved_and_back(d, c, counts))
             if ground is not None and "\\st100e_" in name:        # walkable collision against the terrain
                 for (x, y, z) in sbc.positions(d)[::5]:
                     if 0 <= x <= terrain.CELL and 0 <= z <= terrain.CELL:
@@ -218,7 +250,7 @@ def ddda(game) -> bool:
     print(" 3b. every vanilla cell collision (.sbc, the cell's h and e meshes)")
     for k, v in sorted(counts.items()):
         print(f"  {k:<44} {v}")
-    print(f"  largest move after worldize + localize        {worst:.5f} cm")
+    print(f"  largest change after worldize + localize      {worst:.5f} cm")
     med = summary("e-mesh vertices on the cell's terrain", gaps, total)
     cmed = summary("control: axes swapped", ctrl, total)
     ok &= not any(k.split()[0].isupper() for k in counts)

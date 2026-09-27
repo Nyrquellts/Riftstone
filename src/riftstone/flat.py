@@ -603,6 +603,12 @@ def _from_value(elem, node, source):
         if elem == "string":
             if "\0" in node.text:
                 raise ParamError("a string cannot contain a NUL", node.line, node.col, source)
+            try:
+                node.text.encode("utf-8", "surrogateescape")     # as _write stores it
+            except UnicodeEncodeError as e:
+                bad = node.text[e.start]
+                raise ParamError(f"{bad!r} (U+{ord(bad):04X}) cannot be stored as UTF-8", node.line, node.col,
+                                 source) from None
             return node.text
         if elem == "f32":
             from .params import f32_bits
@@ -611,16 +617,17 @@ def _from_value(elem, node, source):
             except ValueError:
                 raise ParamError(f"{node.text!r} is not a number that fits a 32-bit float",
                                  node.line, node.col, source) from None
+        from .params import shown
         t = node.text.strip()
         if elem == "f64":
             return _float(t, node, source)
         try:
             v = int(t, 0)
         except ValueError:
-            raise ParamError(f"expected a whole number, not {t!r}", node.line, node.col, source) from None
+            raise ParamError(f"expected a whole number, not {shown(t)!r}", node.line, node.col, source) from None
         lo, hi = _RANGE[elem]
         if not lo <= v <= hi:
-            raise ParamError(f"{v} is out of range for {elem} ({lo}..{hi})", node.line, node.col, source)
+            raise ParamError(f"{shown(t)} is out of range for {elem} ({lo}..{hi})", node.line, node.col, source)
         return v
     if not isinstance(node, Map):
         raise ParamError("expected a block of fields", getattr(node, "line", None), None, source)
@@ -655,6 +662,11 @@ def _from_block(fields, node, source):
                 raise ParamError(f"{name} is a list", v.line, v.col, source)
             if kind == "a" and len(v.items) != f[3]:
                 raise ParamError(f"{name} holds {f[3]} values, not {len(v.items)}", v.line, v.col, source)
+            if kind == "ln":                        # the build writes the list's length into its count field
+                ct = next(x[2] for x in fields if x[1] == f[3])
+                if len(v.items) > _RANGE[ct][1]:
+                    raise ParamError(f"{name} holds {len(v.items)} items; its count {f[3]} ({ct}) holds at most "
+                                     f"{_RANGE[ct][1]}", v.line, v.col, source)
             out[name] = [_from_value(f[2], it, source) for it in v.items]
     return out
 

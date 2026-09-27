@@ -179,7 +179,11 @@ class Archive:
         size = path.stat().st_size
         if size > MAX_ARCHIVE:
             raise FormatError("ARC", f"{path.name} is {size} bytes; refusing archives over {MAX_ARCHIVE}")
-        return cls.parse(path.read_bytes())
+        data = path.read_bytes()
+        if data[:4] == MAGIC_ENC:           # the key is read from the client this archive belongs to
+            from .cipher import note_path
+            note_path(path)
+        return cls.parse(data)
 
     # -- writing ---------------------------------------------------------
     def build(self) -> bytes:

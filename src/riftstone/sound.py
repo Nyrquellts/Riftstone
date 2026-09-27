@@ -921,7 +921,8 @@ def to_yaml(s: Sound, name: str | None = None) -> str:
     from .yamlish import Map, Scalar
     f = FORMATS[s.fmt]
     game = "Dragon's Dogma Online" if f.game == "ddo" else "Dragon's Dogma: Dark Arisen"
-    head = [f"Riftstone {f.cls} (.{f.ext}, {game})" + (f" -- {name}" if name else ""),
+    shown = " -- " + "".join(c if c.isprintable() else " " for c in name) if name else ""   # stays in its comment
+    head = [f"Riftstone {f.cls} (.{f.ext}, {game})" + shown,
             *_HEADS[s.fmt], "Rebuilds byte-for-byte when untouched."]
     items = [(Scalar("riftstone"), Scalar(f"{s.fmt}/1"))]
     if name:
@@ -931,19 +932,28 @@ def to_yaml(s: Sound, name: str | None = None) -> str:
     if f.ext in ("srq", "stq"):             # name each cue's package / bank / source next to its index
         names = s.data["sources"] if f.ext == "stq" else s.data["banks" if s.fmt == "srq-ddo" else "packages"]
         names = [x["path"] if isinstance(x, dict) else x for x in names]
-        shown = [_shown(p) for p in names]
+        notes = [t if len(t) <= _NOTE else t[:_NOTE - 3] + "..." for t in map(_shown, names)]
         for el in next(v for k, v in items if k.text == "elements").items:
             for k, v in el.items:
-                if k.text in _INDEX_FIELDS and 0 <= int(v.text) < len(names) and shown[int(v.text)].isprintable():
-                    v.comment = shown[int(v.text)]
+                if k.text in _INDEX_FIELDS and 0 <= int(v.text) < len(names) and notes[int(v.text)].isprintable():
+                    v.comment = notes[int(v.text)]
     return yamlish.emit(Map(items), head)
 
 
 _INDEX_FIELDS = ("mPacFileNameTableIndex", "mBankIndex", "mSrcFileNameTableIndex")
+# every cue repeats its package's path as a comment: the game's paths are at most 60 characters, a longer one
+# is cut there (a 100 KB path named by 1,000 cues made 100 MB of YAML)
+_NOTE = 96
 
 
 def _where(n, source):
     return (getattr(n, "line", None), getattr(n, "col", None), source)
+
+
+def _num(v: int, text: str) -> str:
+    """A number for a message: in decimal, or its text cut short past 64 bits (int -> str refuses over
+    4,300 digits, and a hex number has no such limit)."""
+    return str(v) if v.bit_length() <= 64 else repr(text.strip()[:16] + "...")
 
 
 def _from_node(node, n, what: str, source):
@@ -965,7 +975,7 @@ def _from_node(node, n, what: str, source):
             raise ParamError(f"{what}: expected a whole number, not {t!r}", *_where(n, source)) from None
         lo, hi = _RANGE[node]
         if not lo <= v <= hi:
-            raise ParamError(f"{what}: {v} is out of range for {node} ({lo}..{hi})", *_where(n, source))
+            raise ParamError(f"{what}: {_num(v, t)} is out of range for {node} ({lo}..{hi})", *_where(n, source))
         return v
     if _is_struct(node):
         if not isinstance(n, Map):

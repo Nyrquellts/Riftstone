@@ -14,7 +14,7 @@ HERE = Path(__file__).resolve().parent
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arch', choices=('x86', 'x64', 'both'), default='both')
-    parser.add_argument('--vs', type=Path, default=Path('C:/Dev/NyrSkyrimse/tools/VisualStudio2022'))
+    parser.add_argument('--vs', type=Path, default=Path('<path>'))
     args = parser.parse_args()
     vcvars = args.vs / 'VC/Auxiliary/Build/vcvarsall.bat'
     if not vcvars.is_file():

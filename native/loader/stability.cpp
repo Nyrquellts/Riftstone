@@ -38,7 +38,14 @@ typedef int(WINAPI* MessageBoxA_t)(HWND, LPCSTR, LPCSTR, UINT);
 static SetUEF_t Real_SetUnhandledExceptionFilter;
 static MessageBoxA_t Real_MessageBoxA;
 static LPTOP_LEVEL_EXCEPTION_FILTER g_gameFilter;    // what the game asked for through its import
-static LPTOP_LEVEL_EXCEPTION_FILTER g_otherFilter;   // what someone else installed before ours
+// Filters other modules set themselves (not through the game's import table), newest first: one set before
+// ours, and any set over ours later, which ours takes the front back from.  Each is called after the report.
+#define OTHER_FILTERS 4
+static LPTOP_LEVEL_EXCEPTION_FILTER g_otherFilters[OTHER_FILTERS];
+static volatile LONG g_otherCount = 0;
+static DWORD g_inFilter = TLS_OUT_OF_INDEXES;        // this thread is inside CrashFilter (re-entry guard)
+typedef VOID(WINAPI* StackLimits_t)(PULONG_PTR, PULONG_PTR);
+static StackLimits_t g_stackLimits;                  // GetCurrentThreadStackLimits (Windows 8 and later)
 
 static wchar_t g_stateIni[MAX_PATH];                 // riftstone\runtime-state.ini
 static wchar_t g_marker[MAX_PATH];                   // riftstone\logs\last-crash.txt (crash handler)
@@ -148,6 +155,12 @@ static void Header(HANDLE f, const wchar_t* title) {
     GetModuleFileNameW(NULL, exe, MAX_PATH);
     ULONGLONG up = UptimeMs();
     Out(f, L"%s (Riftstone loader %s)\r\n", title, RIFTSTONE_LOADER_VERSION);
+    // Who to send it to: the game ran modded, which Capcom's support does not cover (and this report
+    // cannot tell by itself whether a mod or the game is at fault).
+    Out(f, L"support     the game ran with mods and plugins through the Riftstone loader (listed below).\r\n"
+           L"            Send this report to the mods' authors or to Riftstone, not to Capcom's support:\r\n"
+           L"            Capcom does not support modded games. Safe mode, or the game without mods, shows\r\n"
+           L"            whether a mod is involved.\r\n");
     Out(f, L"time        %04u-%02u-%02u %02u:%02u:%02u\r\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
     Out(f, L"program     %s\r\n", exe);
     Out(f, L"game        %s, PE timestamp 0x%08lx%s\r\n", GameName(), g_exeTimestamp,
@@ -276,7 +289,8 @@ typedef BOOL(WINAPI* StackWalk64_t)(DWORD, HANDLE, HANDLE, LPSTACKFRAME64, PVOID
                                     PFUNCTION_TABLE_ACCESS_ROUTINE64, PGET_MODULE_BASE_ROUTINE64, PTRANSLATE_ADDRESS_ROUTINE64);
 typedef BOOL(WINAPI* SymInitialize_t)(HANDLE, PCSTR, BOOL);
 
-static void WriteCrashReport(EXCEPTION_POINTERS* ep) {
+// The report of the exception `ep`, raised on thread `thread` (this one, or one that waits for this).
+static void WriteCrashReport(EXCEPTION_POINTERS* ep, DWORD thread) {
     wchar_t stamp[32], path[MAX_PATH], where[MAX_PATH], faultModule[MAX_PATH];
     Stamp(stamp, _countof(stamp));
     HANDLE f = OpenReport(L"crash", stamp, L"txt", path);
@@ -324,13 +338,16 @@ static void WriteCrashReport(EXCEPTION_POINTERS* ep) {
     StackWalk64_t walk = dbg ? (StackWalk64_t)GetProcAddress(dbg, "StackWalk64") : NULL;
     SymInitialize_t symInit = dbg ? (SymInitialize_t)GetProcAddress(dbg, "SymInitialize") : NULL;
     Out(f, L"\r\nstack\r\n");
+    BOOL own = thread == GetCurrentThreadId();
+    HANDLE faulting = own ? GetCurrentThread() : OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, thread);
     if (walk && symInit) {
         symInit(GetCurrentProcess(), NULL, TRUE);
         CONTEXT copy = *c;
         auto access = (PFUNCTION_TABLE_ACCESS_ROUTINE64)GetProcAddress(dbg, "SymFunctionTableAccess64");
         auto base = (PGET_MODULE_BASE_ROUTINE64)GetProcAddress(dbg, "SymGetModuleBase64");
         for (int i = 0; i < 48; i++) {
-            if (!walk(machine, GetCurrentProcess(), GetCurrentThread(), &sf, &copy, NULL, access, base, NULL)) break;
+            if (!walk(machine, GetCurrentProcess(), faulting ? faulting : GetCurrentThread(), &sf, &copy, NULL, access,
+                      base, NULL)) break;
             if (!sf.AddrPC.Offset) break;
             Where((DWORD_PTR)sf.AddrPC.Offset, where, _countof(where));
             int p = PluginAt((DWORD_PTR)sf.AddrPC.Offset);
@@ -338,6 +355,7 @@ static void WriteCrashReport(EXCEPTION_POINTERS* ep) {
                 p >= 0 ? g_pluginInfo[p].name : L"");
         }
     }
+    if (faulting && !own) CloseHandle(faulting);
     Out(f, L"\r\nstack words that point into modules or at engine objects (from ESP)\r\n");
     StackWords(f, sp, 160, TRUE);
     MemorySection(f);
@@ -352,7 +370,7 @@ static void WriteCrashReport(EXCEPTION_POINTERS* ep) {
         wcscpy_s(report, MAX_PATH, path);
         HANDLE d = OpenDump(report, path);
         if (dump && d != INVALID_HANDLE_VALUE) {
-            MINIDUMP_EXCEPTION_INFORMATION mei = {GetCurrentThreadId(), ep, FALSE};
+            MINIDUMP_EXCEPTION_INFORMATION mei = {thread, ep, FALSE};
             dump(GetCurrentProcess(), GetCurrentProcessId(), d,
                  (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory | MiniDumpWithThreadInfo),
                  &mei, NULL, NULL);
@@ -379,21 +397,124 @@ static BOOL NotACrash(const EXCEPTION_RECORD* er) {
     }
 }
 
+// ---- a crash that left little stack -------------------------------------------------------------------
+//
+// The report needs tens of KB of stack (Out alone 5 KB; the stack walk and the minidump more).  After a
+// stack overflow the crashing thread has a few KB left, and writing the report there faults again and ends
+// the process with nothing written.  So when that thread is short of stack, the note for the next start is
+// written first with static buffers, and the report on a helper thread with a whole stack of its own while
+// the crashing thread waits.
+
+#define LOW_STACK (64 * 1024)                        // less than this left: the report goes to a helper thread
+#define HELPER_WAIT_MS 30000                         // the longest the crashing thread waits for it
+
+static SIZE_T StackLeft() {
+    ULONG_PTR low = 0, high = 0;
+    if (!g_stackLimits) return (SIZE_T)-1;           // Windows 7: only a stack overflow counts as low
+    g_stackLimits(&low, &high);
+    ULONG_PTR here = (ULONG_PTR)&low;
+    return here > low ? (SIZE_T)(here - low) : 0;
+}
+
+// The crashing thread holds the loader lock (a crash inside a DllMain, e.g. a plugin's while the loader loads
+// it): a new thread cannot start until that lock is free, so no helper can write the report.
+static BOOL HoldsLoaderLock() {
+#ifdef _M_IX86
+    BYTE* peb = (BYTE*)__readfsdword(0x30);
+    RTL_CRITICAL_SECTION* lock = *(RTL_CRITICAL_SECTION**)(peb + 0xA0);          // PEB.LoaderLock
+#else
+    BYTE* peb = (BYTE*)__readgsqword(0x60);
+    RTL_CRITICAL_SECTION* lock = *(RTL_CRITICAL_SECTION**)(peb + 0x110);
+#endif
+    return lock && (DWORD)(DWORD_PTR)lock->OwningThread == GetCurrentThreadId();
+}
+
+// The crash note with a few hundred bytes of stack: static buffers, the number formatted by hand.  The report
+// (when a helper writes it) replaces it with the full note.
+static volatile LONG g_liteBusy = 0;
+static wchar_t g_liteModule[MAX_PATH];
+static char g_liteNote[128 + 3 * MAX_PATH];
+
+static void WriteMarkerLite(const void* faultAddress) {
+    if (InterlockedExchange(&g_liteBusy, 1)) return;             // another thread is writing one right now
+    HMODULE mod = NULL;
+    g_liteModule[0] = 0;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)faultAddress, &mod) && mod)
+        if (!GetModuleFileNameW(mod, g_liteModule, MAX_PATH)) g_liteModule[0] = 0;
+    char* p = g_liteNote;
+    const char* part = "kind=crash\r\nuptime_ms=";
+    while (*part) *p++ = *part++;
+    ULONGLONG up = UptimeMs();
+    char digits[24];
+    int nd = 0;
+    do { digits[nd++] = (char)('0' + up % 10); up /= 10; } while (up && nd < 24);
+    while (nd) *p++ = digits[--nd];
+    part = "\r\nmodule=";
+    while (*part) *p++ = *part++;
+    int room = (int)(g_liteNote + sizeof g_liteNote - p) - 16;
+    int bytes = g_liteModule[0] ? WideCharToMultiByte(CP_UTF8, 0, g_liteModule, -1, p, room, NULL, NULL) : 0;
+    p += bytes > 0 ? bytes - 1 : 0;                              // without its terminating zero
+    part = "\r\nreport=\r\n";
+    while (*part) *p++ = *part++;
+    InterlockedExchange(&g_markerFatal, 0);
+    HANDLE m = Real_CreateFileW(g_marker, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (m != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(m, g_liteNote, (DWORD)(p - g_liteNote), &w, NULL);
+        CloseHandle(m);
+    }
+    InterlockedExchange(&g_liteBusy, 0);
+}
+
+struct CrashJob {
+    EXCEPTION_POINTERS* ep;
+    DWORD thread;
+};
+
+static DWORD WINAPI CrashReportThread(LPVOID arg) {
+    CrashJob* job = (CrashJob*)arg;
+    WriteCrashReport(job->ep, job->thread);
+    return 0;
+}
+
+// Kept out of CrashFilter so that the filter itself needs next to no stack.
+static __declspec(noinline) void ReportCrash(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_STACK_OVERFLOW && StackLeft() >= LOW_STACK) {
+        WriteCrashReport(ep, GetCurrentThreadId());
+        return;
+    }
+    WriteMarkerLite(ep->ExceptionRecord->ExceptionAddress);      // safe mode and quarantine need this much
+    if (HoldsLoaderLock()) return;
+    CrashJob job = {ep, GetCurrentThreadId()};
+    HANDLE t = CreateThread(NULL, 1024 * 1024, CrashReportThread, &job, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!t) return;
+    WaitForSingleObject(t, HELPER_WAIT_MS);
+    CloseHandle(t);
+}
+
 LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    // Re-entered on this thread: a filter this one called passed the crash back (it had ours as the filter
+    // before it), or writing the report faulted.  Let the caller go on; one crash is one report.
+    BOOL guard = g_inFilter != TLS_OUT_OF_INDEXES;
+    if (guard && TlsGetValue(g_inFilter)) return EXCEPTION_CONTINUE_SEARCH;
+    if (guard) TlsSetValue(g_inFilter, (LPVOID)1);
     // Up to three reports a session: a filter further down may recover (continue execution), and a
     // report must not use up the one a real crash later needs.
     static volatile LONG reports = 0;
-    if (g_crash && !NotACrash(ep->ExceptionRecord) && InterlockedIncrement(&reports) <= 3) WriteCrashReport(ep);
-    if (g_gameFilter && g_gameFilter != CrashFilter) {
-        LONG r = g_gameFilter(ep);
-        if (r != EXCEPTION_CONTINUE_SEARCH || !g_otherFilter) return r;
-    }
-    if (g_otherFilter && g_otherFilter != CrashFilter) return g_otherFilter(ep);
-    return EXCEPTION_CONTINUE_SEARCH;
+    if (g_crash && !NotACrash(ep->ExceptionRecord) && InterlockedIncrement(&reports) <= 3) ReportCrash(ep);
+    LONG r = EXCEPTION_CONTINUE_SEARCH;
+    if (g_gameFilter && g_gameFilter != CrashFilter) r = g_gameFilter(ep);
+    for (LONG i = g_otherCount - 1; r == EXCEPTION_CONTINUE_SEARCH && i >= 0; i--)    // newest first
+        if (i < OTHER_FILTERS && g_otherFilters[i] && g_otherFilters[i] != CrashFilter) r = g_otherFilters[i](ep);
+    if (guard) TlsSetValue(g_inFilter, NULL);
+    return r;
 }
 
-// The game installs its own filter; keep ours first and call the game's after reporting.
+// The game installs its own filter; keep ours first and call the game's after reporting.  With crash reports
+// off ([loader] crash_reports = 0) the hook is not installed; this passes the call on, should it be reached.
 static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI Hook_SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER next) {
+    if (!g_crash) return Real_SetUnhandledExceptionFilter ? Real_SetUnhandledExceptionFilter(next) : NULL;
     LPTOP_LEVEL_EXCEPTION_FILTER prev = g_gameFilter;
     g_gameFilter = next;
     return prev;
@@ -401,14 +522,24 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI Hook_SetUnhandledExceptionFilter(LPTO
 
 // Ours first.  Called at start-up and every few seconds by the live thread: a module that sets its
 // own filter without going through the game's import table (an overlay, a DRM stub) is kept and
-// called after the report.
+// called after the report.  One that sets it over ours got ours as the filter before it and may call
+// it in turn; the re-entry guard in CrashFilter answers that call at once, so the two do not call each
+// other until the stack runs out.
 void CrashFilterInstall() {
     if (!g_crash || !Real_SetUnhandledExceptionFilter) return;
+    static volatile LONG installs = 0;
+    BOOL first = InterlockedIncrement(&installs) == 1;           // at start-up; later, the live thread's rounds
     LPTOP_LEVEL_EXCEPTION_FILTER prev = Real_SetUnhandledExceptionFilter(CrashFilter);
-    if (prev && prev != CrashFilter && prev != g_gameFilter && prev != g_otherFilter) {
-        g_otherFilter = prev;
-        LogLine(L"crash    another module had set a crash filter (0x%p); ours reports first, then calls it", prev);
-    }
+    if (!prev || prev == CrashFilter || prev == g_gameFilter) return;
+    LONG n = g_otherCount;
+    for (LONG i = 0; i < n && i < OTHER_FILTERS; i++)
+        if (g_otherFilters[i] == prev) return;
+    if (n >= OTHER_FILTERS) return;
+    g_otherFilters[n] = prev;                                    // written before it is counted
+    InterlockedExchange(&g_otherCount, n + 1);
+    if (first) LogLine(L"crash    another module had set a crash filter (0x%p); ours reports first, then calls it", prev);
+    else LogLine(L"crash    another module set a crash filter over ours (0x%p); ours is first again, reports, then "
+                 L"calls it (and answers at once when it passes the crash back)", prev);
 }
 
 // ---------------------------------------------------------------------------
@@ -484,8 +615,9 @@ static int WINAPI Hook_MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT
     if (!path[0] || !IniInt(L"loader", L"fatal_hint", 1)) return Real_MessageBoxA(owner, text, caption, type);
     const wchar_t* name = wcsrchr(path, L'\\');
     char buf[3072];
-    _snprintf_s(buf, sizeof buf, _TRUNCATE, "%s\n\n[Riftstone] What happened and which files were missing: riftstone\\logs\\%S",
-                text ? text : "", name ? name + 1 : path);
+    _snprintf_s(buf, sizeof buf, _TRUNCATE, "%s\n\n[Riftstone] What happened and which files were missing: riftstone\\logs\\%S"
+                "\n[Riftstone] The game runs with mods: send that report to the mods' authors or Riftstone, not to "
+                "Capcom's support.", text ? text : "", name ? name + 1 : path);
     return Real_MessageBoxA(owner, buf, caption, type);
 }
 
@@ -668,6 +800,65 @@ static int StateInt(const wchar_t* section, const wchar_t* key, int def) {
     return (int)GetPrivateProfileIntW(section, key, def, g_stateIni);
 }
 
+// A plugin's key in runtime-state.ini ([strikes], [strikes_file], [quarantine]).  A file name that is a
+// plain ini key stays as it is (what Riftstone.cmd and Studio read).  Any other is "~" and the hex of its
+// lower-case UTF-8: a name with '=' would be split there by the ini reader (its strikes never added up and
+// each run appended another line), one starting with ';' '#' '[' or '~' or with spaces at either end would
+// be read as something else, and one outside printable ASCII would turn into '?' in the ANSI file.
+#define PLUGIN_KEY_CAP (2 + 6 * MAX_PATH)
+static void PluginKey(const wchar_t* name, wchar_t* out, size_t cap) {
+    size_t n = wcslen(name);
+    BOOL plain = n > 0 && !wcschr(L";#[~ \t", name[0]) && name[n - 1] != L' ' && name[n - 1] != L'\t';
+    for (size_t i = 0; plain && i < n; i++) plain = name[i] >= 0x20 && name[i] < 0x7F && name[i] != L'=';
+    if (plain) {
+        wcsncpy_s(out, cap, name, _TRUNCATE);
+        return;
+    }
+    wchar_t lower[MAX_PATH];
+    wcsncpy_s(lower, _countof(lower), name, _TRUNCATE);
+    CharLowerBuffW(lower, (DWORD)wcslen(lower));
+    char utf8[3 * MAX_PATH];
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, lower, -1, utf8, sizeof utf8, NULL, NULL);
+    size_t k = 0;
+    out[k++] = L'~';
+    for (int i = 0; i + 1 < bytes && k + 3 <= cap; i++) {
+        static const wchar_t hex[] = L"0123456789abcdef";
+        out[k++] = hex[(BYTE)utf8[i] >> 4];
+        out[k++] = hex[(BYTE)utf8[i] & 15];
+    }
+    out[k] = 0;
+}
+
+// A plugin's value in one section under its key.  An older loader wrote it under the bare file name: that
+// entry, when the ini reader can find it (no '=' in the name), is read and moved to the key.
+static void StatePluginGet(const wchar_t* section, const wchar_t* name, const wchar_t* key, wchar_t* out, DWORD cap) {
+    GetPrivateProfileStringW(section, key, L"", out, cap, g_stateIni);
+    if (out[0] || wcscmp(key, name) == 0 || wcschr(name, L'=')) return;
+    GetPrivateProfileStringW(section, name, L"", out, cap, g_stateIni);
+    if (!out[0]) return;
+    StateWrite(section, key, out);
+    StateWrite(section, name, NULL);
+}
+
+// Older loaders put a name with '=' in as its own key, and the ini reader splits the line at the first '=':
+// "crash=plugin.asi=1" reads as the key "crash".  Those lines were never read back (another was added each
+// run); remove them.
+static void DropSplitLines(const wchar_t* name) {
+    const wchar_t* eq = wcschr(name, L'=');
+    wchar_t head[MAX_PATH], tail[MAX_PATH + 1], value[2 * MAX_PATH];
+    if (!eq || eq == name || (size_t)(eq - name) >= _countof(head)) return;
+    wcsncpy_s(head, _countof(head), name, (size_t)(eq - name));
+    _snwprintf_s(tail, _countof(tail), _TRUNCATE, L"%s=", eq + 1);
+    const wchar_t* sections[] = {L"strikes", L"strikes_file", L"quarantine"};
+    for (const wchar_t* section : sections) {
+        for (int i = 0; i < 256; i++) {
+            GetPrivateProfileStringW(section, head, L"", value, _countof(value), g_stateIni);
+            if (_wcsnicmp(value, tail, wcslen(tail)) != 0) break;
+            StateWrite(section, head, NULL);
+        }
+    }
+}
+
 static DWORD WINAPI SafeModeNotice(LPVOID) {
     MessageBoxW(NULL,
                 L"Dragon's Dogma crashed twice in a row while starting, with your mods and plugins in place.\n\n"
@@ -678,8 +869,10 @@ static DWORD WINAPI SafeModeNotice(LPVOID) {
     return 0;
 }
 
-// Read last-crash.txt (if the last session crashed) into its parts.
+// Read last-crash.txt (if the last session crashed) into its parts; every part is set either way.
 static BOOL ReadMarker(ULONGLONG* uptime, wchar_t* module, wchar_t* kind, wchar_t* report) {
+    *uptime = ~0ULL;
+    module[0] = kind[0] = report[0] = 0;
     HANDLE h = Real_CreateFileW(g_marker, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return FALSE;
     char buf[4096];
@@ -687,8 +880,6 @@ static BOOL ReadMarker(ULONGLONG* uptime, wchar_t* module, wchar_t* kind, wchar_
     ReadFile(h, buf, sizeof buf - 1, &got, NULL);
     CloseHandle(h);
     buf[got] = 0;
-    *uptime = ~0ULL;
-    module[0] = kind[0] = report[0] = 0;
     char* ctx = NULL;
     for (char* line = strtok_s(buf, "\r\n", &ctx); line; line = strtok_s(NULL, "\r\n", &ctx)) {
         if (strncmp(line, "uptime_ms=", 10) == 0) *uptime = _strtoui64(line + 10, NULL, 10);
@@ -753,6 +944,8 @@ void StabilityStart() {
     if (g_keepReports < 1) g_keepReports = 1;
     _snwprintf_s(g_stateIni, _countof(g_stateIni), _TRUNCATE, L"%s\\runtime-state.ini", g_stateDir);
     _snwprintf_s(g_marker, _countof(g_marker), _TRUNCATE, L"%s\\last-crash.txt", g_logDir);
+    if (g_inFilter == TLS_OUT_OF_INDEXES) g_inFilter = TlsAlloc();
+    g_stackLimits = (StackLimits_t)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetCurrentThreadStackLimits");
     Rotate(L"crash");
     Rotate(L"fatal");
     Rotate(L"hang");
@@ -761,8 +954,8 @@ void StabilityStart() {
     int early = StateInt(L"session", L"early_crashes", 0);
     int wasClean = StateInt(L"session", L"clean", 1);
     int alive = StateInt(L"session", L"alive_ms", 0);
-    ULONGLONG up;
-    wchar_t module[MAX_PATH], kind[16], report[MAX_PATH];
+    ULONGLONG up = ~0ULL;
+    wchar_t module[MAX_PATH] = L"", kind[16] = L"", report[MAX_PATH] = L"";
     BOOL crashed = ReadMarker(&up, module, kind, report);
     if (crashed) {
         DeleteFileW(g_marker);
@@ -775,18 +968,20 @@ void StabilityStart() {
         BOOL byPlugin = module[0] && _wcsnicmp(module, pluginsDir, wcslen(pluginsDir)) == 0 && base;
         if (startUp && byPlugin) {
             const wchar_t* name = base + 1;
-            wchar_t id[64], prevId[64], key[MAX_PATH];
+            wchar_t id[64] = L"", prevId[64], count[32], key[PLUGIN_KEY_CAP];
             FileIdentity(module, id, _countof(id));
-            _snwprintf_s(key, _countof(key), _TRUNCATE, L"%s", name);
-            GetPrivateProfileStringW(L"strikes_file", key, L"", prevId, _countof(prevId), g_stateIni);
-            int strikes = wcscmp(prevId, id) == 0 ? StateInt(L"strikes", key, 0) + 1 : 1;
+            PluginKey(name, key, _countof(key));
+            DropSplitLines(name);
+            StatePluginGet(L"strikes_file", name, key, prevId, _countof(prevId));
+            StatePluginGet(L"strikes", name, key, count, _countof(count));
+            int strikes = wcscmp(prevId, id) == 0 ? _wtoi(count) + 1 : 1;
             StateWriteInt(L"strikes", key, strikes);
             StateWrite(L"strikes_file", key, id);
             LogLine(L"plugin   %s was at fault in a start-up crash (%d in a row)", name, strikes);
             if (strikes >= 2) {
                 StateWrite(L"quarantine", key, id);
                 LogLine(L"plugin   %s QUARANTINED: it is skipped until its file changes "
-                        L"(or Riftstone.cmd loader plugin release %s)", name, name);
+                        L"(or Riftstone.cmd loader plugin release %s)", name, key);
             }
             early = 0;
         } else if (startUp) {
@@ -850,15 +1045,16 @@ BOOL PluginAllowed(const wchar_t* name, const wchar_t* fullPath) {
         LogLine(L"plugin   %s skipped (safe mode)", name);
         return FALSE;
     }
-    wchar_t q[64], id[64];
-    GetPrivateProfileStringW(L"quarantine", name, L"", q, _countof(q), g_stateIni);
+    wchar_t q[64], id[64], key[PLUGIN_KEY_CAP];
+    PluginKey(name, key, _countof(key));
+    StatePluginGet(L"quarantine", name, key, q, _countof(q));
     if (!q[0]) return TRUE;
     if (FileIdentity(fullPath, id, _countof(id)) && wcscmp(q, id) == 0) {
         LogLine(L"plugin   %s skipped: quarantined after two start-up crashes (a new version of the file is loaded again)", name);
         return FALSE;
     }
-    StateWrite(L"quarantine", name, NULL);
-    StateWrite(L"strikes", name, NULL);
+    StateWrite(L"quarantine", key, NULL);
+    StateWrite(L"strikes", key, NULL);
     LogLine(L"plugin   %s changed since its quarantine; loading it again", name);
     return TRUE;
 }
@@ -881,8 +1077,13 @@ void StabilityCleanExit() {
 }
 
 void StabilityInstallHooks() {
-    HookImport("KERNEL32.dll", "SetUnhandledExceptionFilter", (void*)Hook_SetUnhandledExceptionFilter,
-               (void**)&Real_SetUnhandledExceptionFilter);
+    // Crash reports off: the game's own filter goes straight to Windows (the hook would only keep it for
+    // CrashFilter, which is not installed then).
+    if (g_crash)
+        HookImport("KERNEL32.dll", "SetUnhandledExceptionFilter", (void*)Hook_SetUnhandledExceptionFilter,
+                   (void**)&Real_SetUnhandledExceptionFilter);
+    else
+        LogLine(L"crash    reports off ([loader] crash_reports = 0): the game's own crash filter is left to Windows");
     if (!Real_SetUnhandledExceptionFilter)
         Real_SetUnhandledExceptionFilter = (SetUEF_t)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetUnhandledExceptionFilter");
     HookImport("USER32.dll", "MessageBoxA", (void*)Hook_MessageBoxA, (void**)&Real_MessageBoxA);

@@ -1,4 +1,5 @@
 import struct
+import time
 import unittest
 
 import helpers  # noqa: F401 (sys.path)
@@ -50,6 +51,31 @@ class MrlTest(unittest.TestCase):
         m = mrl.parse(raw)
         with self.assertRaises(FormatError):
             m.textures[0].set_name("x" * 64)
+
+    def test_a_name_the_field_cannot_hold_is_refused(self):
+        # set_name encoded as Latin-1 unchecked: "tex\wp\€" raised UnicodeEncodeError (riftstone mrl retex),
+        # and "a\0b" was stored, then read back as "a"
+        m = mrl.parse(mrl.build(make([(1, 2)], ["a"])))
+        for bad in ("tex\\wp\\€", "a\0b", "テスト"):
+            with self.subTest(name=bad), self.assertRaises(FormatError):
+                m.textures[0].set_name(bad)
+        self.assertEqual(m.textures[0].name, "a")
+        m.textures[0].set_name("tex\\wp\\é")               # names are read as Latin-1
+        self.assertEqual(mrl.parse(mrl.build(m)).textures[0].name, "tex\\wp\\é")
+
+    def test_many_blocks_split_quickly(self):
+        # each block's end was found by scanning every block start: quadratic in materials (20,000 took seconds)
+        n = 20000
+        table_end = mrl._HDR.size + n * mrl.MAT_ENTRY
+        base = table_end + -table_end % 16                  # the games' layout: blocks from the next 16 bytes
+        mats = [mrl.Material(1, i, [0] * 11 + [base + 16 * i, 0]) for i in range(n)]
+        raw = mrl.build(mrl.Mrl(mrl.VERSION, 0, [], mats, bytes(base - table_end + 16 * n)))
+        m = mrl.parse(raw)
+        t = time.perf_counter()
+        parts = mrl.blocks(raw, m)
+        self.assertLess(time.perf_counter() - t, 0.5)
+        self.assertEqual({(len(cmd), anim) for cmd, anim in parts}, {(16, b"")})
+        self.assertEqual(mrl.rebuild(raw), raw)
 
     def test_inspect(self):
         rep = inspect.describe(mrl.build(make([(0x1234, 0)], ["tex/rock"])), typemap.BY_EXT["mrl"])

@@ -12,7 +12,7 @@ python native/performance/test/run_data.py --arch both --fuzz-seconds 120
 ```
 
 The build uses the installed MSVC directory specified by `--vs` (default
-`C:/Dev/NyrSkyrimse/tools/VisualStudio2022`). It reuses the existing runtime
+`<path>`). It reuses the existing runtime
 builder's vcvars/environment-cache approach, with architecture-specific caches
 and normalized environment names. No download, install, game process or window
 is started. Outputs are `out-data-x86` and `out-data-x64`: `data_kernels.lib`,

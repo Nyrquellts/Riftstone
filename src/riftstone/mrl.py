@@ -24,6 +24,7 @@ textures are used where".
 """
 from __future__ import annotations
 
+import bisect
 import struct
 from dataclasses import dataclass, field
 
@@ -56,7 +57,13 @@ class Texture:
         return self.raw_name.split(b"\0", 1)[0].decode("latin-1")
 
     def set_name(self, new: str) -> None:
-        nb = new.encode("latin-1")
+        try:
+            nb = new.encode("latin-1")          # as name reads it
+        except UnicodeEncodeError as e:
+            raise FormatError("mrl", f"texture name {new!r}: {new[e.start]!r} is not a Latin-1 character; "
+                                     "engine names are plain text") from None
+        if b"\0" in nb:
+            raise FormatError("mrl", f"texture name {new!r} contains a NUL, which would end it there")
         if len(nb) >= NAME_LEN:
             raise FormatError("mrl", f"texture name too long (max {NAME_LEN - 1}): {new!r}")
         self.raw_name = nb + b"\0" * (NAME_LEN - len(nb))
@@ -191,7 +198,8 @@ def blocks(raw: bytes, m: Mrl) -> list[tuple[bytes, bytes]]:
                     | {len(raw)})
 
     def extent(o: int) -> bytes:
-        return raw[o:next((s for s in starts if s > o), len(raw))]
+        i = bisect.bisect_right(starts, o)                  # the next block's start
+        return raw[o:starts[i] if i < len(starts) else len(raw)]
 
     return [(extent(x.fields[11]), extent(x.fields[12]) if x.fields[10] else b"") for x in m.materials]
 

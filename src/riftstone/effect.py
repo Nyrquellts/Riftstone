@@ -365,7 +365,8 @@ def to_yaml(epv: Epv, name: str | None = None) -> str:
     from . import yamlish
     from .yamlish import Map, Scalar, Seq
 
-    head = ["Riftstone effect provider (.epv)" + (f" -- {name}" if name else ""),
+    shown = " -- " + "".join(c if c.isprintable() else " " for c in name) if name else ""   # stays in its comment
+    head = ["Riftstone effect provider (.epv)" + shown,
             f"version {epv.version} ({'Dark Arisen' if epv.version == VERSION_DDDA else 'Online'}). An index is a "
             "list of elements; an element names up to 8 effect lists",
             "(mpEffectList, .efl paths) and one 2D effect, and places them: mJointNo (-1 = none), mPosition,",
@@ -390,6 +391,12 @@ def _where(node, source):
     return (getattr(node, "line", None), getattr(node, "col", None), source)
 
 
+def _num(v: int, text: str) -> str:
+    """A number for a message: in decimal, or its text cut short past 64 bits (int -> str refuses over
+    4,300 digits, and a hex number has no such limit)."""
+    return str(v) if v.bit_length() <= 64 else repr(text.strip()[:16] + "...")
+
+
 def _int(node, name, lo, hi, source) -> int:
     from .yamlish import Scalar
 
@@ -400,7 +407,7 @@ def _int(node, name, lo, hi, source) -> int:
     except ValueError:
         raise ParamError(f"'{name}': {node.text!r} is not a whole number", *_where(node, source)) from None
     if not lo <= v <= hi:
-        raise ParamError(f"'{name}': {v} is out of range ({lo}..{hi})", *_where(node, source))
+        raise ParamError(f"'{name}': {_num(v, node.text)} is out of range ({lo}..{hi})", *_where(node, source))
     return v
 
 
@@ -433,11 +440,23 @@ def _text(node, name, source) -> str:
 def _seq(node, name, source):
     from .yamlish import Seq
 
-    if node is None:
-        return []
     if not isinstance(node, Seq):
         raise ParamError(f"'{name}' must be a list", *_where(node, source))
     return node.items
+
+
+def _section(m, name, source):
+    """A list the block `m` must have (a missing one is refused, not taken as empty)."""
+    v = m.get(name)
+    if v is None:
+        raise ParamError(f"'{name}' is missing", *_where(m, source))
+    return _seq(v, name, source)
+
+
+def _keys(m, known, what, source) -> None:
+    for k, _v in m.items:
+        if k.text not in known:
+            raise ParamError(f"{what}: unknown field '{k.text}'", k.line, k.col, source)
 
 
 def _from_map(node, schema, what, source) -> dict:
@@ -445,10 +464,7 @@ def _from_map(node, schema, what, source) -> dict:
 
     if not isinstance(node, Map):
         raise ParamError(f"{what} must be a mapping of fields", *_where(node, source))
-    known = {n for n, _ in schema}
-    for k, _v in node.items:
-        if k.text not in known:
-            raise ParamError(f"{what}: unknown field '{k.text}'", k.line, k.col, source)
+    _keys(node, {n for n, _ in schema}, what, source)
     out = {}
     for name, t in schema:
         v = node.get(name)
@@ -495,16 +511,18 @@ def from_yaml(text: str, source: str | None = None) -> Epv:
     if version not in VERSIONS:
         raise ParamError(f"version must be {VERSION_DDDA} (Dark Arisen) or {VERSION_DDO} (Online)",
                          *_where(doc.get("version") or doc, source))
+    _keys(doc, ("riftstone", "resource", "version", "indices", "motsync", "events"), "the file", source)
     epv = Epv(version)
-    for i, idx in enumerate(_seq(doc.get("indices"), "indices", source)):
+    for i, idx in enumerate(_section(doc, "indices", source)):
         if not isinstance(idx, Map):
             raise ParamError("each index is a mapping with 'elements'", *_where(idx, source))
+        _keys(idx, ("elements",), f"index {i}", source)
         epv.indices.append([_from_map(e, ELEMENT[version], f"index {i} element {j}", source)
-                            for j, e in enumerate(_seq(idx.get("elements"), "elements", source))])
+                            for j, e in enumerate(_section(idx, "elements", source))])
     epv.motsync = [_from_map(m, MOTSYNC[version], f"motsync {i}", source)
-                   for i, m in enumerate(_seq(doc.get("motsync"), "motsync", source))]
+                   for i, m in enumerate(_section(doc, "motsync", source))]
     epv.events = [_from_map(e, EVENT, f"event {i}", source)
-                  for i, e in enumerate(_seq(doc.get("events"), "events", source))]
+                  for i, e in enumerate(_section(doc, "events", source))]
     try:
         build(epv)
     except FormatError as e:

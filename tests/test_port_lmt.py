@@ -15,6 +15,11 @@ def motion_list(version, track, flags=0x800000):
     return lmt.build(lmt.Lmt(version, [lmt.Motion(tl, 3, -1, ZERO16, ZERO16, flags, ev, None)]))
 
 
+def lmt_tid():
+    from riftstone import typemap
+    return typemap.BY_EXT["lmt"]
+
+
 def xw14(pairs_with_delta):
     return b"".join(struct.pack("<I", d << 28 | w << 14 | a) for a, w, d in pairs_with_delta)
 
@@ -51,6 +56,43 @@ class LmtPortTest(unittest.TestCase):
         self.assertAlmostEqual(after[0][1][1], 0.2, places=3)                 # y from the reference
         self.assertAlmostEqual(after[0][1][2], -0.1, places=3)
         self.assertLess(after[1][1][0], 0)                                    # x negative in the source
+
+    def test_shared_buffer_keeps_each_tracks_axis(self):
+        # review: the re-encode cache left the codec out of its key, so a codec 12 (Y) track sharing a codec 11
+        # (X) track's buffer came out turned about X, and its change was never measured (0.000000 noted)
+        ref = struct.pack("<4f", 0.0, 0.0, 0.0, 1.0)
+        buf = lmt.Blob(xw14([(2048, 3547, 1), (1000, 16000, 0)]))
+        tl = lmt.TrackList([lmt.Track(11, 0, 0, 5, F1, ref, buf), lmt.Track(12, 0, 0, 6, F1, ref, buf),
+                            lmt.Track(11, 0, 0, 7, F1, ref, buf)])
+        ev = [lmt.EventGroup(bytes(64)) for _ in range(4)]
+        src = lmt.build(lmt.Lmt(66, [lmt.Motion(tl, 2, 0, ZERO16, ref, 0x800000, ev, None)]))
+        before = lmt.parse(src).motions[0].tracks.tracks
+        after = lmt.parse(port.convert_lmt(src, "ddda", "ddo").data).motions[0].tracks.tracks
+        for a, b in zip(before, after):
+            self.assertEqual((b.bone, b.codec), (a.bone, 6))
+            for (_, x), (_, y) in zip(lmtcodec.values(a.codec, a.buffer.data, None, a.reference),
+                                      lmtcodec.values(6, b.buffer.data)):
+                for p, q in zip(x, y):
+                    self.assertLessEqual(abs(p - q), 0.000123, (a.bone, x, y))
+        self.assertIs(after[0].buffer, after[2].buffer)        # same codec: still one buffer
+        self.assertIsNot(after[0].buffer, after[1].buffer)
+
+    def test_buffer_shared_under_many_references_refused(self):
+        # one buffer read with a different reference by each track decodes differently for each, so each got its
+        # own codec 6 copy: 100 tracks on one 4 KB buffer made 800 KB out of 8 KB (grows with the square of the
+        # file). No game file shares a single-axis buffer so; the copies may not need more than the file holds.
+        n = 1000
+        buf = lmt.Blob(xw14([(k, 4000, 1 if k < n - 1 else 0) for k in range(n)]))
+        tl = lmt.TrackList([lmt.Track(11, 0, 0, j, F1, struct.pack("<4f", 0, j / 1000, 0, 1), buf)
+                            for j in range(100)])
+        ev = [lmt.EventGroup(bytes(64)) for _ in range(4)]
+        src = lmt.build(lmt.Lmt(66, [lmt.Motion(tl, n, 0, ZERO16, ZERO16, 0x800000, ev, None)]))
+        self.assertLess(len(src), 9000)
+        with self.assertRaises(RiftError):
+            port.convert_lmt(src, "ddda", "ddo")
+        tl.tracks = tl.tracks[:1]                             # one reading of it is fine
+        src = lmt.build(lmt.Lmt(66, [lmt.Motion(tl, n, 0, ZERO16, ZERO16, 0x800000, ev, None)]))
+        self.assertEqual(lmt.parse(port.convert_lmt(src, "ddda", "ddo").data).motions[0].tracks.tracks[0].codec, 6)
 
     def test_codec6_extremes_dropped_for_ddo(self):
         buf = lmt.Blob(struct.pack("<Q", 1 << 56 | 4095))
@@ -155,6 +197,80 @@ class IntoModTest(unittest.TestCase):
             self.assertFalse(ported.motions[0].flags & 1)
             self.assertTrue(any("67 -> 66" in n for n in res.notes))
 
+    @staticmethod
+    def stand_ins(d):
+        """A source game whose one archive holds motion/em/t.lmt (Dark Arisen's) and a destination without it:
+        into(**kw) ports it into the mod d/mods/M."""
+        from riftstone import arc, typemap
+
+        data = lmt.build(lmt.Lmt(66, [lmt.Motion(lmt.TrackList(), 1, 0, ZERO16, ZERO16, 0)]))
+        (d / "src.arc").write_bytes(arc.Archive([arc.Entry.from_data(b"motion\\em\\t", typemap.BY_EXT["lmt"],
+                                                                     data)]).build())
+
+        class Game:
+            def __init__(self, kind):
+                self.kind = self.title = kind
+
+            def vanilla_arc(self, name):
+                return d / "src.arc"
+
+        class Index:
+            def __init__(self, holders):
+                self.holders = holders
+
+            def archives_with(self, name, tid):
+                return self.holders
+
+        def into(**kw):
+            return port.into_mod(d / "mods" / "M", Game("ddda"), Game("ddo"), Index(["rom/x"]), Index([]),
+                                 "motion/em/t.lmt", **kw)
+        return into
+
+    def test_archive_and_names_checked(self):
+        # review: --arc went into the written path unchecked, so '../../../escaped' wrote beside the mods folder
+        # and an absolute name left the mod altogether (the game's own folder too); Studio's body values that
+        # are not text (5, ["x"]) crashed (AttributeError) instead of being refused
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            into = self.stand_ins(d)
+            mod = d / "mods" / "M"
+            for bad in ("../../../escaped", "..", "rom/../../x", str(d / "abs"), "C:/x", "/rom/x", "rom//x",
+                        "rom/x/"):
+                with self.subTest(arc=bad), self.assertRaises(RiftError):
+                    into(arc_name=bad)
+            for key in ("as_", "like", "arc_name", "from_arc", "material"):
+                for bad in (5, ["rom/x"], {"x": 1}):
+                    with self.subTest(key=key, value=bad), self.assertRaises(RiftError):
+                        into(**{key: bad})
+            self.assertEqual([p.name for p in d.rglob("*")], ["src.arc"])          # nothing written anywhere
+            res = into(arc_name="rom\\enemy\\em0100.arc")                        # the name as the game writes it
+            self.assertEqual(res.written, [mod / "archives" / "rom" / "enemy" / "em0100.arc" / "motion" / "em" /
+                                           "t.lmt"])
+            self.assertTrue(res.written[0].is_file())
+
+    def test_destination_names_windows_cannot_hold(self):
+        # --as was written under the path as typed: a part Windows cannot hold as a name ('a:b', 'x ' with its
+        # trailing space) crashed with OSError / FileNotFoundError. The resource goes where a mod keeps that
+        # engine name (fsmap's file name), which the mod's build reads back as the same name.
+        import tempfile
+        from pathlib import Path
+
+        from riftstone import fsmap
+
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            into = self.stand_ins(d)
+            for as_, name in (("motion/a:b.lmt", b"motion\\a:b"), ("motion/x /t.lmt", b"motion\\x \\t"),
+                              ("motion\\em\\T.lmt.yaml", b"motion\\em\\T")):
+                with self.subTest(as_=as_):
+                    w = into(as_=as_, arc_name="rom/x").written[0]
+                    self.assertTrue(w.is_file())
+                    rel = w.relative_to(d / "mods" / "M" / "archives" / "rom" / "x.arc").as_posix()
+                    self.assertEqual(fsmap.decode_path(rel), (name, lmt_tid()))
+
 
 def rigged(joints, version=0xD4):
     """A model with bones only: joints = [(id, parent index or 255, (x, y, z))]."""
@@ -186,6 +302,22 @@ class SkeletonTest(unittest.TestCase):
         self.assertEqual(d["only_second"], [6])
         self.assertEqual(d["offset_differs"], [(1, 2.0)])
         self.assertEqual(d["parent_differs"], [])
+
+    def test_diff_offsets_that_are_not_numbers(self):
+        # review: max(abs(p - q)) with a NaN is NaN (or skips it) and NaN > tolerance is False, so a joint at
+        # (nan, 10, 0) matched one at (0, 10, 0) while one at (0, 99, 0) was reported; like monsters.compare,
+        # an offset that is not a finite number is no known place
+        nan, inf = float("nan"), float("inf")
+        good = rigged([(0, 255, (0, 100, 0)), (1, 0, (0, 10, 0))])
+        far = rigged([(0, 255, (0, 100, 0)), (1, 0, (0, 99, 0))])
+        self.assertEqual(port.skeleton_diff(far, good)["offset_differs"], [(1, 89.0)])
+        for off in ((nan, 10, 0), (0, 10, nan), (inf, 10, 0)):
+            bad = rigged([(0, 255, (0, 100, 0)), (1, 0, off)])
+            for x, y in ((bad, good), (good, bad), (bad, bad)):
+                self.assertEqual(port.skeleton_diff(x, y)["offset_differs"], [(1, None)], off)
+        for tolerance in (nan, inf, -1.0):     # riftstone skeleton --tolerance nan made every joint match
+            with self.assertRaises(RiftError):
+                port.skeleton_diff(far, good, tolerance)
 
 
 if __name__ == "__main__":

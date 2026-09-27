@@ -1,5 +1,5 @@
 """Encounter plans: many encounters from one JSON file, as NYR-Lang's `riftstone` target writes them
-(C:\\Dev\\NyrLang: spawn rules such as `[stage == 330] and [hour >= 20] => E(100) x 100 | near = 35`).
+(<path> spawn rules such as `[stage == 330] and [hour >= 20] => E(100) x 100 | near = 35`).
 
     {"format": "riftstone-encounters/1", "game": "ddda", "encounters": [
         {"stage": 330, "enemy": "em0100", "total": 100, "at": "group:35", "points": 10, "spread": null,
@@ -8,8 +8,9 @@
 `riftstone encounters PLAN --mod MOD` plans each entry with encounter.plan and writes it into the mod
 before planning the next, so encounters in one stage stack like repeated `riftstone encounter`
 runs (the next free group number each time).  `--dry-run` does the same in a scratch copy of what
-they read from the mod (each stage's enemy group list), removed afterwards: it shows a real run's
-group numbers and refusals and leaves the mod as it was.  `at` is "x,y,z" as a list of three numbers or
+they read from the mod (each stage's enemy group lists, and the navigation mesh the stage loads when the mod
+has its own), removed afterwards: it shows a real run's group numbers, refusals and spawn points and leaves
+the mod as it was.  `at` is "x,y,z" as a list of three numbers or
 "group:N"; hours are (first, last) whole hours 0..23, both ends as the game's own groups hold
 them; null keeps what `riftstone encounter` would default to.  An optional "always": true clears the
 copied group's lot-flag load condition (`riftstone encounter --always`; the level director writes it).
@@ -20,7 +21,6 @@ used group number) stops the run there, and the message says which earlier ones 
 from __future__ import annotations
 
 import json
-import math
 import re
 import shutil
 import tempfile
@@ -68,7 +68,7 @@ def parse(text: str) -> list[PlanEntry]:
     """A plan's text -> its entries, every field checked.  Raises RiftError naming the entry."""
     try:
         doc = json.loads(text)
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:            # RecursionError: nesting deeper than the decoder goes
         raise RiftError(f"the plan is not JSON: {e}") from None
     if not isinstance(doc, dict) or doc.get("format") != FORMAT:
         raise RiftError(f'not an encounter plan: expected {{"format": "{FORMAT}", "encounters": [...]}} (NYR-Lang\'s '
@@ -95,8 +95,9 @@ def parse(text: str) -> list[PlanEntry]:
         total = _int(item.get("total"), "total", 1, 9999, where)
         at = item.get("at")
         if isinstance(at, list):
+            # a range check takes any integer (math.isfinite overflowed past a float's range) and refuses nan/inf
             if len(at) != 3 or not all(isinstance(c, (int, float)) and not isinstance(c, bool)
-                                       and math.isfinite(c) and abs(c) < 1e6 for c in at):
+                                       and abs(c) < 1e6 for c in at):
                 raise RiftError(f"{where}: at is [x, y, z] (finite numbers) or \"group:N\"")
             at_text = ",".join(repr(float(c)) for c in at)
         elif isinstance(at, str) and (m := re.fullmatch(r"group:0*([0-9]{1,3})", at)) and int(m.group(1)) <= 294:
@@ -105,8 +106,7 @@ def parse(text: str) -> list[PlanEntry]:
             raise RiftError(f"{where}: at is [x, y, z] or \"group:N\" (N 0..294), not {at!r}")
         spread = item.get("spread")
         if spread is not None:
-            if not isinstance(spread, (int, float)) or isinstance(spread, bool) or not (
-                    math.isfinite(spread) and 0 < spread <= 5000):
+            if not isinstance(spread, (int, float)) or isinstance(spread, bool) or not 0 < spread <= 5000:
                 raise RiftError(f"{where}: spread is a distance 0..5000, not {spread!r}")
             spread = float(spread)
         hours = item.get("hours")

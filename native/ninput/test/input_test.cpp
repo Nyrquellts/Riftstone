@@ -19,6 +19,8 @@ static void check(bool ok, const char* label) {
 static int g_ab_fires = 0;
 static void on_ab(int /*slot*/, void*) { ++g_ab_fires; }
 static void add_x(int /*slot*/, NinputPad* p, void*) { p->buttons |= BTN_X; }
+static int g_guide_fires = 0;
+static void on_guide(int /*slot*/, void*) { ++g_guide_fires; }
 
 static ninput::RawXInputState frame(unsigned short buttons) {
     ninput::RawXInputState s{};
@@ -67,6 +69,13 @@ int main() {
     feed(0, 0, s);
     check((s.pad.buttons & BTN_X) != 0, "the transform's added button is present in the returned state");
     check(g_ab_fires == 3, "hotkeys read raw input, unaffected by a later transform");
+
+    std::puts("the Guide button is a bindable bit (in game its 0x0400 reaches here via XInputGetStateEx)");
+    int hg = n->input->register_hotkey(NINPUT_GAMEPAD_GUIDE, on_guide, nullptr);
+    s = frame(NINPUT_GAMEPAD_GUIDE);
+    feed(0, 0, s);
+    check(g_guide_fires == 1, "a hotkey bound to Guide fires when the pad reports bit 0x0400");
+    n->input->unregister(hg);
 
     std::puts("unregister");
     n->input->unregister(hk);

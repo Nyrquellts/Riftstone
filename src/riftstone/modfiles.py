@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import arc, arcfolder, fsmap, params
+from . import arc, arcfolder, fsmap, params, typemap
 from .errors import RiftError
 
 
@@ -54,6 +54,89 @@ def _entry(path: Path, name: bytes, type_id: int) -> arc.Entry | None:
                 raise RiftError(f"{path.name}: {name.decode('latin-1')} runs past the end of the archive")
             return arc.Entry(n, t, size, payload, encrypted=encrypted)
     return None
+
+
+def resources(mod_root: Path | None, type_id: int):
+    """(engine name, the file) of every resource of this type the mod holds, in files/ or archives/."""
+    if mod_root is None:
+        return
+    ext = "." + typemap.extension(type_id)
+    for base in ("files", "archives"):
+        folder = mod_root / base
+        if not folder.is_dir():
+            continue
+        for f in sorted(folder.rglob("*")):
+            n = f.name.lower()
+            if not f.is_file() or not (n.endswith(ext) or n.endswith(ext + ".yaml")):
+                continue
+            rel = f.relative_to(folder).as_posix()
+            if base == "archives":
+                parts = rel.split("/")
+                cut = next((i for i, p in enumerate(parts) if p.lower().endswith(".arc")), None)
+                if cut is None:
+                    continue
+                rel = "/".join(parts[cut + 1:])
+            try:
+                name, tid = fsmap.decode_path(rel[:-5] if rel.lower().endswith(".yaml") else rel)
+            except Exception:
+                continue
+            if tid == type_id:
+                yield name.decode("latin-1"), f
+
+
+def read(f: Path) -> bytes:
+    """A mod file's resource bytes (its YAML made binary)."""
+    raw = f.read_bytes()
+    if f.name.lower().endswith(".yaml"):
+        return params.yaml_to_resource(params.decode_text(raw, str(f)), str(f))
+    return raw
+
+
+def group_ids(game, idx, mod_root: Path | None, name: bytes) -> tuple[set[int], int | None]:
+    """What a new record in layout ``name`` keeps clear of, and the bound its id stays under while it can: the ids the
+    game's own copy of the layout has (a machine of the game may name one the mod removed), the ids its group uses
+    in its other layouts, as the mod holds them, else the game's (the game finds a placement by group and id, and
+    every group in the game uses each id once across its layouts), and for an enemy group its kill record's bits
+    (``lot.KILL_BITS``: ids past 31 wrap onto another placement's)."""
+    from . import lot
+
+    LOT = typemap.BY_EXT["lot"]
+    label = name.decode("latin-1")
+
+    def ids(data: bytes) -> set[int]:
+        try:
+            return {r.id for r in lot.parse(data).records}
+        except RiftError:
+            return set()
+
+    def game_data(n: bytes) -> bytes | None:
+        arcs = idx.archives_with(n, LOT)
+        e = _entry(game.vanilla_arc(arcs[0]), n, LOT) if arcs else None
+        return e.data() if e is not None else None
+
+    own = game_data(name)
+    reserved = ids(own) if own is not None else set()
+    ln = lot.parse_name(label)
+    if ln is None or ln.type == "s":
+        return reserved, None
+    key = (ln.stage, ln.type, ln.number)
+
+    def same(n: str) -> bool:
+        m = lot.parse_name(n)
+        return m is not None and (m.stage, m.type, m.number) == key and n.lower() != label.lower()
+
+    others: dict[str, object] = {}
+    for n in idx.names_under(f"scr\\st{ln.stage:03d}\\etc\\", LOT):
+        if same(n.decode("latin-1")):
+            others[n.decode("latin-1").lower()] = n
+    for n, f in resources(mod_root, LOT):
+        if same(n):
+            others[n.lower()] = f                 # the mod's copy, not the game's
+    for held in others.values():
+        data = read(held) if isinstance(held, Path) else game_data(held)
+        if data is not None:
+            reserved |= ids(data)
+    return reserved, (lot.KILL_BITS if ln.type == "e" else None)
 
 
 def save(out: Path, data: bytes, name: bytes, type_id: int) -> None:

@@ -10,6 +10,10 @@ from riftstone.game import Game
 from riftstone.index import Index
 from riftstone.mod import Mod
 
+# the environment this module's classes set (a stand-in RIFTSTONE_HOME) is put back when it ends: a later
+# module that reads the real game (test_compat) otherwise found an empty stand-in index
+setUpModule, tearDownModule = helpers.module_env("RIFTSTONE_HOME", "RIFTSTONE_GAME", "RIFTSTONE_DDO", "RIFTSTONE_DDO_ASSETS", "RIFTSTONE_MODS", "RIFTSTONE_WORKSPACE")
+
 GMD = typemap.BY_EXT["gmd"]
 
 

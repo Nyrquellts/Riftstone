@@ -43,6 +43,14 @@ appended last (measured, and reproduced exactly on every file of both games): ev
 in track order, then every resource and string value in order; a text already in the table --
 also as the tail of a longer entry or inside a resource entry -- is reused unless that entry is
 the newest, else it is appended. ``build`` repeats it, so names and paths are edited as text.
+``parse`` checks that layout before it reads any key, reads a text once per string-table offset however
+many tracks name it, and checks the table by writing it again the writer's way. The writer (_Strings)
+answers each search from an index of where the texts it is given first occur, so a search costs the
+text, not the table (131,070 distinct strings: build 0.7 s, parse 0.8 s, where the plain search took 7.2
+and 16.9 s). Measured: all the references of a file together name at most 0.37 of it (DDDA 0.37, DDO
+0.33; the longest text is 51 bytes); its YAML, which writes every reference's text in full, is at most
+15.5 times the file (overall 3.2). Texts adding up to more than TEXT_LIMIT (16) times the file are
+refused by ``parse`` and ``build`` (4,000 references to one 20 KB path would be 80 MB of YAML from 72 KB).
 
 Proved on every distinct file (``check_corpus --only sdl``): DDDA 624, DDO 1,481; parse -> build and
 the YAML round trip byte-for-byte.
@@ -85,7 +93,8 @@ f32 mHeight, f32 mTopRadius, f32[4] mPos, f32 mBottomRadius. (Area's mHeight / m
 the loader's use -- it sets every vertex's y to mBottom and flips a negative mHeight; Cone's mHeight is
 the one getter-only property left for its first float.)
 A grid (cGridCollision): "grco", u32 0x77C09C94, f32[8] box, u16 nx, u16 nz, u8 index type (0 u32,
-1 u16), u8 packed (1 in every file; the unpacked form is refused), nx*nz cells of two u32, u32 index
+1 u16), u8 packed (1 in every file; the unpacked form is refused), nx*nz cells of two u32 (at least one
+in every file; a header's cell count 0 means no grid, so a grid without cells is refused), u32 index
 count, the indices. A box: f32 min x y z, u32 its own number, f32 max x y z (the number equals the
 box's position in every file; ``build`` writes it).
 
@@ -104,6 +113,7 @@ the YAML round trip byte-for-byte.
 """
 from __future__ import annotations
 
+import secrets
 import struct
 from dataclasses import dataclass, field
 
@@ -225,15 +235,6 @@ def _raw(v) -> bytes:
         raise FormatError("schedule", f"{v!r} has characters the game's encoding (Shift-JIS) cannot store") from None
 
 
-def _cstr(data: bytes, p: int, what: str) -> bytes:
-    if not 0 <= p < len(data):
-        raise FormatError("sdl", f"{what} points outside the file", p)
-    e = data.find(b"\0", p)
-    if e < 0:
-        raise FormatError("sdl", f"{what} is not terminated", p)
-    return data[p:e]
-
-
 def parse_sdl(data: bytes) -> Scheduler:
     data = bytes(data)
     if data[:4] != SDL_MAGIC:
@@ -250,44 +251,64 @@ def parse_sdl(data: bytes) -> Scheduler:
     if not table_end <= sbase <= len(data):
         raise FormatError("sdl", f"the string table offset 0x{sbase:x} is outside the file", 0x14)
     kinds = _kinds(version)
-    sc = Scheduler(version, word0c & 0xFFFFFF, (word0c >> 24) & 1, word0c >> 25, base_track, unk08)
-    for i in range(ntracks):
+    rows = [rec.unpack_from(data, _SDL_HEAD.size + i * rec.size) for i in range(ntracks)]
+    if version != SDL_DDO:
+        rows = [r[:6] + (0, 0) + r[6:] for r in rows]           # DDDA's records have no mUnk10 / mUnk14
+    # the layout first, as _build_sdl makes it: each keyed track's keys (4-aligned), then its values
+    # (16-aligned), in track order, then the string table. Nothing is read before its place is checked, so
+    # tracks cannot name the same bytes over and over.
+    pos = table_end
+    for i, (kind, _, count, _, _, _, _, _, koff, voff) in enumerate(rows):
         o = _SDL_HEAD.size + i * rec.size
-        if version == SDL_DDO:
-            kind, ptype, count, parent, name, index, x1, x2, koff, voff = rec.unpack_from(data, o)
-            extra = (x1, x2)
-        else:
-            kind, ptype, count, parent, name, index, koff, voff = rec.unpack_from(data, o)
-            extra = (0, 0)
-        tr = Track(kind, ptype, parent, None, index, extra=extra)
-        if _named(version, kind):
-            tr.name = _text(_cstr(data, sbase + name, f"track {i}'s name"))
-        else:
-            tr.raw_name = name
         kv = kinds.get(kind)
         if kv is None:
             if count or koff or voff:
                 raise FormatError("sdl", f"track {i} (kind {kind}) has keys; only kinds {min(kinds)}.."
                                          f"{max(kinds)} are keyed", o)
-        elif count:
-            what, size = kv
-            if size is None:
-                raise FormatError("sdl", f"track {i}: kind {kind} has keys, but its value size is UNKNOWN "
-                                         "(no game file has one)", o)
-            if koff + 4 * count > len(data) or voff + size * count > len(data):
-                raise FormatError("sdl", f"track {i}: {count} keys run past the end of the file", o + 2)
+            continue
+        if not count:
+            if koff or voff:
+                raise FormatError("sdl", f"track {i} has no keys but key/value offsets", o)
+            continue
+        if kv[1] is None:
+            raise FormatError("sdl", f"track {i}: kind {kind} has keys, but its value size is UNKNOWN "
+                                     "(no game file has one)", o)
+        k = (pos + 3) & ~3
+        v = (k + 4 * count + 15) & ~15
+        pos = v + kv[1] * count
+        if (koff, voff) != (k, v):
+            raise FormatError("sdl", f"track {i}: keys at 0x{koff:x}, values at 0x{voff:x}; the game's writer "
+                                     f"puts them at 0x{k:x}, 0x{v:x}", o + rec.size - 8)
+        if pos > sbase:
+            raise FormatError("sdl", f"track {i}: {count} keys run into the string table (0x{sbase:x})", o + 2)
+    if sbase != (pos + 3) & ~3:
+        raise FormatError("sdl", f"the string table is at 0x{sbase:x}; the game's writer puts it at "
+                                 f"0x{(pos + 3) & ~3:x}", 0x14)
+    sc = Scheduler(version, word0c & 0xFFFFFF, (word0c >> 24) & 1, word0c >> 25, base_track, unk08)
+    texts = _Texts(data, sbase)
+    for i, (kind, ptype, count, parent, name, index, x1, x2, koff, voff) in enumerate(rows):
+        tr = Track(kind, ptype, parent, None, index, extra=(x1, x2))
+        if _named(version, kind):
+            tr.name = texts.get(name, False, f"track {i}'s name", _SDL_HEAD.size + i * rec.size + 8)
+        else:
+            tr.raw_name = name
+        if count:
+            what, size = kinds[kind]
             tr.keys = [(k & 0xFFFFFF, k >> 24) for k in struct.unpack_from(f"<{count}I", data, koff)]
-            tr.values = _read_values(data, what, size, count, voff, sbase, i)
-        elif koff or voff:
-            raise FormatError("sdl", f"track {i} has no keys but key/value offsets", o)
+            tr.values = _read_values(data, what, size, count, voff)
+            if what in ("resource", "string"):
+                tr.values = [None if off == 0 else texts.get(off, what == "resource", f"track {i}'s value {j}",
+                                                             voff + 4 * j) for j, off in enumerate(tr.values)]
         sc.tracks.append(tr)
+    # the string table (and every padding byte) is checked by writing it again the writer's way
     if build_sdl(sc) != data:
         raise FormatError("sdl", "the file is not laid out the way the game's writer lays it out "
                                  "(padding, alignment or string table)")
     return sc
 
 
-def _read_values(data, what, size, count, voff, sbase, i) -> list:
+def _read_values(data, what, size, count, voff) -> list:
+    """A keyed track's values; a resource or string value is still its string-table offset (0 = none)."""
     raw = data[voff:voff + size * count]
     if what == "bool":
         return list(raw)
@@ -295,38 +316,152 @@ def _read_values(data, what, size, count, voff, sbase, i) -> list:
         return [struct.unpack_from("<4I", raw, 16 * j) for j in range(count)]
     if what == "matrix":
         return [struct.unpack_from("<16I", raw, 64 * j) for j in range(count)]
-    words = struct.unpack(f"<{count}I", raw)
-    if what == "resource":
-        out = []
-        for off in words:
-            if off == 0:
-                out.append(None)
-                continue
-            if sbase + off + 4 > len(data):
-                raise FormatError("sdl", f"track {i}: a resource points outside the file", voff)
-            out.append((struct.unpack_from("<I", data, sbase + off)[0],
-                        _text(_cstr(data, sbase + off + 4, f"track {i}'s resource path"))))
-        return out
-    if what == "string":
-        return [None if off == 0 else _text(_cstr(data, sbase + off, f"track {i}'s string")) for off in words]
-    return list(words)
+    return list(struct.unpack(f"<{count}I", raw))
+
+
+# The YAML writes every reference's text in full, and the model holds a text per string-table offset. In the
+# game's files every reference together names at most 0.37 of the file (its longest text: 51 bytes); a file
+# naming more than TEXT_LIMIT times itself (a key per frame could name a 120-byte path) is refused.
+TEXT_LIMIT = 16                     # times the file
+
+
+class _Texts:
+    """The texts the tracks name: each read once per string-table offset and shared by every track naming
+    it, all the references together held to TEXT_LIMIT times the file."""
+
+    def __init__(self, data: bytes, sbase: int):
+        self.data = data
+        self.sbase = sbase
+        self.seen = {}              # (offset, resource?) -> (bytes, the model's value)
+        self.total = 0              # bytes of text every reference so far names
+
+    def get(self, off: int, resource: bool, what: str, at: int):
+        got = self.seen.get((off, resource))
+        if got is None:
+            p = self.sbase + off
+            e = self.data.find(b"\0", p + 4 if resource else p) if p < len(self.data) else -1
+            if e < 0:
+                raise FormatError("sdl", f"{what} (string 0x{off:x}) is not a text of the string table", at)
+            b = self.data[p:e]
+            got = self.seen[(off, resource)] = (len(b), (struct.unpack_from("<I", b)[0], _text(b[4:])) if resource
+                                                else _text(b))
+        self.total += got[0]
+        if self.total > TEXT_LIMIT * len(self.data):
+            raise FormatError("sdl", f"{what}: the texts the tracks name add up to more than {TEXT_LIMIT} times the "
+                                     "file", at)
+        return got[1]
+
+
+_PRIME: list = []                   # the modulus of _Strings' hash: a random 61-bit prime, chosen once
+
+
+def _hash_prime() -> int:
+    """A random prime, so no text can be chosen to collide with another on purpose."""
+    while not _PRIME:
+        n = secrets.randbits(61) | 1 << 60 | 1
+        if _is_prime(n):
+            _PRIME.append(n)
+    return _PRIME[0]
+
+
+def _is_prime(n: int) -> bool:
+    """Miller-Rabin with the first 12 primes as bases: exact for every n below 3.3e24."""
+    bases = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+    if n < 2 or any(n % q == 0 for q in bases):
+        return n in bases
+    d, s = n - 1, 0
+    while not d & 1:
+        d, s = d >> 1, s + 1
+    for a in bases:
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(s - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
 
 
 class _Strings:
-    """The game's writer: search the table (minus the entry appended last) for the bytes + NUL, else append."""
+    """The game's writer: search the table (minus the entry appended last) for the bytes + NUL, else append.
 
-    def __init__(self):
+    Given every text it will be asked for, it answers the search from an index instead of reading the table
+    again: when an entry stops being the newest, the first place each text asked for occurs there is noted.
+    A text without a NUL occurs as the tail of a run of bytes between two NULs (found by a rolling hash of
+    the run's tails -- the tail as a number modulo a random prime -- then compared); one with a NUL (a type
+    id with a zero byte) ends with a whole run, and is compared with the run and the bytes before it. So a
+    search costs its text, not the table, and gives what table.find(text + NUL, 0, last) gives (tests compare
+    the two; the corpus proves the offsets)."""
+
+    def __init__(self, texts=()):
         self.table = bytearray()
-        self.last = 0
+        self.last = 0                                   # the newest entry starts here
+        self.first = {}                                 # text -> where it first occurs, ending before `last`
+        self.asked = frozenset(texts)
+        self.prime = _hash_prime()
+        self.plain = {}                                 # hash -> texts without a NUL not found yet
+        self.longest = 0
+        self.empty = b"" in self.asked                  # the empty text: found at the first NUL
+        self.wide = {}                                  # texts with a NUL not found yet -> None
+        for t in self.asked:
+            if b"\0" in t:
+                self.wide[t] = None
+            elif t:
+                self.plain.setdefault(int.from_bytes(t, "big") % self.prime, []).append(t)
+                self.longest = max(self.longest, len(t))
+        self.wide_heads = sorted({t.rindex(0) + 1 for t in self.wide})    # bytes up to a wide text's last NUL
+        self.wide_sizes = {len(t) for t in self.wide}
 
     def add(self, b: bytes) -> int:
-        needle = b + b"\0"
-        f = self.table.find(needle, 0, self.last)       # a match must end before the newest entry
-        if f >= 0:
+        f = self.first.get(b)
+        if f is not None:
             return f
-        self.last = len(self.table)
-        self.table += needle
-        return self.last
+        if b not in self.asked:                         # a text nobody declared: the plain search
+            f = self.table.find(b + b"\0", 0, self.last)
+            if f >= 0:
+                return f
+        at = len(self.table)
+        self.table += b + b"\0"
+        self._searchable(self.last, at)                 # the entry that was the newest
+        self.last = at
+        return at
+
+    def _searchable(self, start: int, end: int) -> None:
+        tb, p = self.table, start
+        while p < end:
+            q = tb.index(0, p, end)                     # every entry ends with a NUL
+            self._run(p, q)
+            p = q + 1
+
+    def _run(self, r: int, p: int) -> None:
+        """Note the texts first occurring at the run table[r:p] and the NUL at p."""
+        tb, first = self.table, self.first
+        if self.empty:
+            first[b""] = p
+            self.empty = False
+        if self.plain:
+            h, pw, prime, plain = 0, 1, self.prime, self.plain
+            for m in range(1, min(p - r, self.longest) + 1):
+                h = (tb[p - m] * pw + h) % prime        # the run's last m bytes as a number, modulo the prime
+                pw = pw * 256 % prime
+                ts = plain.get(h)
+                if ts:
+                    t = next((t for t in ts if len(t) == m and tb[p - m:p] == t), None)
+                    if t is not None:
+                        first[t] = p - m
+                        ts.remove(t)
+                        if not ts:
+                            del plain[h]
+        if self.wide:
+            for k in self.wide_heads:
+                if k <= r and p - r + k in self.wide_sizes:
+                    t = bytes(tb[r - k:p])
+                    if t in self.wide:
+                        first[t] = r - k
+                        del self.wide[t]
 
 
 def build_sdl(sc: Scheduler) -> bytes:
@@ -366,9 +501,20 @@ def _build_sdl(sc: Scheduler) -> bytes:
         else:
             offs.append((0, 0))
     sbase = (pos + 3) & ~3
-    # strings, in the writer's order
-    st = _Strings()
-    names = []
+    # strings: every text first (the writer is told them all), then the table in the writer's order -- every
+    # name, then every resource and string value
+    made = {}                       # one bytes object per text
+
+    def raw(v, i: int, where: str) -> bytes:
+        b = made.get(v)
+        if b is None:
+            b = _raw(v)
+            if b"\0" in b:
+                raise FormatError("sdl", f"track {i}: a NUL inside {where}")
+            made[v] = b
+        return b
+
+    name_texts = []                 # per track: its name's bytes, or None (the field is raw_name)
     for i, tr in enumerate(sc.tracks):
         if sc.version != SDL_DDO and tuple(tr.extra) != (0, 0):
             # DDDA's 24-byte track records have no such words: the values would be lost (fuzz finding
@@ -377,39 +523,49 @@ def _build_sdl(sc: Scheduler) -> bytes:
         if _named(sc.version, tr.kind):
             if tr.name is None:
                 raise FormatError("sdl", f"track {i} (kind {tr.kind}) needs a name")
-            nb = _raw(tr.name)
-            if b"\0" in nb:
-                raise FormatError("sdl", f"track {i}: a NUL inside the name")
-            names.append(st.add(nb))
+            if tr.raw_name:             # the field holds the name's offset: the value would be lost
+                raise FormatError("sdl", f"track {i} (kind {tr.kind}) has a name; raw_name is the name field "
+                                         "of a kind without one")
+            name_texts.append(raw(tr.name, i, "the name"))
+        elif tr.name is not None:
+            raise FormatError("sdl", f"track {i}: kind {tr.kind} has no name (the field is raw_name)")
         else:
-            names.append(tr.raw_name)
-    words = []
+            name_texts.append(None)
+    value_texts = []                # per track: a resource / string track's value bytes (None: none), or None
     for i, tr in enumerate(sc.tracks):
         what = _kind_of(sc.version, tr.kind)
         if what in ("resource", "string") and tr.keys:
-            w = []
+            vt = []
             for v in tr.values:
                 if v is None:
-                    w.append(0)
-                    continue
-                if what == "resource":
+                    vt.append(None)
+                elif what == "resource":
                     tid, path = v
-                    pb = _raw(path)
-                    if b"\0" in pb:
-                        raise FormatError("sdl", f"track {i}: a NUL inside a resource path")
-                    off = st.add(struct.pack("<I", tid) + pb)
+                    b = made.get((tid, path))
+                    if b is None:
+                        b = made[(tid, path)] = struct.pack("<I", tid) + raw(path, i, "a resource path")
+                    vt.append(b)
                 else:
-                    sb = _raw(v)
-                    if b"\0" in sb:
-                        raise FormatError("sdl", f"track {i}: a NUL inside a string")
-                    off = st.add(sb)
-                if off == 0:
-                    raise FormatError("sdl", f"track {i}: a value that lands on the table's first string "
-                                             "reads back as none; the game cannot store it")
-                w.append(off)
-            words.append(w)
+                    vt.append(raw(v, i, "a string"))
+            value_texts.append(vt)
         else:
+            value_texts.append(None)
+    texts = [b for b in name_texts if b is not None] + [b for vt in value_texts if vt for b in vt if b is not None]
+    st = _Strings(texts)
+    names = [tr.raw_name if b is None else st.add(b) for tr, b in zip(sc.tracks, name_texts)]
+    words = []
+    for i, vt in enumerate(value_texts):
+        if vt is None:
             words.append(None)
+            continue
+        w = []
+        for b in vt:
+            off = 0 if b is None else st.add(b)
+            if b is not None and off == 0:
+                raise FormatError("sdl", f"track {i}: a value that lands on the table's first string "
+                                         "reads back as none; the game cannot store it")
+            w.append(off)
+        words.append(w)
     out = bytearray()
     try:
         out += _SDL_HEAD.pack(SDL_MAGIC, sc.version, n, sc.unk08,
@@ -436,6 +592,9 @@ def _build_sdl(sc: Scheduler) -> bytes:
     except struct.error as e:
         raise FormatError("sdl", f"a value does not fit its field ({e})") from None
     out += st.table
+    if sum(len(b) for b in texts) > TEXT_LIMIT * len(out):
+        raise FormatError("sdl", f"the texts the tracks name add up to more than {TEXT_LIMIT} times the file: "
+                                 "parse would refuse it")
     return bytes(out)
 
 
@@ -475,6 +634,11 @@ def _txt_node(v, flow: bool = False):
     return Scalar(v, "plain" if v and quote(v, flow) == v and v != "null" else "double")
 
 
+def _one_line(text: str) -> str:
+    """Text for the header comment: what is not printable (a newline would end the comment) as a space."""
+    return "".join(c if c.isprintable() else " " for c in text)
+
+
 def _type_text(tid: int) -> str:
     from . import typemap
     known = typemap.BY_ID.get(tid)
@@ -490,6 +654,12 @@ def _class_note(tid: int) -> str | None:
     if not _CLASS_BY_ID:
         _CLASS_BY_ID.update({typemap.jamcrc(n): n for n in UNIT_CLASSES + ZONE_CLASSES})
     return _CLASS_BY_ID.get(tid) or xfs.CLASS_NAMES.get(tid) or (typemap.BY_ID.get(tid) or (None,))[0]
+
+
+def _num(v: int, text: str) -> str:
+    """A number for a message: in decimal, or its text cut short past 64 bits (int -> str refuses over
+    4,300 digits, and a hex number has no such limit)."""
+    return str(v) if v.bit_length() <= 64 else repr(text.strip()[:16] + "...")
 
 
 class _Y:
@@ -521,7 +691,7 @@ class _Y:
         except ValueError:
             raise self.err(f"{what}: {node.text!r} is not a whole number", node) from None
         if not lo <= v <= hi:
-            raise self.err(f"{what}: {v} is outside {lo}..{hi}", node)
+            raise self.err(f"{what}: {_num(v, node.text)} is outside {lo}..{hi}", node)
         return v
 
     def f32(self, node, what):
@@ -551,17 +721,22 @@ class _Y:
             if "\0" in node.text and not allow_nul:
                 raise self.err(f"{what}: a NUL inside the text", node)
             try:
-                node.text.encode("cp932")
+                b = node.text.encode("cp932")
             except UnicodeEncodeError:
                 raise self.err(f"{what}: characters the game's encoding (Shift-JIS) cannot store; "
                                "write {hex: ...} for raw bytes", node) from None
-            return node.text
-        if isinstance(node, Map) and node.get("hex") is not None:
+        elif isinstance(node, Map) and node.get("hex") is not None:
             try:
-                return bytes.fromhex(node.get("hex").text)
+                if len(node.items) != 1:
+                    raise ValueError
+                b = bytes.fromhex(node.get("hex").text)
             except (ValueError, AttributeError):
-                raise self.err(f"{what}: hex must be pairs of hex digits", node) from None
-        raise self.err(f"{what} must be text", node)
+                raise self.err(f'{what}: raw bytes are {{hex: "..."}}, pairs of hex digits', node) from None
+        else:
+            raise self.err(f"{what} must be text", node)
+        # the form parse gives these bytes, so YAML -> model -> bytes -> model is stable: {hex: ...} of text
+        # is text, and text stored as other characters' bytes ('¬' as 81 CA) is what those bytes read as ('￢')
+        return _text(b)
 
     def type_id(self, node, what):
         from . import typemap
@@ -614,7 +789,7 @@ def sdl_to_yaml(sc: Scheduler, name: str | None = None) -> str:
     kinds = "6 int, 8 vector, 9 float, 11 bool, 12 unit ref, 13 resource, 14 string, 15 event, 16 matrix" if ddo \
         else "6 int, 7 vector, 8 float, 9 bool, 10 unit ref, 11 resource, 12 string, 13 event, 14 matrix"
     head = ["Riftstone scheduler (.sdl, rScheduler" + (", Dragon's Dogma Online)" if ddo else ")")
-            + (f" -- {name}" if name else ""),
+            + (f" -- {_one_line(name)}" if name else ""),
             f"{len(sc.tracks)} tracks. kind: 1 root, 2 unit, 3 system object, 4 spacer, 5 sub-object; keyed: {kinds}.",
             "type is the driven property's MtProperty type; parent is a unit's move line, or the track that",
             "owns a property; index is a unit's class id or a property's array index. A key is {frame, mode,",
@@ -714,6 +889,9 @@ def sdl_from_yaml(text: str, source: str | None = None) -> Scheduler:
                           y.int(tn.get("mUnk14"), 0, 0xFFFFFFFF, f"{where} mUnk14", 0)))
         if _named(version, kind):
             tr.name = y.text(y.get(tn, "name", where), f"{where} name")
+            if tn.get("raw_name") is not None:
+                raise y.err(f"{where}: kind {kind} has a name; raw_name is the name field of a kind without one",
+                            tn.get("raw_name"))
         elif tn.get("name") is not None:
             raise y.err(f"{where}: kind {kind} has no name", tn.get("name"))
         what = _kind_of(version, kind)
@@ -913,6 +1091,9 @@ def _read_grid(r: _R, what: str) -> Grid:
     if g.index_type not in (0, 1):
         raise FormatError("zon", f"{what}: grid index type {g.index_type} (0 u32, 1 u16 are known)", r.p - 2)
     ncell = g.nx * g.nz
+    if not ncell:           # a header's 0 cells mean no grid; build refuses one without cells
+        raise FormatError("zon", f"{what}: a grid of {g.nx} x {g.nz} cells (every game file's grids have cells)",
+                          r.p - 6)
     if ncell * 8 > len(r.d) - r.p:
         raise FormatError("zon", f"{what}: {ncell} grid cells cannot fit in the file", r.p)
     cells = struct.unpack(f"<{2 * ncell}I", r.take(8 * ncell, what))
@@ -1022,13 +1203,14 @@ def parse_zon(data: bytes) -> Zone:
                 raise FormatError("zon", f"the header's grid sizes {grid_sizes} do not match the grid", r.p)
         elif grid_sizes != [0, 0]:
             raise FormatError("zon", f"the header states a grid {grid_sizes} but none follows", r.p)
+    if n_unique + n_tail > (len(data) - r.p) // 4:
+        raise FormatError("zon", f"the tables ({n_tail} + {n_unique} entries) run past the end", r.p)
+    if z.zone_type == 2:
         left = len(data) - r.p - 4 * (n_unique + n_tail)
         if left == BOUNDS_SIZE * nl:
             z.layout_bounds = _read_bounds(r, nl, "the layout bounds")
         elif left != 0:
             raise FormatError("zon", f"{left} bytes before the tables fit neither 0 nor {nl} layout bounds", r.p)
-    if n_unique + n_tail > (len(data) - r.p) // 4:
-        raise FormatError("zon", f"the tables ({n_tail} + {n_unique} entries) run past the end", r.p)
     z.tail = r.u32s(n_tail, "the first table")
     z.unique_index = r.u32s(n_unique, "the unique-id table")
     if r.p != len(data):
@@ -1226,8 +1408,10 @@ def zon_to_yaml(z: Zone, name: str | None = None) -> str:
     from .yamlish import Map, Scalar, Seq
 
     ddo = z.is_ddo
-    head = ["Riftstone zone (.zon, rZone" + (", Dragon's Dogma Online)" if ddo else ")") + (f" -- {name}" if name else ""),
-            f"'{_raw(z.name).decode('latin-1')}': {len(z.layouts)} layout(s) (a shape plus nZone::cLayoutElement's fields),",
+    head = ["Riftstone zone (.zon, rZone" + (", Dragon's Dogma Online)" if ddo else ")")
+            + (f" -- {_one_line(name)}" if name else ""),
+            f"'{_one_line(_raw(z.name).decode('latin-1'))}': {len(z.layouts)} layout(s) (a shape plus "
+            "nZone::cLayoutElement's fields),",
             f"{len(z.groups)} group(s). Shapes: " + ", ".join(f"{i} {n}" for i, n in enumerate(SHAPE_NAMES)) + ".",
             "contents and mpExtendObj are XFS objects kept as exact bytes (hex). A grid is cGridCollision.",
             "Floats are exact 32-bit values. Rebuilds byte-for-byte when untouched."]
@@ -1312,6 +1496,8 @@ def zon_from_yaml(text: str, source: str | None = None) -> Zone:
         if gn.get("grid") is not None:
             g.grid = _grid_from(y, gn.get("grid"), f"{w} grid")
             g.bounds = _bounds_from(y, y.get(gn, "bounds", w), f"{w} bounds")
+        elif gn.get("bounds") is not None:
+            raise y.err(f"{w}: bounds come with a grid (a box per GroupLayoutIndex entry)", gn.get("bounds"))
         z.groups.append(g)
     if doc.get("grid") is not None:
         z.grid = _grid_from(y, doc.get("grid"), "grid")

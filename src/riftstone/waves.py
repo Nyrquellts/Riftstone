@@ -320,37 +320,11 @@ def census(game, idx, w: World, rebuild: bool = False) -> dict[int, dict[int, li
 
 def _mod_resources(mod_root: Path, type_id: int):
     """(engine name, the file) of every resource of this type the mod holds, in files/ or archives/."""
-    if mod_root is None:
-        return
-    ext = "." + typemap.extension(type_id)
-    for base in ("files", "archives"):
-        folder = mod_root / base
-        if not folder.is_dir():
-            continue
-        for f in sorted(folder.rglob("*")):
-            n = f.name.lower()
-            if not f.is_file() or not (n.endswith(ext) or n.endswith(ext + ".yaml")):
-                continue
-            rel = f.relative_to(folder).as_posix()
-            if base == "archives":
-                parts = rel.split("/")
-                cut = next((i for i, p in enumerate(parts) if p.lower().endswith(".arc")), None)
-                if cut is None:
-                    continue
-                rel = "/".join(parts[cut + 1:])
-            try:
-                name, tid = fsmap.decode_path(rel[:-5] if rel.lower().endswith(".yaml") else rel)
-            except Exception:
-                continue
-            if tid == type_id:
-                yield name.decode("latin-1"), f
+    return modfiles.resources(mod_root, type_id)
 
 
 def _read_mod_file(f: Path) -> bytes:
-    raw = f.read_bytes()
-    if f.name.lower().endswith(".yaml"):
-        return params.yaml_to_resource(params.decode_text(raw, str(f)), str(f))
-    return raw
+    return modfiles.read(f)
 
 
 def _mod_fsm_flags(mod_root: Path | None) -> dict:

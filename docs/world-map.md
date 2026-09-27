@@ -240,6 +240,52 @@ group's number is free in **every** enemy group list of the stage: stage 443 als
 (groups 20-22), and a layout name carries only the number. The group copied may be in either list (an encounter
 among Everfall's DLC groups copies one of them, conditions and all); the copy goes into `st443_e`. In game UNKNOWN.
 
+**Encounters in separate mods.** Every encounter mod carries the stage's whole group list, so as whole resources
+the later mod's copy would replace the other's and its groups would vanish (their layouts stay, but nothing loads
+them). `build`, `install` and `package` merge the copies instead (`src/riftstone/gplmerge.py`), against the game's
+own list, group by group (a group is its `mGroupList` slot and its record):
+
+- a group only one mod adds, changes or removes is taken from that mod; a group several mods change alike is
+  taken once; where mods change one group differently its fields merge, and a field they set differently goes to
+  the later (higher priority) mod, reported like any clash. `mSetBit`'s bits and the header merge the same way.
+- Two encounters made apart both take the stage's first free number. The first mod keeps it (a mod installed
+  before claims first, and a moved group keeps the number the last install gave it); each other one gets the
+  lowest number free in all of the stage's lists of that kind and in every mod's, and its layouts
+  (`st<S>_<X>m<Z>n_e<N>`) are renamed with it, since the engine finds a group's layouts by that name alone. Its
+  cells' `mGroup` and its sibling groups' shared-area references follow it, and so do the targets of its mod's
+  state machines in the stage's own folder (`scr\st<S>\...`): a wave chain (`riftstone waves`) waits on its
+  groups by number (`cLinkUnit::cTarget` `mType` 2: `mNo0` the group, `mNo1` the placement id, in the stage the
+  machine runs in). The mod's files are not changed.
+- A group is moved only when nothing else refers to its number: another of its mod's groups sharing its wander or
+  kill area or waiting on it (an NPC or object group's `mLinkEmGroup`), a change to `mSetBit` in its list (its
+  meaning is not known), a layout the game already has under that number, or a machine of the mod outside the
+  stage's folder that names it (a quest's or a character's machine may run in any stage, so it cannot be rewritten
+  for this one). Such a group keeps its number and the later mod's group with that number wins, reported.
+- Two wave chains made apart take the stage's same highest free lot flags. Merged, each chain would open and close
+  the other's waves too, so a lot flag that new groups of several mods are gated on is reported (both groups are
+  kept); a flag the game's own groups are gated on (a group copied `like=` one of them) is shared on purpose.
+  Two chains after the same group also share the machine's name, so one machine wins, reported like any clash.
+
+**Layouts** several mods change (`spawns copy`, Studio's map) merge the same way (`src/riftstone/lotmerge.py`):
+records by id against the game's layout, fields merged where mods change one record differently; an id two mods
+both add (each copy takes the largest + 1) keeps its first claimant, and each other one gets an id free in the
+game's layout and every mod's copy (0..1023). An enemy group's layouts are numbered together, as the game numbers
+them: it finds a placement by group and id (stage | group << 10, id; `docs/enemy-waves.md`) and keeps one kill-record
+bit per id, which wraps past 31, and every enemy group in the game uses each id once across its layouts, all below
+32. So two mods adding one id to different cells of a group clash too, and a moved enemy placement takes the
+smallest id free in all of the group's layouts (the game's and every mod's), below 32 while one is. Nothing in the
+game can refer to a record a mod adds; the mod's own machines in the stage's folder can (a wave chain waits for its
+first group's placements by id) and follow it, while one elsewhere naming it keeps it where it is, reported. `mSetID`
+is not a record id (on the game's 6,342 layouts it is -1 on 41,104 records and matches no record on 750 more). A
+layout the game does not have belongs to a new group, whose number the group-list merge keeps apart.
+
+The merged list keeps the game's order and puts the added groups after it by number (every list in the game is
+in number order). `install` records the numbers it gave in its state, so the next install keeps them. Measured on
+the game's 199 lists: every one is in number order, only `_p` lists set `mSetBit` (47), and the only fields
+holding another group's number are the shared wander and kill areas (21 and 14 groups, all within their list) and
+`mLinkEmGroup` (9 NPC/object groups). What an encounter does in game stays UNKNOWN, merged or not; the merged
+list uses only what the game's own lists use.
+
 **Hours.** A group also holds a window of hours, `mDataSetHour.mSetHourBgn` / `mSetHourEnd`. Across the game's
 3,925 groups (world cache, 2026-09-25): 3,673 hold 0..23, 87 hold 4..20 and 85 hold 20..4 (day and night pairs),
 30 hold 0..0, and the rest are day/night variants such as 3..20, 20..3, 4..19. `--hours 20,3` sets the new group's
