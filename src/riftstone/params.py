@@ -82,17 +82,19 @@ def _classdef(name: str, engine_value: int | None, props: list) -> xfs.ClassDef:
 
 
 def prop_keys(cdef: xfs.ClassDef) -> list[str]:
-    """YAML keys for a class's properties: repeats become name#2, name#3 ..."""
-    counts: dict[str, int] = {}
-    names = {p.name for p in cdef.props}
+    """YAML keys for a class's properties: repeats become name#2, name#3 ..., and none takes the key of
+    another property or of the object's own _class line (a property named _class is _class#2)."""
+    counts: dict[str, int] = {"_class": 1}
+    taken = {p.name for p in cdef.props} | {"_class"}
     keys = []
     for p in cdef.props:
         k = counts.get(p.name, 0) + 1
-        counts[p.name] = k
         key = p.name if k == 1 else f"{p.name}#{k}"
-        while k > 1 and key in names:
+        while k > 1 and key in taken:
             k += 1
             key = f"{p.name}#{k}"
+        counts[p.name] = k
+        taken.add(key)
         keys.append(key)
     return keys
 
@@ -151,8 +153,10 @@ def f32_bits(text: str) -> int:
             raise ValueError("nan:0x... must hold the bits of a 32-bit NaN")
         return bits
     specials = {".nan": math.nan, "nan": math.nan, ".inf": math.inf, "+.inf": math.inf, "inf": math.inf,
-                "-.inf": -math.inf, "-inf": -math.inf}
+                "+inf": math.inf, "-.inf": -math.inf, "-inf": -math.inf}
     v = specials[t] if t in specials else float(t)
+    if math.isinf(v) and t not in specials:        # 1e400: infinity only when written so (as _parse_float)
+        raise ValueError("too large for a 32-bit float")
     return struct.unpack("<I", _F32.pack(to_f32(v)))[0]
 
 
@@ -177,6 +181,24 @@ def _floaty(s: str) -> str:
     return s
 
 
+def shown(text: str, limit: int = 32) -> str:
+    """A value as the file wrote it, for a message: cut short, since a number thousands of digits long
+    cannot even be written in decimal (Python refuses past 4,300 digits)."""
+    t = str(text).strip()
+    return t if len(t) <= limit else t[:limit] + "..."
+
+
+def shown_value(v) -> str:
+    """A parsed value for a message: its repr, but a number past 64 bits in hex cut short (a hex number read
+    from a file has no digit limit, and int -> str refuses past 4,300 digits) and a long list cut short."""
+    if isinstance(v, int) and not isinstance(v, bool) and v.bit_length() > 64:
+        return f"{v:#x}"[:19] + "..."
+    if isinstance(v, (list, tuple)):
+        inner = ", ".join(shown_value(x) for x in v[:8]) + (", ..." if len(v) > 8 else "")
+        return f"[{inner}]" if isinstance(v, list) else f"({inner})"
+    return repr(v)
+
+
 def _parse_int(sc: Scalar, lo: int, hi: int, what: str, err) -> int:
     t = sc.text.strip().replace("_", "")
     try:
@@ -185,9 +207,9 @@ def _parse_int(sc: Scalar, lo: int, hi: int, what: str, err) -> int:
         v = int(body, 16) if body.lower().startswith("0x") else int(body, 10)
         v = -v if neg else v
     except ValueError:
-        raise err(f"{what} must be a whole number, not {sc.text!r}", sc) from None
+        raise err(f"{what} must be a whole number, not {shown(sc.text)!r}", sc) from None
     if not lo <= v <= hi:
-        raise err(f"{what} must be between {lo} and {hi}; {v} is out of range", sc)
+        raise err(f"{what} must be between {lo} and {hi}; {shown(sc.text)} is out of range", sc)
     return v
 
 
@@ -199,11 +221,11 @@ def _parse_float(sc: Scalar, single: bool, what: str, err):
         try:
             bits = int(low[6:], 16)
         except ValueError:
-            raise err(f"{what}: {sc.text!r} is not a NaN bit pattern (nan:0x7fc00000)", sc) from None
+            raise err(f"{what}: {shown(sc.text)!r} is not a NaN bit pattern (nan:0x7fc00000)", sc) from None
         width, exp_mask, mant_mask = (32, 0x7F800000, 0x007FFFFF) if single else \
             (64, 0x7FF0000000000000, 0x000FFFFFFFFFFFFF)
         if not 0 <= bits < (1 << width) or (bits & exp_mask) != exp_mask or not bits & mant_mask:
-            raise err(f"{what}: {sc.text!r} is not a {width}-bit NaN pattern", sc)
+            raise err(f"{what}: {shown(sc.text)!r} is not a {width}-bit NaN pattern", sc)
         return xfs.F32Bits(bits)
     if low in (".nan", "nan"):
         return float("nan")
@@ -214,14 +236,14 @@ def _parse_float(sc: Scalar, single: bool, what: str, err):
     try:
         v = float(t.replace("_", ""))
     except ValueError:
-        raise err(f"{what} must be a number, not {sc.text!r}", sc) from None
+        raise err(f"{what} must be a number, not {shown(sc.text)!r}", sc) from None
     if math.isinf(v) and not low.endswith("inf"):
-        raise err(f"{what}: {sc.text} is too large to store", sc)
+        raise err(f"{what}: {shown(sc.text)} is too large to store", sc)
     if single:
         try:
             v = to_f32(v)
         except ValueError:
-            raise err(f"{what}: {sc.text} is too large for a 32-bit float (max about 3.4e38)", sc) from None
+            raise err(f"{what}: {shown(sc.text)} is too large for a 32-bit float (max about 3.4e38)", sc) from None
     return v
 
 
@@ -291,9 +313,10 @@ def to_yaml(x: xfs.Xfs, name: str | None = None, type_id: int | None = None, tag
     if xfs.text_encoding(x.version) == "cp932":
         header.append("Text is stored in Shift-JIS (cp932), as the game reads it: characters it lacks are refused.")
     items = [(Scalar("riftstone"), Scalar(tag))]
-    if name is not None:
+    if name is not None:                        # a note for the reader (from_yaml does not use it): any text
         resource = name + (f".{ext}" if ext else "")
-        items.append((Scalar("resource"), _str_scalar(resource.encode("latin-1"))))
+        q = yamlish.quote(resource)
+        items.append((Scalar("resource"), Scalar(resource, "plain" if q == resource else "double")))
     if x.version != xfs.VERSION:   # Dragon's Dogma Online's layout (0x000f)
         items.append((Scalar("xfs"), Scalar(f"0x{x.version:04x}")))
         if x.extra.get("reserved"):  # the header's spare u32: zero in every vanilla file, kept when it is not
@@ -356,8 +379,8 @@ class _Builder:
         elif self.classes[ci] != cdef:
             raise self.err(f"class {cdef.name} is declared twice with different layouts", cls_node)
         self.count += 1
-        if self.count > 0xFFFF:
-            raise self.err("more than 65535 objects; XFS object numbers are 16-bit", node)
+        if self.count > xfs.MAX_OBJECTS:
+            raise self.err(f"more than {xfs.MAX_OBJECTS} objects; XFS object numbers are 16-bit", node)
         keys = prop_keys(cdef)
         known = set(keys)
         given = {}

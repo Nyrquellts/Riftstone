@@ -55,7 +55,9 @@ array (4-aligned), the tracks' extremes (from a 16-byte boundary, 32 bytes each)
 tracks' buffers (each 4-aligned), the event block and its lists, the float block and its
 frames. Blocks shared by reference (two motions pointing at one track array, two tracks at
 one buffer or extremes block) are written once, where they are first reached, and shared
-again when rebuilt; identical content that the file does not share stays separate.
+again when rebuilt; identical content that the file does not share stays separate. So the
+blocks a file's motions use fit in the file once; ``parse`` refuses blocks that overlap past
+that (they would be copied once per reference).
 """
 from __future__ import annotations
 
@@ -199,21 +201,26 @@ def parse(data: bytes) -> Lmt:
     offsets = struct.unpack_from(f"<{n}I", data, 8)
     lists: dict[int, TrackList] = {}
     blobs: dict[tuple[int, int, str], Blob] = {}
-    # Event and float lists are never shared in the game's files, so together they cannot hold
-    # more entries than the file has 8-byte slots; a hostile file pointing every motion at one
-    # long list is refused instead of being expanded once per motion.
-    budget = [len(data) // EVENT_SIZE]
+    # The writer puts each block in the file once -- motion headers, track arrays, extremes, buffers,
+    # event and float blocks and their lists; a block two motions or two tracks share is written once
+    # and shared by reference -- and build writes exactly the blocks read here, so a file that rebuilds
+    # byte for byte (every vanilla one) holds them all. Blocks that overlap, e.g. every slot pointing
+    # at one header or buffers running to the end from every offset, are refused instead of being
+    # copied once per reference.
+    room = [len(data)]
 
-    def spend(n: int, where: int) -> None:
-        budget[0] -= n
-        if budget[0] < 0:
-            raise FormatError("lmt", "event and float lists overlap more than the file can hold", where)
+    def spend(n: int, what: str, where: int) -> None:
+        room[0] -= n
+        if room[0] < 0:
+            raise FormatError("lmt", f"{what} overlaps other blocks (together they need more than the file's "
+                                     f"{len(data):,} bytes)", where)
 
     def blob(off: int, size: int, what: str) -> Blob:
         key = (off, size, what)
         b = blobs.get(key)
         if b is None:
             _span(data, off, size, what)
+            spend(size, f"a {what}", off)
             b = blobs[key] = Blob(data[off:off + size])
         return b
 
@@ -223,6 +230,7 @@ def parse(data: bytes) -> Lmt:
             motions.append(None)
             continue
         _span(data, off, MOTION_SIZE, f"motion {i}")
+        spend(MOTION_SIZE, f"motion {i}'s header", off)
         tr_off, nt, frames, loop, end_pos, end_rot, flags, ev_off, fl_off = _MOTION.unpack_from(data, off)
         _count(nt, f"motion {i} track", off)
         key = tr_off if nt else -1
@@ -237,6 +245,7 @@ def parse(data: bytes) -> Lmt:
             tl = TrackList()
             if nt:
                 _span(data, tr_off, nt * TRACK_SIZE, f"motion {i} tracks")
+                spend(nt * TRACK_SIZE, f"motion {i}'s track array", tr_off)
                 for t in range(nt):
                     codec, usage, btype, bone, weight, bsize, boff, ref, ext = \
                         _TRACK.unpack_from(data, tr_off + t * TRACK_SIZE)
@@ -252,26 +261,28 @@ def parse(data: bytes) -> Lmt:
         events = None
         if ev_off:
             _span(data, ev_off, EVENT_GROUPS * _EVGROUP.size, f"motion {i} events")
+            spend(EVENT_GROUPS * _EVGROUP.size, f"motion {i}'s event block", ev_off)
             events = []
             for g in range(EVENT_GROUPS):
                 remap, ne, lo = _EVGROUP.unpack_from(data, ev_off + g * _EVGROUP.size)
                 _count(ne, f"motion {i} event group {g}", ev_off)
                 if ne:
                     _span(data, lo, ne * EVENT_SIZE, f"motion {i} event list {g}")
-                    spend(ne, lo)
+                    spend(ne * EVENT_SIZE, f"motion {i}'s event list {g}", lo)
                 events.append(EventGroup(remap, [struct.unpack_from("<II", data, lo + k * EVENT_SIZE)
                                                  for k in range(ne)]))
         floats = None
         if fl_off:
             ng = float_groups(flags)
             _span(data, fl_off, ng * _FLGROUP.size, f"motion {i} float tracks")
+            spend(ng * _FLGROUP.size, f"motion {i}'s float block", fl_off)
             floats = []
             for g in range(ng):
                 remap, nf, fo = _FLGROUP.unpack_from(data, fl_off + g * _FLGROUP.size)
                 _count(nf, f"motion {i} float group {g}", fl_off)
                 if nf:
                     _span(data, fo, nf * FLOAT_FRAME_SIZE, f"motion {i} float frames {g}")
-                    spend(2 * nf, fo)
+                    spend(nf * FLOAT_FRAME_SIZE, f"motion {i}'s float frames {g}", fo)
                 floats.append(FloatGroup(remap, [(struct.unpack_from("<I", data, fo + k * 16)[0],
                                                   data[fo + k * 16 + 4:fo + k * 16 + 16]) for k in range(nf)]))
         elif float_groups(flags):

@@ -11,14 +11,20 @@ and fonts are its own.
 ## No game data
 
 Riftstone ships no game data: no archives, models, textures, text, sound or executables from either
-game. It reads and rewrites the files of a copy of the game its user owns, on that user's computer, and
-never bypasses copy protection. The tables in `src/riftstone/data` hold engine identifiers, hashes and
-file layouts measured from the games, not their content.
+game. It reads and changes the files of a copy of the game its user owns, on that user's computer. Dark
+Arisen mods are served by the loader from `riftstone\overlay`, so the game's own files and `DDDA.exe` stay
+as Steam installed them; the loader works in the running game's memory and changes no file of the game.
+Online's archives are encrypted: Riftstone ships no key, and reads it from the user's own Online client.
+The tables in `src/riftstone/data` hold engine identifiers, hashes and file layouts measured from the
+games, not their content.
 
-A mod package made with `riftstone package` contains archives rebuilt on the maker's PC from their own
-game: they carry the game's own data with the mod's changes. Such a package is for players who own the
-game, and whoever shares it is responsible for doing so within the law and the game's terms. The
-package's README says so.
+A mod package made with `riftstone package` holds no file of either game either: for each resource a mod
+changes or adds, a delta against resources the player already has plus the bytes its author wrote, and
+for content that came from the other game (a Dragon's Dogma Online chimera skin, a port) only a recipe;
+each player's Riftstone makes the mods from their own copies of the games and checks every file. Whoever
+shares a package is responsible for its own content (their own work only). `docs/legal.md` has the rules.
+
+Riftstone is free and never sold; nothing made with it may be sold or put behind a paywall.
 
 ## Riftstone itself
 
@@ -60,7 +66,8 @@ Riftstone.
   licence. It is kept only as a local reference under
   `vendor/unit_expander` (not in the repository) and is never built into a release or a mod package.
   Riftstone's own encounters use one enemy kind per group and do not need it.
-- **safetyhook** (Boost Software License 1.0) and **Zydis** (MIT) are fetched at build time by the
-  optional Ninput host (`native/ninput`) only; neither is part of the loader, of any plugin Riftstone
-  installs, of a release or of a mod package. Anyone who distributes a Ninput build must include Zydis's
-  MIT notice with it.
+- **safetyhook** (Boost Software License 1.0), **Zydis** and **Zycore** (MIT) are fetched at build time by
+  the optional Ninput host (`native/ninput`) only; none is part of the loader, of any plugin Riftstone
+  installs or of a mod package. A Ninput build that is given to anyone carries their licences
+  (`native/ninput/licenses/`): the player zip made with `riftstone package --plugins-only --ninput` puts
+  Ninput under `optional\ninput`, switched off until a player copies it, with those licences beside it.

@@ -89,6 +89,37 @@ class PngTest(unittest.TestCase):
         want = b"".join(plte[3 * k:3 * k + 3] + bytes([trns[k] if k < len(trns) else 255]) for k in idx)
         self.assertEqual(texcodec.read_png(make_png(7, 5, 3, 8, idx, plte, trns)), (7, 5, want))
 
+    def test_the_largest_sides_are_read(self):
+        # MAX_PNG (64 MiB of rows) was below a 4096x4096 RGBA PNG's (4 * 4096 + 1) * 4096 bytes, which
+        # encode takes and png() writes; 16-bit RGBA was refused from 2048x4096 up
+        side = texcodec.MAX_SIDE
+        self.assertEqual(texcodec.read_png(texcodec.png(side, side, bytes(4 * side * side)))[:2], (side, side))
+        ihdr = lambda w, h, d: SIG + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, d, 6, 0, 0, 0))   # noqa: E731
+        for w, depth in ((side // 2, 16), (side, 16)):
+            with self.assertRaises(RiftError) as cm:            # read, so its (damaged) data is looked at
+                texcodec.read_png(ihdr(w, side, depth) + chunk(b"IDAT", b"garbage!") + chunk(b"IEND", b""))
+            self.assertIn("damaged", str(cm.exception))
+
+    def test_a_colour_key_makes_its_pixels_transparent(self):
+        # tRNS names the one grey level or RGB colour that is transparent; it was ignored for both
+        alpha = lambda png: texcodec.read_png(png)[2][3::4]   # noqa: E731
+        self.assertEqual(alpha(make_png(2, 2, 0, 8, bytes([0, 7, 200, 7]), trns=struct.pack(">H", 7))),
+                         bytes([255, 0, 255, 0]))
+        rgb = bytes([1, 2, 3, 9, 9, 9, 1, 2, 3, 1, 2, 4])
+        self.assertEqual(alpha(make_png(2, 2, 2, 8, rgb, trns=struct.pack(">3H", 1, 2, 3))), bytes([0, 255, 0, 255]))
+        # 16-bit: the whole sample is compared, not the byte that is kept
+        g16 = struct.pack(">4H", 0x0107, 0x0100, 0x0107, 0xFFFF)
+        self.assertEqual(alpha(make_png(2, 2, 0, 16, g16, trns=struct.pack(">H", 0x0107))), bytes([0, 255, 0, 255]))
+        rgb16 = struct.pack(">6H", 1, 2, 3, 1, 2, 0x0103)
+        self.assertEqual(alpha(make_png(2, 1, 2, 16, rgb16, trns=struct.pack(">3H", 1, 2, 3))), bytes([0, 255]))
+        # a key no sample of the image's depth can equal keeps it opaque; one of the wrong size is refused
+        self.assertEqual(alpha(make_png(2, 2, 0, 8, bytes([7, 7, 1, 1]), trns=struct.pack(">H", 0x0107))), b"\xff" * 4)
+        with self.assertRaises(RiftError):
+            texcodec.read_png(make_png(2, 2, 2, 8, rgb, trns=struct.pack(">H", 1)))
+        # the colour itself is kept (the texture decides what a transparent pixel looks like)
+        self.assertEqual(texcodec.read_png(make_png(2, 1, 2, 8, rgb[:6], trns=struct.pack(">3H", 1, 2, 3)))[2],
+                         bytes([1, 2, 3, 0, 9, 9, 9, 255]))
+
     def test_refusals(self):
         good = make_png(4, 4, 6, 8, self.rand(64))
         ihdr = lambda w, h, d, c, i=0: SIG + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, d, c, 0, 0, i))

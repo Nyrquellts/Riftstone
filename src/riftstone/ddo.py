@@ -46,7 +46,7 @@ _STAGE_LIST = b"scr\\stage_list"
 # -- where the server's data lives ----------------------------------------------------------------
 def server_assets(game: Game) -> Path | None:
     """The asset folder the local DDO server reads: $RIFTSTONE_DDO_ASSETS, else the instance the DDO
-    toolkit (C:\\Dev\\DDO) runs (server.json -> server-<build>\\Arrowgene.Ddon.config.json AssetPath),
+    toolkit (<path>) runs (server.json -> server-<build>\\Arrowgene.Ddon.config.json AssetPath),
     else the server bundled with the client (nativePC\\Server\\Files\\Assets)."""
     if game.kind != "ddo":
         return None
@@ -57,14 +57,14 @@ def server_assets(game: Game) -> Path | None:
     build = None
     try:
         build = json.loads((home / "server.json").read_text(encoding="utf-8"))["build"]
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):     # a file that does not say: the defaults
         pass
     instances = ([home / f"server-{build}"] if build and build != "bundled" else []) + [home / "server"]
     for inst in instances:
         try:
             cfg = json.loads((inst / "Arrowgene.Ddon.config.json").read_text(encoding="utf-8-sig"))
             p = Path(cfg["AssetPath"])
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
             continue
         if p.is_dir():
             return p
@@ -76,7 +76,7 @@ def need_assets(game: Game) -> Path:
     p = server_assets(game)
     if p is None or not (p / SPAWN_FILE).is_file():
         raise RiftError("the local DDO server's asset folder was not found (set RIFTSTONE_DDO_ASSETS to its "
-                        "Files\\Assets folder, or set the server up with C:\\Dev\\DDO\\ddon.cmd server setup)")
+                        "Files\\Assets folder, or set the server up with <path> server setup)")
     return p
 
 
@@ -168,6 +168,54 @@ def client_enemy_names(game: Game, idx) -> dict[int, str]:
     return out
 
 
+_SPAWN_INTS = ("StageId", "LayerNo", "GroupId", "PositionIndex", "Lv")      # read from every row, with EnemyId
+_ENEMY_ID = re.compile(r"\s*(?:0[xX])?[0-9a-fA-F]{1,8}\s*")
+
+
+def _whole(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _enemy_id_ok(v) -> bool:
+    if isinstance(v, str):
+        return _ENEMY_ID.fullmatch(v) is not None
+    return _whole(v) and 0 <= v <= 0xFFFFFFFF
+
+
+def check_spawns(doc, src) -> list[str]:
+    """The enemy table's schema, after checking what world and encounter read: "schemas": {"enemies": [column
+    names]} with the columns they use, "enemies" a list of rows as long as the schema, those columns whole numbers
+    and EnemyId an id ("0x010100"), "dropsTables" a list.  A RiftError names the file and the first problem."""
+    def bad(why: str) -> RiftError:
+        return RiftError(f"{src}: not the server's enemy spawn table ({why})")
+
+    if not isinstance(doc, dict):
+        raise bad("not a JSON object")
+    schemas = doc.get("schemas")
+    schema = schemas.get("enemies") if isinstance(schemas, dict) else None
+    if not isinstance(schema, list) or not all(isinstance(c, str) for c in schema):
+        raise bad('"schemas": {"enemies": [...]} lists the columns by name')
+    missing = [c for c in (*_SPAWN_INTS, "EnemyId") if c not in schema]
+    if missing:
+        raise bad(f"the schema has no {', '.join(missing)}")
+    rows = doc.get("enemies")
+    if not isinstance(rows, list):
+        raise bad('"enemies" is a list of rows')
+    if not isinstance(doc.get("dropsTables", []), list):
+        raise bad('"dropsTables" is a list')
+    ints = [(c, schema.index(c)) for c in _SPAWN_INTS]
+    eid = schema.index("EnemyId")
+    for i, r in enumerate(rows):
+        if not isinstance(r, list) or len(r) != len(schema):
+            raise bad(f"row {i} is not a list of {len(schema)} values, one per column")
+        for c, k in ints:
+            if not _whole(r[k]):
+                raise bad(f"row {i}: {c} is {r[k]!r}, not a whole number")
+        if not _enemy_id_ok(r[eid]):
+            raise bad(f"row {i}: EnemyId is {r[eid]!r}, not an enemy id such as \"0x010100\"")
+    return list(schema)
+
+
 def load(game: Game, idx, assets: Path | None = None, spawn_file: Path | None = None) -> DdoWorld:
     """The server's spawns (from `spawn_file`, else the asset folder's) with client names.  A name table
     the client lacks or that does not read only costs the names: w.warnings says so, and enemies and
@@ -176,10 +224,9 @@ def load(game: Game, idx, assets: Path | None = None, spawn_file: Path | None = 
     src = spawn_file or assets / SPAWN_FILE
     try:
         doc = json.loads(src.read_text(encoding="utf-8"))
-        schema = list(doc["schemas"]["enemies"])
-    except (OSError, ValueError, KeyError, TypeError) as e:
+    except (OSError, ValueError, RecursionError) as e:      # RecursionError: nesting deeper than the decoder goes
         raise RiftError(f"{src}: not the server's enemy spawn table ({e})") from None
-    w = DdoWorld(assets, schema, doc)
+    w = DdoWorld(assets, check_spawns(doc, src), doc)
     try:
         w.enemies.update(client_enemy_names(game, idx))
     except RiftError as e:
@@ -298,11 +345,6 @@ def pick_enemy(w: DdoWorld, query: str) -> int:
                     f"say which by id, e.g. 0x{ids[0]:06X} (riftstone world enemy <id> --game ddo shows where it spawns)")
 
 
-def rows_where(w: DdoWorld, **match) -> list[list]:
-    cols = {k: w.col(k) for k in match}
-    return [r for r in w.rows if all(r[c] == match[k] for k, c in cols.items())]
-
-
 def enemy_id(row_value) -> int:
     return int(row_value, 16) if isinstance(row_value, str) else int(row_value)
 
@@ -354,7 +396,8 @@ def encounter(w: DdoWorld, stage: int, enemy: int, count: int, group: int | None
         new.append(row)
     at = w.rows.index(members[-1]) + 1
     w.rows[at:at] = new
-    notes = [f"{count} x {w.enemy_name(enemy)} added to {w.stage_name(stage)} (StageId {stage}), layer {layer}, "
+    # worded for a dry run too: the rows are only in memory here, and the caller says whether it wrote them
+    notes = [f"{count} x {w.enemy_name(enemy)} for {w.stage_name(stage)} (StageId {stage}), layer {layer}, "
              f"group {group}, which spawns {len(members)} already",
              (f"the group's layout has {points} spawn points ({len(used)} used by the server): new ones fill "
               f"{min(count, len(positions) - len(used))} unused point(s) first, then share"
@@ -449,10 +492,13 @@ def load_items(assets: Path) -> dict[int, dict]:
         lines = path.read_text(encoding="utf-8-sig").splitlines()
     except OSError as e:
         raise RiftError(f"the server's item list is missing ({e})") from None
+    if not lines or not lines[0].strip():
+        raise RiftError(f"{path}: the server's item list is empty (its first line names the columns: #ItemId,...)")
     head = lines[0].lstrip("#").split(",")
     out = {}
     for row in csv.reader(lines[1:]):
-        if row and row[0].strip().isdigit():
+        # an id: ASCII digits, at most 9 (str.isdigit() also takes '²', and int() refuses 4,300 digits)
+        if row and re.fullmatch(r"[0-9]{1,9}", row[0].strip()):
             out[int(row[0])] = dict(zip(head, row))
     return out
 
@@ -465,6 +511,46 @@ def find_items(items: dict[int, dict], query: str) -> list[int]:
     return sorted(exact or [i for i, r in items.items() if q in r.get("Name", "").lower()])
 
 
+def check_shops(shops, src) -> list:
+    """Shop.json as the commands read it: a list of {"ShopId": n, "Data": {"GoodsParamList": [{"ItemId": n, ...}]}}
+    (a goods entry's Unk7, which a new entry copies, a list).  A RiftError names the file and the first problem."""
+    def bad(why: str) -> RiftError:
+        return RiftError(f"{src}: not the server's shop list ({why})")
+
+    if not isinstance(shops, list):
+        raise bad("a list of shops")
+    for i, sh in enumerate(shops):
+        data = sh.get("Data") if isinstance(sh, dict) else None
+        goods = data.get("GoodsParamList") if isinstance(data, dict) else None
+        if not isinstance(sh, dict) or not _whole(sh.get("ShopId")) or not isinstance(goods, list):
+            raise bad(f'shop {i} is not {{"ShopId": n, "Data": {{"GoodsParamList": [...]}}}}')
+        for g in goods:
+            if not isinstance(g, dict) or not _whole(g.get("ItemId")) or not isinstance(g.get("Unk7", []), list):
+                raise bad(f'shop {sh["ShopId"]}: a good is {{"ItemId": n, ...}}, not {str(g)[:80]}')
+    return shops
+
+
+def check_drop_tables(spawn, src) -> list:
+    """EnemySpawn.json's drop tables as the commands read them: a list of {"id": n, "name": text, "items":
+    [[ItemId, ItemNum, MaxItemNum, Quality, IsHidden, DropChance], ...]} (the server's column order)."""
+    def bad(why: str) -> RiftError:
+        return RiftError(f"{src}: not the server's drop tables ({why})")
+
+    tables = spawn.get("dropsTables", []) if isinstance(spawn, dict) else None
+    if not isinstance(tables, list):
+        raise bad('"dropsTables" is a list')
+    for i, t in enumerate(tables):
+        if (not isinstance(t, dict) or not _whole(t.get("id")) or not isinstance(t.get("name", ""), str)
+                or not isinstance(t.get("items", []), list)):
+            raise bad(f'drop table {i} is not {{"id": n, "name": text, "items": [...]}}')
+        for it in t.get("items", []):
+            if (not isinstance(it, list) or len(it) != 6 or not _whole(it[0])
+                    or not isinstance(it[5], (int, float)) or isinstance(it[5], bool)):
+                raise bad(f"drop table {t['id']}: an item is [ItemId, ItemNum, MaxItemNum, Quality, IsHidden, "
+                          f"DropChance], not {str(it)[:80]}")
+    return tables
+
+
 def shop_add(shops: list, shop_id: int, item: int, price: int, stock: int) -> str:
     shop = next((s for s in shops if s.get("ShopId") == shop_id), None)
     if shop is None:
@@ -472,6 +558,11 @@ def shop_add(shops: list, shop_id: int, item: int, price: int, stock: int) -> st
     goods = shop["Data"]["GoodsParamList"]
     if any(g.get("ItemId") == item for g in goods):
         raise RiftError(f"shop {shop_id} already sells item {item}")
+    # the server's CDataGoodsParam reads Price as UInt32 and Stock as a byte (every shop in the game has 255)
+    if not 0 <= price <= 0xFFFFFFFF:
+        raise RiftError(f"--buy is a price of 0..4294967295 (the server's UInt32), not {price}")
+    if not 0 <= stock <= 255:
+        raise RiftError(f"--stock is 0..255 (the server reads it as a byte; the game's shops all have 255), not {stock}")
     new = dict(goods[-1]) if goods else {"Unk4": False, "Unk5": 0, "Unk6": 0, "Unk7": []}
     new.update({"Index": len(goods), "ItemId": item, "Price": price, "Stock": stock})
     new["Unk7"] = list(new.get("Unk7", []))
@@ -497,5 +588,8 @@ def drop_add(spawn: dict, table_id: int, item: int, chance: float, num: int = 1)
     if any(it[0] == item for it in t["items"]):
         raise RiftError(f"drop table {table_id} already has item {item}")
     t["items"].append([item, num, num, 0, False, round(chance, 4)])
-    users = sum(1 for r in spawn["enemies"] if r[spawn["schemas"]["enemies"].index("DropsTableId")] == table_id)
+    schema = spawn["schemas"]["enemies"]
+    if "DropsTableId" not in schema:                  # a table without the column: no row names a drop table
+        return f"drop table {table_id} ({t.get('name', '')}) now has {len(t['items'])} items"
+    users = sum(1 for r in spawn["enemies"] if r[schema.index("DropsTableId")] == table_id)
     return f"drop table {table_id} ({t.get('name', '')}) now has {len(t['items'])} items; {users} spawn row(s) use it"

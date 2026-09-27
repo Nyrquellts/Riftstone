@@ -1,6 +1,11 @@
+import itertools
 import os
+import random
 import struct
+import time
+import tracemalloc
 import unittest
+from unittest import mock
 
 import helpers  # noqa: F401 (sys.path)
 from riftstone import schedule, xfs
@@ -161,6 +166,19 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(moved.tracks[1].name, "HemiSphereLight2")      # names are text; the table is rebuilt
         schedule.build(moved)
 
+    def test_yaml_name_stays_in_its_comment(self):
+        # the resource name (and a zone's own Name) went into the header comment as it was: a newline in
+        # it began a YAML line of its own (a second 'riftstone:' key, which also fooled params' tag detection)
+        from riftstone import params
+        named = zon_type1()
+        named.name = "Sound\nriftstone: sdl/1"
+        for m in (sdl_ddda(), sdl_ddo(), zon_type1(), zon_type2(ddo=True), named):
+            raw = schedule.build(m)
+            y = schedule.to_yaml(m, "x\nriftstone: xfs/1\r\t\"#")
+            self.assertEqual(schedule.from_yaml(y), m)
+            self.assertEqual(schedule.yaml_to_bytes(y), raw)
+            self.assertEqual(params.yaml_to_resource(y), raw)
+
     def test_refusals(self):
         raw = schedule.build(sdl_ddda())
         k, v = struct.unpack_from("<II", raw, 0x18 + 2 * 24 + 16)                      # mGroup: 1 key, then values
@@ -182,6 +200,137 @@ class SchedulerTest(unittest.TestCase):
         with self.assertRaises(FormatError):
             schedule.build(first)
 
+    def test_overlapping_keys_refused_before_reading(self):
+        # each track's keys and values were only checked to lie in the file: 80 tracks of 65,535 keys, all at
+        # 0x18, were read in full (23.8 s, 467 MB) before the layout check refused them afterwards. The offsets
+        # the game's writer gives each track are now checked before any key is read.
+        head, rec = struct.Struct("<4sHHIIII"), struct.Struct("<BBHIIIII")
+        n, size = 80, 0x18 + 4 * 65535 + 1
+        data = bytearray(head.pack(b"SDL\0", 19, n, schedule.UNK08[19], 100, 0, size - 1))
+        for _ in range(n):
+            data += rec.pack(6, 0, 65535, 0, 0, 0, 0x18, 0x18)
+        data += bytes(size - len(data))
+        t0 = time.perf_counter()
+        with self.assertRaises(FormatError):
+            schedule.parse(bytes(data))
+        self.assertLess(time.perf_counter() - t0, 0.5)
+        raw = schedule.build(sdl_ddda())                                # the second keyed track moved by 4
+        at = 0x18 + 3 * 24 + 16
+        k, v = struct.unpack_from("<II", raw, at)
+        with self.assertRaises(FormatError):
+            schedule.parse(raw[:at] + struct.pack("<II", k + 4, v) + raw[at + 8:])
+
+    def test_a_text_is_read_once(self):
+        # every reference copied its text out of the file (4,000 values naming one 20 KB path took 81 MB for a
+        # 72 KB file); a text is read once per offset and every value naming it shares it
+        path = "p" * 100
+        tracks = [Track(1, name="Root"),
+                  Track(11, 128, 0, "mRes", keys=[(i, 0) for i in range(4000)], values=[(RES, path)] * 4000)]
+        raw = schedule.build(Scheduler(19, 100, 0, 0, 0, schedule.UNK08[19], tracks))
+        tracemalloc.start()
+        try:
+            sc = schedule.parse(raw)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(sc.tracks, tracks)
+        read = [v[1] for v in sc.tracks[1].values]
+        self.assertEqual(len({id(p) for p in read[2:]}), 1)             # after the writer's two copies, one
+        self.assertLess(peak, 4 << 20)
+
+    def test_expanded_texts_bounded(self):
+        # the YAML writes every reference's text in full: 4,000 values naming one 20 KB path (the writer keeps
+        # two copies) made 80 MB of YAML from a 72 KB file, and Studio's open would build it. Every reference
+        # is counted now and held to TEXT_LIMIT times the file (the game's files name at most 0.37 of theirs).
+        big = [Track(1, name="Root"),
+               Track(11, 128, 0, "mRes", keys=[(i, 0) for i in range(4000)], values=[(RES, "p" * 20000)] * 4000)]
+        sc = Scheduler(19, 100, 0, 0, 0, schedule.UNK08[19], big)
+        with mock.patch.object(schedule, "TEXT_LIMIT", 1 << 30):              # the file the writer makes
+            raw = schedule.build(sc)
+        self.assertLess(len(raw), 80000)
+        t0 = time.perf_counter()
+        with self.assertRaises(FormatError):
+            schedule.parse(raw)
+        self.assertLess(time.perf_counter() - t0, 0.5)
+        with self.assertRaises(FormatError):                                  # nor does build write it
+            schedule.build(sc)
+        # a key per frame naming a 50-byte path (the game's longest texts) is 7 times the file: kept
+        many = [Track(1, name="Root"),
+                Track(11, 128, 0, "mRes", keys=[(i, 0) for i in range(1000)], values=[(RES, "q" * 50)] * 1000)]
+        m = Scheduler(19, 100, 0, 0, 0, schedule.UNK08[19], many)
+        self.assertEqual(schedule.parse(schedule.build(m)), m)
+
+    def test_writer_search_is_not_quadratic(self):
+        # the writer searched the whole table for every text: 131,070 distinct short strings (a 1.7 MB file)
+        # took 16.9 s to parse and 7.2 s to build. The search is answered from an index now (0.8 s and 0.7 s;
+        # the bounds leave room for a slow machine).
+        words = [bytes(w).decode() for w in itertools.islice(itertools.product(b"abcdefghijklmnopqrstuvwxyz0123456789",
+                                                                               repeat=4), 2 * 65535)]
+        tracks = [Track(1, name="Root")] + [Track(12, 14, 0, f"m{t}", keys=[(i, 0) for i in range(65535)],
+                                                  values=words[65535 * t:65535 * (t + 1)]) for t in range(2)]
+        sc = Scheduler(19, 100, 0, 0, 0, schedule.UNK08[19], tracks)
+        t0 = time.perf_counter()
+        raw = schedule.build(sc)
+        t1 = time.perf_counter()
+        back = schedule.parse(raw)
+        t2 = time.perf_counter()
+        self.assertEqual(back, sc)
+        self.assertLess(t1 - t0, 3.0)
+        self.assertLess(t2 - t1, 3.0)
+
+    def test_writer_index_matches_the_plain_search(self):
+        # the index must give the offset the game's writer gives: the first place the text + NUL ends before
+        # the newest entry, suffixes of longer texts and texts across entries (a type id with a zero byte)
+        def plain(texts):
+            table, last, out = bytearray(), 0, []
+            for b in texts:
+                f = table.find(b + b"\0", 0, last)
+                if f < 0:
+                    f = last = len(table)
+                    table += b + b"\0"
+                out.append(f)
+            return out, bytes(table)
+
+        rng = random.Random(0x5D1)
+        for _ in range(400):
+            pool = []
+            for _ in range(rng.randint(1, 12)):
+                text = bytes(rng.choice(b"ab") for _ in range(rng.randint(0, 6)))
+                if rng.random() < 0.3:                                   # a resource: 4 bytes of type id first
+                    text = bytes(rng.choice(b"\0ab") for _ in range(4)) + text
+                pool.append(text)
+            texts = [rng.choice(pool) for _ in range(rng.randint(1, 40))]
+            st = schedule._Strings(texts)
+            got = [st.add(b) for b in texts]
+            self.assertEqual((got, bytes(st.table)), plain(texts), texts)
+
+    def test_suffix_texts_bounded(self):
+        # the writer reuses the tail of a longer text, so each of many tracks may name another suffix of one
+        # long text: here 1,000 suffixes of a 5,000-byte name, 5 MB of names from a 30 KB file. The texts
+        # read are held to TEXT_LIMIT times the file (the game's files name at most 0.37 of theirs).
+        long = "A" * 5000
+        tracks = [Track(2, name=long), Track(2, name="B")] + [Track(2, name=long[k:]) for k in range(1, 1000)]
+        sc = Scheduler(19, 100, 0, 0, 0, schedule.UNK08[19], tracks)
+        with mock.patch.object(schedule, "TEXT_LIMIT", 1 << 30):              # the file the writer makes
+            raw = schedule.build(sc)
+        self.assertLess(len(raw), 30000)
+        with self.assertRaises(FormatError):
+            schedule.parse(raw)
+        with self.assertRaises(FormatError):                                  # nor does build write it
+            schedule.build(sc)
+        ok = [Track(2, name=long), Track(2, name="B"), Track(2, name=long[1:])]      # one suffix is fine
+        self.assertEqual(schedule.parse(schedule.build(Scheduler(19, 1, 0, 0, 0, 0, ok))).tracks, ok)
+
+    def test_string_references_are_the_writers(self):
+        # a name or value the writer would store elsewhere is refused where it is read
+        raw = schedule.build(sdl_ddda())
+        sbase = struct.unpack_from("<I", raw, 0x14)[0]
+        name_at = 0x18 + 1 * 24 + 8                                      # track 1's name offset
+        off = struct.unpack_from("<I", raw, name_at)[0]
+        for bad in (off + 1, len(raw) - sbase, 0x7FFFFFFF):                # a suffix the writer would not use; past
+            with self.assertRaises(FormatError):
+                schedule.parse(raw[:name_at] + struct.pack("<I", bad) + raw[name_at + 4:])
+
     def test_yaml_refusals(self):
         y = schedule.to_yaml(sdl_ddda())
         for bad in (y.replace("FrameMax: 5000", "FrameMax: 16777216"),
@@ -197,6 +346,53 @@ class SchedulerTest(unittest.TestCase):
             self.assertNotEqual(bad, y)
             with self.assertRaises(ParamError):
                 schedule.from_yaml(bad)
+
+    def test_yaml_text_reads_as_parse_gives_it(self):
+        # {hex: ...} holding text stayed bytes in the model while parse gives text: name {hex: "526f6f74"}
+        # read as b'Root', parse(build(m)) as 'Root' (the same bytes, another model); so did text whose
+        # bytes decode to other characters ('¬' is stored as 81 CA, which reads back as '￢')
+        y, yz = schedule.to_yaml(sdl_ddda()), schedule.to_yaml(zon_type1())
+        for text, pick, want in (
+                (y.replace("name: Root", 'name: {hex: "526f6f74"}'), lambda m: m.tracks[0].name, "Root"),
+                (y.replace("name: Root", 'name: "¬"'), lambda m: m.tracks[0].name, "￢"),
+                (y.replace("value: x}", 'value: {hex: "78"}}'), lambda m: m.tracks[12].values[0], "x"),
+                (y.replace("path: effect\\efl\\ev\\x}", 'path: {hex: "41"}}', 1),
+                 lambda m: m.tracks[11].values[0], (RES, "A")),
+                (yz.replace("Name: OM", 'Name: {hex: "4f4d"}'), lambda m: m.name, "OM"),
+                (yz.replace("Name: OM", 'Name: {hex: "81ff"}'), lambda m: m.name, b"\x81\xff")):   # not text
+            self.assertNotIn(text, (y, yz))
+            m = schedule.from_yaml(text)
+            self.assertEqual(pick(m), want)
+            self.assertEqual(schedule.parse(schedule.build(m)), m)
+        for bad in (y.replace("name: Root", 'name: {hex: "526f6f74", text: Root}'),       # a field hex has not
+                    yz.replace("Name: OM", "Name: {hex: [4f]}")):
+            with self.assertRaises(ParamError):
+                schedule.from_yaml(bad)
+
+    def test_yaml_fields_are_not_dropped(self):
+        # raw_name was read on every track but only a track without a name keeps it: 'raw_name: 77' on the
+        # Root track was accepted and lost. A zone group's bounds without its grid were ignored.
+        y, yz = schedule.to_yaml(sdl_ddda()), schedule.to_yaml(zon_type1())
+        self.assertEqual(schedule.from_yaml(y.replace("  - kind: 4  # #7 spacer", "  - kind: 4\n    raw_name: 77"))
+                         .tracks[7].raw_name, 77)                      # a spacer keeps its field
+        for bad in (y.replace("    name: Root", "    name: Root\n    raw_name: 77"),
+                    yz.replace("    GroupGlobalLayoutIndex: []",
+                               "    GroupGlobalLayoutIndex: []\n    bounds: [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]")):
+            self.assertNotIn(bad, (y, yz))
+            with self.assertRaises(ParamError):
+                schedule.from_yaml(bad)
+
+    def test_yaml_long_hex_number(self):
+        # base 16 has no digit limit, but 3,572 hex digits are over 4,300 decimal ones: the range message
+        # printed the number and leaked int -> str's ValueError
+        big = "0x" + "f" * 3572
+        y, yz = schedule.to_yaml(sdl_ddda()), schedule.to_yaml(zon_type1())
+        for bad in (y.replace("FrameMax: 5000", "FrameMax: " + big), y.replace("version: 19", "version: -" + big),
+                    y.replace("type: rEffectList", "type: " + big, 1), yz.replace("mUnk0C: 3", "mUnk0C: " + big)):
+            self.assertNotIn(bad, (y, yz))
+            with self.assertRaises(ParamError) as cm:
+                schedule.from_yaml(bad)
+            self.assertLess(len(str(cm.exception)), 200)
 
     def _corpus(self, kind: str, want: dict):
         from riftstone import corpus, typemap
@@ -308,6 +504,32 @@ class ZoneTest(unittest.TestCase):
         tail.tail = [1]
         with self.assertRaises(FormatError):
             schedule.build(tail)
+
+    def test_zone_grid_without_cells_refused(self):
+        # a type 2 zone's grid of 0 x 1 cells parsed, but build refuses a grid without cells (no game file
+        # has one): the file could be read but not rebuilt or round-tripped
+        raw = schedule.build(zon_type2())
+        g = raw.index(b"grco")
+        sizes = raw.index(struct.pack("<III", 12, 3, 2)) + 4               # the header's grid sizes (3, 2)
+        bad = bytearray(raw)
+        bad[g + 40:g + 44] = struct.pack("<HH", 0, 1)                    # nx 0, nz 1
+        del bad[g + 46:g + 46 + 2 * 8]                                    # its two cells
+        bad[sizes:sizes + 8] = struct.pack("<II", 3, 0)
+        with self.assertRaises(FormatError):
+            schedule.parse(bytes(bad))
+        z = zon_type2()
+        z.grid.nx, z.grid.cells = 0, []
+        with self.assertRaises(FormatError):
+            schedule.build(z)
+
+    def test_tables_past_the_end_say_so(self):
+        # the bytes left for the layout bounds were worked out before the check that the tables fit: a
+        # unique-id count 100 too large said "-64 bytes before the tables fit neither 0 nor 12 layout bounds"
+        raw = schedule.build(zon_type2())
+        at = raw.index(struct.pack("<III", 12, 3, 2))
+        with self.assertRaises(FormatError) as cm:
+            schedule.parse(raw[:at] + struct.pack("<I", 112) + raw[at + 4:])
+        self.assertIn("run past the end", str(cm.exception))
 
     def test_yaml_refusals(self):
         y = schedule.to_yaml(zon_type1())

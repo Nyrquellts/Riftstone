@@ -18,6 +18,8 @@ from riftstone import arc, cli, lmt, mod, monsters, mrl, port, skins, studiofile
 from riftstone.errors import ParamError, RiftError
 from riftstone.index import Index
 
+setUpModule, tearDownModule = helpers.module_env("RIFTSTONE_HOME")
+
 MOD, MRL, TEX = typemap.BY_EXT["mod"], typemap.BY_EXT["mrl"], typemap.BY_EXT["tex"]
 
 

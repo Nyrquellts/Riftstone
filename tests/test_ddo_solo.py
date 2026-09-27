@@ -473,6 +473,25 @@ class ModTest(unittest.TestCase):
             self.assertTrue((Path(d) / "outside.txt").exists())
             self.assertTrue((root / "server" / ddo_solo.SCRIPT).exists())
 
+    def test_a_hand_edited_record_is_read_as_far_as_it_goes(self):
+        # was: TypeError ({"files": 5} or null), an unhashable list ({"files": [["a"]]}) and RecursionError (deep
+        # nesting) out of write, before anything was written
+        settings = "server/scripts/settings/GameServerSettings.csx"
+        deep = 100_000
+        for bad in ('{"files": 5}', '{"files": null}', '{"files": [["a"]]}', '[["a"]]', '"files"', "7",
+                    "[" * deep + "]" * deep, '{"files": ' + "[" * deep + "]" * deep + "}",
+                    json.dumps({"files": [["a"], {"b": 1}, 5, settings]})):
+            with self.subTest(bad=bad[:40]), tempfile.TemporaryDirectory() as d:
+                root = Path(d) / "Solo Balance"
+                ddo_solo.write(root, ddo_solo.plan(sources()))
+                (root / ddo_solo.RECORD).write_text(bad, encoding="utf-8")
+                p = ddo_solo.plan(sources(), settings=())
+                self.assertEqual(sorted(ddo_solo.write(root, p)), sorted(p.files))
+                rec = json.loads((root / ddo_solo.RECORD).read_text(encoding="utf-8"))
+                self.assertEqual(sorted(rec["files"]), sorted(p.files))
+                # the one path the record still names is this generator's own output: taken out as usual
+                self.assertEqual((root / settings).exists(), settings not in bad)
+
     def test_refuses_a_dark_arisen_mod(self):
         with tempfile.TemporaryDirectory() as d:
             m = mod.Mod.create(Path(d) / "M", "M", game="ddda")

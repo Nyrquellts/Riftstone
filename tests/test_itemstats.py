@@ -14,6 +14,8 @@ from riftstone.game import Game
 from riftstone.index import Index
 from riftstone.mod import Mod
 
+setUpModule, tearDownModule = helpers.module_env("RIFTSTONE_HOME")
+
 ITEMLV = typemap.BY_EXT["itemlv"]
 F32 = lambda x: struct.unpack("<I", struct.pack("<f", x))[0]  # noqa: E731
 

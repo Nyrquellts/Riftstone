@@ -71,6 +71,25 @@ class MissionTest(unittest.TestCase):
         with self.assertRaises(RiftError):
             mission.parse("not json")
 
+    def test_nesting_deeper_than_the_decoder_is_refused(self):
+        """json.loads raises RecursionError, not ValueError, past its depth: it escaped mission.parse (riftstone
+        dungeon --mission FILE)."""
+        for text in ("[" * 100_000, '{"a":' * 100_000):
+            with self.assertRaises(RiftError):
+                mission.parse(text)
+
+    def test_names_are_whole_words(self):
+        """re.match with "$" took a name ending in a newline ("D\\n"): a rule, a symbol and a start of more than
+        a word are refused, and so is a start that is a side rule (no beat could be on the main path)."""
+        doc = {"format": mission.FORMAT, "start": "D", "rules": {"D": [["Fight", "Boss"]]}}
+        for bad in ({"rules": {"D\n": [["Fight", "Boss"]]}, "start": "D\n"},
+                    {"rules": {"D": [["Fight", "Boss"]], "E\n": [["Fight"]]}},
+                    {"rules": {"D": [["Fight", "E\n"]], "E\n": [["Boss"]]}},
+                    {"start": "D\n"}, {"start": "??D"}, {"start": "?D"}):
+            with self.assertRaises(RiftError, msg=repr(bad)):
+                mission.grammar(dict(doc, **bad))
+        self.assertEqual(mission.grammar(doc).start, "D")
+
 
 if __name__ == "__main__":
     unittest.main()

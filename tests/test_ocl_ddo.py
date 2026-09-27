@@ -272,6 +272,16 @@ class OclDdoTest(unittest.TestCase):
             with self.assertRaises(ParamError, msg=i):
                 ocl_ddo.yaml_to_bytes(t, "bad.yaml")
 
+    def test_huge_numbers_are_refused_in_a_short_message(self):
+        # a hex number thousands of digits long parses; writing it in decimal for the message raised
+        # ValueError ("Exceeds the limit (4300 digits)")
+        good = ocl_ddo.to_yaml(sample())
+        for value in ("0x" + "F" * 3600, "9" * 5000):
+            for text in (f"riftstone: ocl-ddo/1\npad: {value}\n", good.replace("mJnt0: 4", f"mJnt0: {value}", 1)):
+                with self.assertRaises(ParamError) as cm:
+                    ocl_ddo.yaml_to_bytes(text, "t.yaml")
+                self.assertLess(len(str(cm.exception)), 200)
+
     def test_yaml_hostile_text(self):
         good = ocl_ddo.to_yaml(sample())
         rng = random.Random(7)

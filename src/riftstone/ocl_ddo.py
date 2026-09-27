@@ -432,15 +432,16 @@ def _scalar(node, what: str, where):
 
 
 def _int(node, what: str, t: str, source) -> int:
+    from .params import shown
     where = _where(node, source)
     text = _scalar(node, what, where)
     try:
         v = int(text, 0)
     except ValueError:
-        raise ParamError(f"{what} must be a whole number, not {text!r}", *where) from None
+        raise ParamError(f"{what} must be a whole number, not {shown(text)!r}", *where) from None
     lo, hi = _RANGE[t]
     if not lo <= v <= hi:
-        raise ParamError(f"{what}: {v} is out of range for a {t} ({lo}..{hi})", *where)
+        raise ParamError(f"{what}: {shown(text)} is out of range for a {t} ({lo}..{hi})", *where)
     return v
 
 

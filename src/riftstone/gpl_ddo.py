@@ -69,6 +69,7 @@ import struct
 from dataclasses import dataclass, field
 
 from .errors import FormatError, ParamError
+from .params import shown, shown_value
 
 MAGIC = b"gpl\0"
 VERSION = 70
@@ -294,7 +295,7 @@ def _pack(out: bytearray, t: str, v, name: str) -> None:
                 raise ParamError(f"{name}: 3 numbers, not {len(v)}")
             out += struct.pack("<3I", *v)
     except struct.error:
-        raise ParamError(f"{name} {v!r} does not fit its field ({t})") from None
+        raise ParamError(f"{name} {shown_value(v)} does not fit its field ({t})") from None
 
 
 def _name_bytes(v) -> bytes:
@@ -318,7 +319,8 @@ def _write_shape(out: bytearray, s: dict) -> None:
     _pack(out, "s32", kind, "type")
     if kind:
         if kind not in ZONES:
-            raise ParamError(f"area-shape type {kind} is not one DDO.exe loads ({', '.join(map(str, [0, *ZONES]))})")
+            raise ParamError(f"area-shape type {shown_value(kind)} is not one DDO.exe loads "
+                             f"({', '.join(map(str, [0, *ZONES]))})")
         for name, t in _ZONE_HEAD + ZONES[kind][1]:
             _pack(out, t, s[name], name)
 
@@ -331,7 +333,7 @@ def _write_group(out: bytearray, g: dict) -> None:
     for name, lo, width in _BITS:
         v = g[name]
         if not 0 <= v < 1 << width:
-            raise ParamError(f"{name} {v} does not fit its {width} bit(s) (0..{(1 << width) - 1})")
+            raise ParamError(f"{name} {shown_value(v)} does not fit its {width} bit(s) (0..{(1 << width) - 1})")
         word |= v << lo
     out += struct.pack("<II", word, len(g["mLayoutIDArray"]))
     for c in g["mLayoutIDArray"]:
@@ -374,7 +376,7 @@ def _build(gpl: GplDdo) -> bytes:
         out += struct.pack(f"<II{SLOTS}II", VERSION, SLOTS, *gpl.mGroupList, len(gpl.groups))
     except struct.error:
         bad = next((v for v in gpl.mGroupList if not (isinstance(v, int) and 0 <= v <= 0xFFFFFFFF)), None)
-        raise ParamError(f"the mGroupList slot {bad!r} does not fit a u32") from None
+        raise ParamError(f"the mGroupList slot {shown_value(bad)} does not fit a u32") from None
     if gpl.groups:
         out += struct.pack("<9I", *pool_counts(gpl.groups))
         for g in gpl.groups:
@@ -483,7 +485,7 @@ class _Yaml:
             raise self.err(f"'{key}' must be a whole number, not {sc.text!r}", sc) from None
         lo, hi = _RANGE[t]
         if not lo <= v <= hi:
-            raise self.err(f"'{key}' {v} does not fit a {t} ({lo}..{hi})", sc)
+            raise self.err(f"'{key}' {shown(sc.text)} does not fit a {t} ({lo}..{hi})", sc)
         return v
 
     def f32(self, node, key: str) -> int:

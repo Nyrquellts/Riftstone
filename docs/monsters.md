@@ -137,9 +137,10 @@ separate part models. Every enemy that wears the same model file changes with it
 goblin model sits in `em0100` (Goblins), `em0103` (Greater Goblins) and two event archives, and the
 Hobgoblins' and Grimgoblins' own full-detail materials (`e0101_a`, `e0102_a`) are made for it.
 
-`--as-skin N` (chimera only) writes skin `sNN` instead, through `skins.py` and `tools/ddo_skins.py` (which
-now reads DDO through Riftstone's own ARCC reader, the `ddon` toolkit as a fallback). Only placements marked
-with that skin change, and it needs the `enemy_skins` plugin.
+`--as-skin N` (chimera only) writes skin `sNN` instead, through `skins.py` and `ddoskins.py` (which reads DDO
+through Riftstone's own ARCC reader, the `ddon` toolkit as a fallback). Only placements marked with that skin
+change, and it needs the `enemy_skins` plugin. Every conversion records its recipe in the mod
+(`riftstone-sources.json`): a package carries the recipe, never the converted files (`docs/legal.md`).
 
 ### Converted and built (2026-09-25, scratch mods, not installed)
 

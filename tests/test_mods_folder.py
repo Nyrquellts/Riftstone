@@ -14,6 +14,8 @@ from riftstone import cli, install, mod, studio
 from riftstone.errors import RiftError
 from riftstone.game import Game
 
+setUpModule, tearDownModule = helpers.module_env("RIFTSTONE_HOME")
+
 
 class ModsFolderTest(unittest.TestCase):
     def setUp(self):
@@ -131,8 +133,11 @@ class ModsFolderTest(unittest.TestCase):
         self.assertFalse((self.folder / "Local").exists())
 
     def test_mods_lists_the_folder_and_what_is_installed(self):
+        # mod entries as install.apply writes them (load_state refuses a record whose entries lack these)
         state = {"schema": install.STATE_SCHEMA, "archives": {},
-                 "mods": [{"path": str(self.folder / "Harder Goblins")}, {"path": str(self.base / "Old Mod")}]}
+                 "mods": [{"path": str(self.folder / "Harder Goblins"), "name": "Harder Goblins", "version": "0.1.0",
+                           "priority": 0},
+                          {"path": str(self.base / "Old Mod"), "name": "Old Mod", "version": "0.1.0", "priority": 1}]}
         g = Game(self.game)
         g.state_dir.mkdir(parents=True)
         (g.state_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")

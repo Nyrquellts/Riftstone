@@ -39,7 +39,7 @@ it cannot take the `xinput1_3.dll` name for either game (DDDAFix ships it as `wi
 | 1 | **Proxy adapter** (xinput1_3 / dinput8 / version, user-selectable) | **Built.** Three DLLs from one core; xinput1_3 is the base (both games import it by ordinal). Exports match the system DLL and forward to it. |
 | 2 | **D3D9 / display arbiter** — one `Reset` hook, broadcast lost/reset to plugins | **Built.** Hooks `Direct3DCreate9` → `CreateDevice` → `Reset`; brackets each reset with lost/reset broadcasts. Proven offline against a real D3D9 device. Follows the Riftstone loader's `[d3d9] chain` (DXVK's `d3d9.dll` in `riftstone\dxvk`, `docs/runtime.md`): that DLL's `Direct3DCreate9` is hooked too, so the broadcasts reach the chained device (`test/chain_test.cpp`, with the loader's stand-in DLL). |
 | 3 | **Modular plugin loader** — a plugins folder, isolated, deterministic order | **Built.** The core loads `<game>\ninput\plugins\*.dll/*.asi` in name order and gives each the SDK handshake. Separate from the Riftstone loader's own generic `.asi` loading. |
-| 4 | **Input multiplexer** — XInput polling, hotkeys, remaps/macros | **Built.** The proxy's `XInputGetState` wrapper feeds every polled frame through the engine: hotkey chords fire plugin callbacks (rising edge, per slot) and transforms rewrite the pad the game reads. Guide button / Elite paddles need `XInputGetStateEx`/HID — future. |
+| 4 | **Input multiplexer** — XInput polling, hotkeys, remaps/macros | **Built.** The proxy's `XInputGetState` wrapper feeds every polled frame through the engine: hotkey chords fire plugin callbacks (rising edge, per slot) and transforms rewrite the pad the game reads. The poll is sourced from `XInputGetStateEx`, so the **Guide button** (`NINPUT_GAMEPAD_GUIDE`) is bindable; it's cleared before the game sees the pad. Elite paddles need vendor HID — future. |
 | 5 | **Shared NYR engine API** — `set_enemy_cap`, shadows, LODs… | **Built and wired.** Capability provider registry (core never does a guessed write). `enemy_cap` registers `set_enemy_cap` (apply-once, byte-verified) and `lod_tuner` registers `set_lod_distance_multiplier` (runtime-adjustable). Both plugins live in this worktree and still build standalone; their in-game effect stays UNKNOWN until launched. |
 | 6 | **Conflict-free hook registry** (SafetyHook) | **Built and proven** — `src/hook_registry.*`, 13/13 offline checks. |
 
@@ -78,6 +78,11 @@ python native\ninput\deploy.py install      rem  status | uninstall  also
 
 Then launch DDDA and walk through **`docs/in-game-verification.md`** — the checklist that moves each
 pillar from harness-verified to in-game verified (and the fullscreen/alt-tab crash test).
+
+Players get it in Riftstone's player zip (`riftstone package --plugins-only --ninput`): `optional\ninput\` holds
+`xinput1_3.dll`, a README and the licences of the code it links in (`licenses/`: SafetyHook, Zydis, Zycore).
+Nothing loads it until the player copies `xinput1_3.dll` next to `DDDA.exe`: it is experimental, and its in-game
+behaviour stays UNKNOWN until someone plays with it.
 
 To place things by hand instead: copy the personality you want next to `DDDA.exe`, renamed to its
 slot name, and drop plugins in `<game>\ninput\plugins\`:

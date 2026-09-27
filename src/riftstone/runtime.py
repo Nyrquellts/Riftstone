@@ -302,8 +302,14 @@ def list_reports(logs: Path) -> list[dict]:
     return out
 
 
+# A number the loader writes has at most 9 digits; a longer one (damaged text) is not read: int() refuses
+# more than 4,300 digits.
+_NUM = r"(?<!\d)(\d{1,9})(?!\d)"
+
+
 def _mb(text: str) -> int | None:
-    m = re.search(r"(\d+)\s*MB", text)
+    """The first number of a memory line ("42 MB (free in all: 146 MB)" -> 42)."""
+    m = re.match(r"\s*" + _NUM + r"\s*MB", text)
     return int(m.group(1)) if m else None
 
 
@@ -342,7 +348,7 @@ def parse_report(text: str) -> dict:
             elif head == "safe mode":
                 r["safe_mode"] = line[12:].strip().startswith("ON")
             elif head == "stage":
-                m = re.match(r"-?\d+", line[12:].strip())
+                m = re.match(r"-?\d{1,9}(?!\d)", line[12:].strip())
                 r["stage"] = int(m.group(0)) if m else None
             elif head == "exception":
                 m = re.match(r"0x([0-9a-fA-F]+) (.+?) at (0x[0-9a-fA-F]+) \((.*)\)$", line[12:].strip())
@@ -368,7 +374,7 @@ def parse_report(text: str) -> dict:
             elif s.startswith("last files opened"):
                 section = "files"
             elif s.startswith("files the game looked for"):
-                m = re.search(r":\s*(\d+)\s*$", s)
+                m = re.search(r":\s*" + _NUM + r"\s*$", s)
                 r["missing_count"] = int(m.group(1)) if m else 0
                 section = "missing"
             elif s.startswith("the game stopped with this message"):
@@ -390,7 +396,7 @@ def parse_report(text: str) -> dict:
             if m:
                 r["objects"].append({"register": m.group(1), "address": m.group(2), "class": m.group(3)})
         elif section == "stack":
-            m = re.match(r"#(\d+) (0x[0-9a-fA-F]+)\s+(\S+)(?:\s+<- plugin (.+))?$", s)
+            m = re.match(r"#(\d{1,9}) (0x[0-9a-fA-F]+)\s+(\S+)(?:\s+<- plugin (.+))?$", s)
             if m:
                 r["stack"].append({"frame": int(m.group(1)), "address": m.group(2), "where": m.group(3),
                                    "plugin": m.group(4)})
@@ -402,7 +408,7 @@ def parse_report(text: str) -> dict:
             key, _, rest = s.partition("  ")
             key = key.strip()
             if key == "address space used":
-                nums = re.findall(r"(\d+) MB", rest)
+                nums = re.findall(_NUM + r" MB", rest)
                 if len(nums) >= 2:
                     r["memory"]["used_mb"], r["memory"]["total_mb"] = int(nums[0]), int(nums[1])
             elif key == "largest free block":
@@ -467,7 +473,7 @@ def _mods_by_archive(game_root: Path | None) -> dict[str, list[str]]:
     try:
         state = json.loads((Path(game_root) / "riftstone" / "state.json").read_text(encoding="utf-8"))
         return {k.lower(): list(v.get("mods", [])) for k, v in state.get("archives", {}).items()}
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, TypeError, RecursionError):     # a damaged record: nothing to add
         return {}
 
 
@@ -479,7 +485,7 @@ def _installed_mod_roots(game_root: Path | None) -> list[tuple[str, Path]]:
     try:
         state = json.loads((Path(game_root) / "riftstone" / "state.json").read_text(encoding="utf-8"))
         return [(m.get("name") or Path(m["path"]).name, Path(m["path"])) for m in state.get("mods", []) if m.get("path")]
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError):
         return []
 
 
@@ -618,6 +624,48 @@ def explain(report: dict, game_root: Path | None = None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------
+# ini files, as the loader and the plugins read them
+
+# They read their inis with GetPrivateProfileStringW, which reads a file without a UTF-16 mark in the ANSI
+# code page, one with a UTF-8 mark included, and the loader writes runtime-state.ini with
+# WritePrivateProfileStringW, in the code page (measured on Windows 11, code page 1252: a UTF-8 "ä" reads
+# as "Ã¤"; a UTF-8 mark hides the first section).  Riftstone reads and writes every such ini in it too.
+INI_ENCODING = "mbcs"
+# A file that starts with a UTF-16 (little-endian) mark Windows reads as UTF-16, every character, and
+# WritePrivateProfileStringW keeps it UTF-16 (measured the same way: "Spielstände 日本" reads back whole).
+INI_UTF16 = b"\xff\xfe"
+
+
+def ini_text(raw: bytes) -> str:
+    """An ini's bytes as the loader and the plugins read them: UTF-16 after its mark, else the code page."""
+    if raw.startswith(INI_UTF16):
+        return raw[2:].decode("utf-16-le", "replace")
+    return raw.decode(INI_ENCODING, "replace")
+
+
+def ini_bytes(text: str, like: bytes = b"") -> bytes:
+    """A whole ini written as Windows writes one: CRLF line ends, in the code page ('?' for a character it lacks:
+    only a byte that did not decode can bring one), or as UTF-16 behind its mark when `like`, the file it
+    replaces, is one."""
+    text = text.replace("\n", "\r\n")
+    if like.startswith(INI_UTF16):
+        return INI_UTF16 + text.encode("utf-16-le", "replace")
+    return text.encode(INI_ENCODING, "replace")
+
+
+def ini_value(value: str, key: str, utf16: bool = False) -> bytes:
+    """A value a person typed, as an ini holds it: in UTF-16 for a UTF-16 file, else in the code page (refused
+    when the code page lacks one of its characters)."""
+    try:
+        return value.encode("utf-16-le" if utf16 else INI_ENCODING)
+    except UnicodeEncodeError:
+        if utf16:
+            raise RiftError(f"{key}: {value!r} is not text that can be written") from None
+        raise RiftError(f"{key} holds only characters of this PC's Windows code page, which the loader and its "
+                        f"plugins read their settings in; {value!r} has others") from None
+
+
+# ---------------------------------------------------------------------------------------------
 # safe mode and quarantine (the loader's runtime-state.ini)
 
 def _state_ini(game_root: Path) -> Path:
@@ -628,10 +676,29 @@ def _read_ini(path: Path) -> configparser.ConfigParser:
     cp = configparser.ConfigParser(interpolation=None, strict=False)
     cp.optionxform = str
     try:
-        cp.read_string(path.read_text(encoding="utf-8-sig", errors="replace"))
+        cp.read_string(ini_text(path.read_bytes()))     # the loader writes it: the code page (ini_text)
     except (OSError, configparser.Error):
         pass
     return cp
+
+
+def plugin_key(name: str) -> str:
+    """A plugin's key in runtime-state.ini as the loader (0.4.1, stability.cpp PluginKey) writes it: a plain ini
+    key as it is; any other name ('=' in it, a leading ; # [ ~ or blank, a trailing blank, anything outside
+    printable ASCII) as '~' and the hex of its lower-case UTF-8."""
+    plain = bool(name) and name[0] not in ";#[~ \t" and name[-1] not in " \t" \
+        and all(0x20 <= ord(c) < 0x7F and c != "=" for c in name)
+    return name if plain else "~" + name.lower().encode("utf-8", "surrogatepass").hex()
+
+
+def plugin_name(key: str) -> str:
+    """The plugin file a runtime-state.ini key names ('~' and hex back to its name; any other key as it is)."""
+    if re.fullmatch(r"~(?:[0-9a-f]{2})+", key):
+        try:
+            return bytes.fromhex(key[1:]).decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    return key
 
 
 def runtime_state(game_root: Path) -> dict:
@@ -642,7 +709,9 @@ def runtime_state(game_root: Path) -> dict:
 
     session, safe = sec("session"), sec("safe_mode")
     return {"session": session, "last_session": sec("last_session"), "safe_mode": safe.get("on", "0").strip() == "1",
-            "quarantine": sorted(sec("quarantine")), "strikes": sec("strikes"),
+            # plugin names as they are, not the loader's ~hex keys for unusual ones
+            "quarantine": sorted(plugin_name(k) for k in sec("quarantine")),
+            "strikes": {plugin_name(k): v for k, v in sec("strikes").items()},
             "last_clean": session.get("clean", "1").strip() == "1", "loader": session.get("loader")}
 
 
@@ -653,7 +722,7 @@ def _write_ini(path: Path, cp: configparser.ConfigParser) -> None:
     cp.write(buf, space_around_delimiters=False)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(buf.getvalue(), encoding="utf-8")
+    tmp.write_bytes(ini_bytes(buf.getvalue()))
     os.replace(tmp, path)
 
 
@@ -672,14 +741,18 @@ def safe_mode_off(game_root: Path) -> bool:
 
 
 def release_plugin(game_root: Path, name: str) -> bool:
-    """Take a plugin out of quarantine.  Writes runtime-state.ini."""
+    """Take a plugin out of quarantine (by its file name; the loader's ~hex key works too).  Writes
+    runtime-state.ini."""
     path = _state_ini(game_root)
     cp = _read_ini(path)
     found = False
+    # Windows matches ini keys ignoring case; an older loader wrote every name as it is
+    want = {name.lower(), plugin_name(name).lower()}
     for sec in ("quarantine", "strikes", "strikes_file"):
-        if cp.has_section(sec) and cp.has_option(sec, name):
-            cp.remove_option(sec, name)
-            found = found or sec == "quarantine"
+        for key in cp.options(sec) if cp.has_section(sec) else ():
+            if key.lower() in want or plugin_name(key).lower() in want:
+                cp.remove_option(sec, key)
+                found = found or sec == "quarantine"
     if found:
         _write_ini(path, cp)
     return found
@@ -896,6 +969,20 @@ def _digest(path: Path) -> str | None:
         return None
 
 
+_BACKUP_NAME = re.compile(r"\d{8}-\d{6}(-[\w-]+)?")          # the stamp a backup folder is named by
+
+
+def _backups(account: Path) -> list[Path]:
+    """An account's backup folders, oldest first: only the stamp-named folders, never a link or junction.  A
+    folder of the owner's own there is not a backup: it was counted as the newest, and pruned."""
+    try:
+        return sorted((d for d in account.iterdir() if _BACKUP_NAME.fullmatch(d.name) and d.is_dir()
+                       and not d.is_symlink() and not getattr(d, "is_junction", lambda: False)()),
+                      key=lambda d: d.name)
+    except OSError:
+        return []
+
+
 def list_save_backups(root: Path | None = None) -> list[dict]:
     """Backups under %LOCALAPPDATA%\\Riftstone\\saves\\DDDA, newest first."""
     root = root or save_backup_root()
@@ -905,9 +992,7 @@ def list_save_backups(root: Path | None = None) -> list[dict]:
     except OSError:
         return []
     for account in accounts:
-        for b in account.iterdir():
-            if not b.is_dir() or not re.fullmatch(r"\d{8}-\d{6}(-[\w-]+)?", b.name):
-                continue
+        for b in _backups(account):
             files = [f for f in b.iterdir() if f.is_file()]
             out.append({"account": account.name, "stamp": b.name, "path": b, "files": len(files),
                         "size": sum(f.stat().st_size for f in files),
@@ -930,7 +1015,7 @@ def backup_saves(remotes: list[Path] | None = None, root: Path | None = None, ke
         # a save outside Steam's userdata is filed as "other", as the save_backup plugin files it
         account = remote.parent.parent.name if remote.parent.name == DDDA_APP else "other"
         target = root / account
-        existing = sorted((d for d in target.iterdir() if d.is_dir()), key=lambda d: d.name) if target.is_dir() else []
+        existing = _backups(target)
         if existing and _digest(existing[-1] / "DDDA.sav") == digest:
             continue
         dest = target / (stamp or time.strftime("%Y%m%d-%H%M%S"))

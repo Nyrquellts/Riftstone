@@ -472,7 +472,12 @@ named, and rebuild byte for byte, binary and YAML (`riftstone: lot/2`)**; 48,424
 copy-then-remove restores every file, so records can be added and removed in all of them. The record id
 is an id, not a position (a 0-based run in 3,281 files, another start in 1,023, not consecutive in 615):
 a copy takes the largest + 1, a removal renumbers nothing, and ids stay in 0..1023, the loader's
-id table. Mods holding the earlier `lot/1` YAML (the file in hex plus the placements found) still load.
+id table. The largest + 1 counts the ids the record's group uses in its other layouts and the game's own
+ids of the layout (even ones a mod removed: a machine of the game may name them), since the game finds a
+placement by group and id and every group in the game uses each id once across its layouts; for an enemy
+group, whose kill record keeps one bit per id and wraps past 31 (`docs/enemy-waves.md`), the smallest free
+id under 32 comes first when the largest + 1 is not under it (`modfiles.group_ids`, `lot.free_id`). Mods
+holding the earlier `lot/1` YAML (the file in hex plus the placements found) still load.
 
 The file name says whose placements these are: `st<S>_<X>m<Z>n_<t><N>` is group N of `st<S>_<t>.gpl`
 in map cell (X, Z) -- the name the engine itself builds (0x01562268); see `docs/world-map.md`.
@@ -492,9 +497,11 @@ creator's pack), and its body lists that archive's contents:
 Measured (`check_corpus --only arcs`): all 1,038 rebuild byte for byte; 1,034 list their archive's
 directory exactly. Two in vanilla do not (older lists of `om8505` in some stage packs lack 7 quest-text
 files added later; `om11001`'s hashes a differently spelled effect name), so the game already lives
-with out-of-date lists; what the engine uses them for is UNKNOWN. This is the archive dependency
-graph: enemies pull in their projectile (shell) archives, stage packs their object archives
-(`riftstone world deps <archive>` shows both directions).
+with out-of-date lists; the other two, in stage802 and stage804, reference archives the game does not
+ship (`id\credit_02\credit2`, `id\DDN\DDNcredit_01\creditDDN`). More of either than those counts fails
+the check (`ARCS_MEASURED`, 2026-09-26); what the engine uses the lists for is UNKNOWN. This is the
+archive dependency graph: enemies pull in their projectile (shell) archives, stage packs their object
+archives (`riftstone world deps <archive>` shows both directions).
 
 ## GPL -- enemy group placement (`src/riftstone/gpl.py`)
 
@@ -884,14 +891,14 @@ A packed little-endian stream, read field by field:
 
 ```
 mCoreHeader     "NAV\0", u32 0x21, u32 0 (every file), u32 slots of mpNodeBuffer (all triangles' lists)
-mName           u32 n, then n + 1 bytes ending in NUL ("new Navigation" in 38 of 41)
-counts          u32 vertices, u32 triangles (mNumberOfNode), u32 node infos (0 everywhere), u8 1 = extras
+mName           u32 n, then n characters and a NUL, n <= 255 ("new Navigation" in 38 of 41)
+counts          u32 vertices, u32 triangles (mNumberOfNode), u32 node infos (0 everywhere), u8 1 = extras (else 0)
 vertex[]        float3 position (cm); with the extras u8 mpNearWall and u16 mpWallDistance (0, 0 everywhere)
 triangle[]      s32 own index, u32 n + u32 attributes (one bitfield: 0 on 95%), u8 flag (0),
                 float3 (0, 0, 1) and f32 (0) everywhere, u8 n + u32 areas (none), u32 n + s32 corners
                 (three vertex indices), u32 n + n links of u32 neighbour, u32 0, u32 edge (0..2),
                 f32 cost, f32 0, f32 0
-hierarchy       u16 areas; each: u16 id, u32 n + name, u32, u32 geometries of u8 kind (0 box: float3 min,
+hierarchy       u16 areas; each: u16 id, u32 n + name (as mName), u32, u32 geometries of u8 kind (0 box: float3 min,
                 max; 1 oriented box: float3 extent + 4 x float4; 2 sphere: f32 radius, float3 centre;
                 another kind: nothing), u16 first triangle, u16 triangles, u16 parent, u8 n + children,
                 u8 n + links; then u16 mNumberOfTotalAreaChild, u16 mNumberOfTotalAreaLink
@@ -911,6 +918,19 @@ Measured over every file:
   them), so `nav.parse` refuses a file where they differ, and a vertex, neighbour or tree entry that points
   past its list.
 - **One area everywhere:** `root`, one box around the mesh, triangles 0.., parent 0xFFFF.
+- **Names:** the loader does not copy n + 1 bytes: its string reader (0x00CFEE30) reads up to the first NUL,
+  whatever n says, and stores at most n characters (`4D 3B FD 73 04 88 04 1F 47` at `0x00CFEE62`, looping
+  until the NUL: `84 C9 75 D2` at `0x00CFEE8D`). The buffer is 256 bytes on the reader's stack: the mesh's
+  name goes to `esp + 0x60` of a 0x160-byte frame (`81 EC 54 01 00 00` at `0x01099106`, `8D 44 24 64` at
+  `0x0109911F`, the call `E8 05 5D C6 FF` at `0x01099126`), an area's to `esp + 0x0C` below a local at
+  `+0x10C` (`8D 44 24 10` at `0x011FB8F7`, `E8 2D 35 B0 FF` at `0x011FB8FE`, `8D 8C 24 0C 01 00 00` at
+  `0x011FBAE6`). So `nav.parse` takes a name only as at most 255 characters with its one NUL last: a NUL
+  earlier would make the loader read every later field from another place, and a longer name overruns the
+  buffer.
+- **The extras byte:** the loader reads a vertex's near-wall byte and wall distance only when it is 1
+  (`80 7C 24 13 01` at `0x010992D6`); every file has 1, and `nav.parse` takes 0 or 1.
+- **Numbers:** every float is finite in every file; `nav.parse` refuses any other (a signalling NaN would not
+  be written back with the same bits).
 - **The game's walkers stand on it:** 2,840 enemy placements, height over the mesh median 0 cm, 95% within
   35 cm (`tools/nav_proof.py`).
 
@@ -928,7 +948,7 @@ cells (`.way`, not decoded).
 | `riftstone-arc.json` | unpacked folder | order, exact names, types, flags, SHA-256 per resource |
 | `riftstone-mod.json` | mod folder | name, version, author, priority |
 | `state.json` | `<game>\riftstone\` | enabled mods, installed archives + hashes, mode |
-| `vanilla\…` | `<game>\riftstone\` | verified copies of replaced archives (direct mode) |
+| `vanilla\…` | `<game>\riftstone\` | verified copies of replaced archives (Online's direct mode; Dark Arisen archives an older Riftstone replaced, until restored) |
 | `overlay\…` | `<game>\riftstone\` | built archives served by the loader (overlay mode) |
 | `logs\loader.log`, `crash-*.txt/.dmp` | `<game>\riftstone\` | loader activity and crash reports |
 | `index-*.sqlite` | `%LOCALAPPDATA%\Riftstone` | resource index |

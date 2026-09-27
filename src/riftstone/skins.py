@@ -110,7 +110,7 @@ def game_texture(data: bytes, version: int = tex.VERSION) -> bytes:
     """A flat texture of revision ``version`` (DDDA 0x99 or DDO 0x9D): that game's own as is, the other
     game's (the same header and pixel layout; measured on the chimera maps, every word but the first
     equal) with its revision and attribute bits rewritten (``tex.attr1_for``), or a .dds
-    (DXT1/DXT3/DXT5)."""
+    (DXT1/DXT5; ``tex.dds_to_tex`` refuses DXT3 and asks for DXT5)."""
     if version not in tex.VERSIONS:
         raise ParamError(f"texture revision 0x{version:x} is not one Riftstone writes")
     if data[:4] == b"DDS ":
@@ -180,19 +180,55 @@ def resources(game, idx, fam: Family, n: int, textures: dict[str, bytes]) -> dic
     return out
 
 
+def mod_paths(fam: Family, res) -> list[str]:
+    """Where a mod keeps a skin's resources, as its own paths."""
+    return sorted(f"archives/{fam.archive}.arc/" + fsmap.encode_name(name.encode("latin-1"), tid) for name, tid in res)
+
+
+def is_other_game_texture(data: bytes) -> bool:
+    """A texture of Dragon's Dogma Online's revision (0x9D): the other game's content."""
+    return len(data) >= 8 and data[:4] == b"TEX\0" and struct.unpack_from("<I", data, 4)[0] & 0xFFF == tex.VERSION_DDO
+
+
+def record_ddo(mod_root: Path, fam: Family, n: int, variant: str, res) -> None:
+    """Skin n was made from Online's chimera variant (ddoskins.py): the mod's package carries that recipe, and
+    the player's Riftstone makes the textures from the player's own Online client (sources.py)."""
+    from . import sources
+    sources.record(mod_root, "ddo-skin", {"family": fam.key, "skin": n, "variant": variant}, mod_paths(fam, res),
+                   foreign="Dragon's Dogma Online")
+
+
+def mark_other_game(mod_root: Path, fam: Family, n: int, inputs: dict[str, bytes]) -> list[str]:
+    """Mark the maps of skin n that were made from Online textures (a package refuses to carry them); returns
+    their base names."""
+    from . import sources
+    TEX = typemap.BY_EXT["tex"]
+    theirs = sorted(base for base, data in inputs.items() if is_other_game_texture(data))
+    sources.mark_foreign(mod_root, mod_paths(fam, [(skin_name(fam, n, b), TEX) for b in theirs]),
+                         "Dragon's Dogma Online")
+    return theirs
+
+
 def write(mod_root: Path, fam: Family, n: int, res: dict[tuple[str, int], bytes], title: str = "",
           source: str = "") -> list[Path]:
-    """Put a skin into a mod (archives/<family archive>.arc/...) and record it in the mod's skins.json."""
+    """Put a skin into a mod (archives/<family archive>.arc/...) and record it in the mod's skins.json.  A manifest
+    it cannot add to, or a resource outside the skin's folder, is refused before any file is written.  Whatever
+    made the skin's files before no longer counts (sources.forget); a caller that knows where the new maps came
+    from says so after (record_ddo, mark_other_game)."""
+    from . import sources
     check_number(n)
-    written = []
+    man = read_manifest(mod_root)
+    outs = []
     for (name, type_id), data in sorted(res.items()):
         if not name.startswith(fam.folder + f"\\s{n:02d}\\"):
             raise ParamError(f"{name} is not in skin {n}'s folder")
         rel = fsmap.encode_name(name.encode("latin-1"), type_id)
-        out = mod_root / "archives" / (fam.archive + ".arc") / rel
+        outs.append((mod_root / "archives" / (fam.archive + ".arc") / rel, data))
+    written = []
+    for out, data in outs:
         arcfolder.write_file(out, data)
         written.append(out)
-    man = read_manifest(mod_root)
+    sources.forget(mod_root, mod_paths(fam, res))
     man.setdefault(fam.key, {})[str(n)] = {"title": title or f"{fam.key} skin {n}", "source": source,
                                            "textures": list(fam.textures), "materials": list(fam.materials)}
     (mod_root / MANIFEST).write_text(json.dumps(man, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -201,15 +237,20 @@ def write(mod_root: Path, fam: Family, n: int, res: dict[tuple[str, int], bytes]
 
 
 def read_manifest(mod_root: Path) -> dict:
+    """A mod's skins.json: {family: {number: {"title": ..., ...}}}.  Each family Riftstone knows must be an object
+    (write adds to it); anything else is kept as it is."""
     p = Path(mod_root) / MANIFEST
     if not p.is_file():
         return {}
     try:
         man = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:       # RecursionError: nesting deeper than the decoder goes
         raise RiftError(f"{p}: not a skins manifest ({e})") from None
     if not isinstance(man, dict):
         raise RiftError(f"{p}: not a skins manifest")
+    for key in FAMILIES:
+        if key in man and not isinstance(man[key], dict):
+            raise RiftError(f'{p}: "{key}" is not an object of skins by number ({{"1": {{"title": ...}}}})')
     return man
 
 
@@ -244,6 +285,18 @@ def check_free(mod_root: Path, fam: Family, n: int) -> None:
 PICTURES = (".png", ".dds", ".tex")
 
 
+def ddo_variant_of_folder(folder: Path) -> str | None:
+    """The Online chimera variant a folder of maps came from, when tools/ddo_skins.py wrote it (its
+    riftstone-source.json), else None."""
+    from . import ddoskins
+    try:
+        mark = json.loads((Path(folder) / "riftstone-source.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    variant = mark.get("variant") if isinstance(mark, dict) and mark.get("kind") == "ddo-skin" else None
+    return variant if variant in ddoskins.VARIANTS else None
+
+
 def textures_from_folder(folder: Path, fam: Family) -> dict[str, bytes]:
     """The albedo maps in a folder, by base name: <base>.png, <base>.dds or <base>.tex (either game's).
     They are converted in :func:`resources`, with the vanilla map as the template."""
@@ -269,8 +322,9 @@ def export(mod_root: Path, fam: Family, n: int, folder: Path, kind: str = "png")
     if kind not in ("png", "dds"):
         raise ParamError("export as png or dds")
     folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
-    written = []
+    if folder.exists() and not folder.is_dir():
+        raise RiftError(f"{folder} is a file; export writes the pictures into a folder")
+    pictures = []                  # every picture first: a refusal leaves no folder behind
     for base in fam.textures:
         src = skin_file(mod_root, fam, n, base, TEX)
         if not src.is_file():
@@ -281,7 +335,11 @@ def export(mod_root: Path, fam: Family, n: int, folder: Path, kind: str = "png")
         else:
             w, h, px = texcodec.decode(t, 0)
             out = texcodec.png(w, h, px)
-        p = folder / f"{base}.{kind}"
-        p.write_bytes(out)
-        written.append(p)
-    return written
+        pictures.append((folder / f"{base}.{kind}", out))
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        for p, out in pictures:
+            p.write_bytes(out)
+    except OSError as e:
+        raise RiftError(f"cannot write the pictures into {folder}: {e.strerror or e}") from None
+    return [p for p, _ in pictures]

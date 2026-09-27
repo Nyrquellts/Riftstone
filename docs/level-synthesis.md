@@ -56,7 +56,8 @@ Anxiety, Absence, Hesitation, Apprehension and Remorse).
 
 ## How a dungeon is made (`src/riftstone/dungeon.py`)
 
-1. **Space.** The stage's mesh, its doors, the region they open into (the triangles the mesh's links join to
+1. **Space.** The stage's mesh (the mod's own copy when it holds one, as the encounters and the check read it),
+   its doors, the region they open into (the triangles the mesh's links join to
    them) and each triangle's depth (metres by the mesh from the nearest door). The **main path** runs from a
    door to the deepest place with room for a boss (`rules/beats.nyr`'s boss room, 4 m). **Places** are laid
    along it every half spacing, then over the rest of the region by farthest-point sampling: each new place
@@ -99,7 +100,9 @@ Anxiety, Absence, Hesitation, Apprehension and Remorse).
    whose tiers the pool lacks takes weaker enemies, or one tier stronger at most (never three hydras for a
    "fight"); every such change is said. A stage whose own enemies are all critters, flyers or too rarely placed
    to measure (an empty pool) needs `--pool game`. A stage with no enemy group at all is refused before
-   anything is planned: each encounter copies one of the stage's groups (step 6).
+   anything is planned: each encounter copies one of the stage's groups (step 6). A stage with no place at
+   all (none 12 m from the doors with room, near its enemies, at any of the three spacings) is refused as too
+   small for a dungeon; the end of the main path keeps those rules like every other place.
 6. **Which group each encounter copies**: a new group takes its areas and conditions from a vanilla group of
    the stage (`encounter.py`). A group whose `mLoadCondition.mLotFlag` is set loads only while its lot flag
    (`mDataLotFlag.mFlagNo`) is: **every one of the 397 enemy groups of stages 420-447** has one (their base
@@ -108,10 +111,13 @@ Anxiety, Absence, Hesitation, Apprehension and Remorse).
    `"always": true`), so the encounter loads whenever the stage does, as the game's groups without a flag do.
    `--keep-lot-flags` keeps them (the encounter then appears only while that flag is set). What sets each of
    the game's lot flags is UNKNOWN here.
-7. **Plan, write, check**: the dungeon becomes an encounter plan (`riftstone-encounters/1`, the file
-   `riftstone encounters` writes) and each encounter is written as a new enemy group (`encounter.py`: the
-   game's own horde setting for more than the spawn points, `rules/horde.nyr`). Then every spawn point of
-   every written layout is **read back from the mod's files** and found on the mesh, in the doors' region.
+7. **Plan, check, write, read back**: the dungeon becomes an encounter plan (`riftstone-encounters/1`, the
+   file `riftstone encounters` writes), every encounter of it is planned in a scratch copy of the mod (the
+   group numbers and refusals a real run gets) and every spawn point found on the mesh in the doors' region;
+   only then, and only when all of that holds, is each encounter written as a new enemy group (`encounter.py`:
+   the game's own horde setting for more than the spawn points, `rules/horde.nyr`), and Studio makes a new
+   mod. Then every spawn point of every written layout is **read back from the mod's files** and found on the
+   mesh, in the doors' region.
 
 `rules/beats.nyr` (NYR-Lang, compiled into `src/riftstone/rules/beats.py`):
 
@@ -131,8 +137,9 @@ rings at the spot's height. Measured over 79 vanilla enemy groups (two per stage
 in a stage with a mesh, a walker's points go onto the mesh: the first on the ground under the spot (or the
 nearest within 10 m; farther is refused), the others on the same rings moved onto ground reached from the
 first (at most twice the straight distance plus 5 m by the mesh: not behind a wall), with room and 60% of
-the spread apart; fewer fit in a tight spot, and the group gets that many (said). 719 of 719 such points
-stand on the mesh. Flyers and stages without a mesh keep the rings; `--no-ground` asks for them.
+the spread apart; fewer fit in a tight spot, and the group gets that many (said). The rings stop after 100
+(every spread from 40 cm still reaches the 40 m walk; a spread of a hair in a tight spot once searched for
+hours). 719 of 719 such points stand on the mesh. Flyers and stages without a mesh keep the rings; `--no-ground` asks for them.
 
 ## The proof and the gates
 
@@ -142,7 +149,7 @@ stand on the mesh. Flyers and stages without a mesh keep the rings; `--no-ground
 | `check_corpus --game ddo --only nav` | 332 of 332 byte-exact; 1,613,727 links, all within 1% but 96 of one mesh (rm107) |
 | `tools/nav_proof.py` | the stage table; 2,840 walker placements on the mesh (median 0 cm, 95% within 35 cm); 277 of 283 doors on it; flat rings vs ground (509 of 790 vs 719 of 719); the director over the 53 stages x 3 seeds: 99 dungeons from the stages' own enemies, 24 more with `--pool game`, 5 stages refused for want of an enemy group to copy, 7 too small for the built-in mission (one fight fits on each); 3,143 of 3,143 spawn points on the mesh in the doors' region |
 | unit tests | `test_nav`, `test_wfc`, `test_mission`, `test_dungeon` (a stand-in stage with a corridor, a hole and an island) |
-| fuzz | `nav`, `mission`, `wfc` (answers checked against brute force), `dungeon` |
+| fuzz | `nav`, `mission`, `wfc` (answers checked against brute force), `dungeon`, `ground` (an encounter's spawn points, hostile spot and spread: on the mesh, reached on foot, apart and with room as the rules say) |
 
 ## What stays UNKNOWN, and the limits
 

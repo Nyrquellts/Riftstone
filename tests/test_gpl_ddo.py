@@ -245,6 +245,24 @@ class GplDdoTest(unittest.TestCase):
         with self.assertRaisesRegex(ParamError, "g.yaml: line"):
             gpl_ddo.yaml_to_bytes(text.replace("MaxCount: 10", "MaxCount: 99999999999", 1), "g.yaml")
 
+    def test_huge_numbers_are_refused_in_a_short_message(self):
+        # base 16 has no digit limit, but the range message wrote the number in decimal: ValueError ("Exceeds
+        # the limit (4300 digits)") instead of a refusal
+        big = "0x" + "f" * 3572
+        text = gpl_ddo.to_yaml(sample())
+        for bad in (text.replace("MaxCount: 10", f"MaxCount: {big}", 1), text.replace("0x80000005", big, 1)):
+            with self.assertRaises(ParamError) as e:
+                gpl_ddo.yaml_to_bytes(bad, "g.yaml")
+            self.assertLess(len(str(e.exception)), 200)
+        for fn in (lambda m: m.groups[0].update(MaxCount=int(big, 16)), lambda m: m.groups[0].update(FlagNo=int(big, 16)),
+                   lambda m: m.groups[0]["mAreaHitShapeList"][0].update(type=int(big, 16)),
+                   lambda m: m.mGroupList.__setitem__(1, int(big, 16))):
+            m = sample()
+            fn(m)
+            with self.assertRaises(ParamError) as e:
+                gpl_ddo.build(m)
+            self.assertLess(len(str(e.exception)), 200)
+
     def test_summary_and_names(self):
         s = gpl_ddo.summary(sample())
         self.assertIn("3 group(s), 3 layout cell(s), 8 area shape(s)", s)

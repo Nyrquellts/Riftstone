@@ -130,6 +130,18 @@ def main() -> int:
             print("  pass  a program whose files are missing is switched off")
         if r.returncode not in (0, 1, 2):
             print(f"  FAIL  the harness stopped with exit code {r.returncode:#x}")
+        # experimental: off unless compat.ini says enabled=1 -- with no such line, and as it ships
+        shipped = (Path(__file__).resolve().parents[1] / "compat.ini").read_text(encoding="utf-8")
+        for label, ini in (("with no enabled line", INI.replace("enabled=1\n", "")), ("as it ships", shipped)):
+            (work / "compat.ini").write_text(ini, encoding="utf-8")
+            log.unlink(missing_ok=True)
+            again = subprocess.run([str(work / "compat_stub.exe"), str(exe), str(work)], cwd=work,
+                                   capture_output=True, text=True, timeout=120,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            said = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+            off = "compat: off in compat.ini" in said and "wrapped" not in said and again.returncode in (0, 1, 2)
+            print(("  pass  " if off else "  FAIL  ") + f"the plugin stays off {label} (experimental)")
+            ok = ok and off
         return 0 if ok else 1
     finally:
         shutil.rmtree(work, ignore_errors=True)

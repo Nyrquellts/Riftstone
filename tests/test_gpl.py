@@ -106,6 +106,58 @@ class GplTest(unittest.TestCase):
         self.assertIn("UNSAFE: group(s) 7", inspect.describe(body, typemap.BY_EXT["gpl"]).text("x"))
         self.assertNotIn("UNSAFE", inspect.describe(ok, typemap.BY_EXT["gpl"]).text("x"))
 
+    def test_every_key_is_checked(self):
+        """A misspelled area list or one written as a block built a group without those shapes, silently; unknown
+        keys were never refused; mGroupList: [4294967297] read back as 1 and -1 as 4294967295 (masked)."""
+        import re
+
+        one = gpl.Gpl(1, [0x10, 0x20], [0xFF], 0, [group()])
+        text = gpl.to_yaml(gpl.parse(gpl.build(one)))
+        life = re.compile(r"    mLifeAreaArray:\n(?:      .*\n)*")
+        kill = re.compile(r"    mKillAreaList:\n(?:      .*\n)*")
+        self.assertRegex(text, life)
+        self.assertRegex(text, kill)
+        bads = {
+            "mAreaHitShapeLst": text.replace("mAreaHitShapeList:", "mAreaHitShapeLst:"),
+            "mKillAreaLists": text.replace("mKillAreaList:", "mKillAreaLists:"),
+            "mLifeAreaAray": text.replace("mLifeAreaArray:", "mLifeAreaAray:"),
+            "a block": text.replace("    mAreaHitShapeList:\n      - mName", "    mAreaHitShapeList:\n        mName"),
+            "inner": life.sub("    mLifeAreaArray:\n      - 5\n      - []\n", text),
+            "left out": kill.sub("", text),
+            "units left out": re.sub(r"    mUnitKindList:\n(?:      .*\n)*", "", text),
+            "mColour": text.replace("    mSetCountMax: 5\n", "    mSetCountMax: 5\n    mColour: 3\n"),
+            "colour": text.replace("mDLCNo: 0\n", "mDLCNo: 0\ncolour: 3\n"),
+            "unit colour": text.replace("        isBelong: 1\n", "        isBelong: 1\n        colour: 3\n", 1),
+            "mSplitY": text.replace("        mSplitZ: 1\n", "        mSplitZ: 1\n        mSplitY: 1\n"),
+            "shape mColour": text.replace("        mDecay: 0.5\n", "        mDecay: 0.5\n        mColour: 1\n", 1),
+            "mHeight": text.replace("        mVertex: [5.0, 6.0, 7.0, 0.0]\n",
+                                    "        mVertex: [5.0, 6.0, 7.0, 0.0]\n        mHeight: 3.0\n"),   # a type-1 field
+            "4294967297": text.replace("mGroupList: [16, 32]", "mGroupList: [4294967297, 32]"),
+            "-1": text.replace("mGroupList: [16, 32]", "mGroupList: [-1, 32]"),
+            "mSetBit": text.replace("mSetBit: [255]", "mSetBit: [0x100000000]"),
+            "pad": text.replace("pad: [0, 0, 0]", "pad: [0, -1, 0]"),
+        }
+        for why, bad in bads.items():
+            self.assertNotEqual(bad, text, why)
+            with self.assertRaises(ParamError, msg=why):
+                gpl.yaml_to_bytes(bad, "g.yaml")
+        top = gpl.parse(gpl.yaml_to_bytes(text.replace("mGroupList: [16, 32]", "mGroupList: [0xFFFFFFFF, 0]")))
+        self.assertEqual(top.mGroupList, [0xFFFFFFFF, 0])
+        self.assertEqual(gpl.yaml_to_bytes(text), gpl.build(one))
+
+    def test_text_that_cannot_be_written_is_refused_on_its_line(self):
+        # was: UnicodeEncodeError ('surrogates not allowed') from a "\ud800" escape in a unit or shape name
+        text = gpl.to_yaml(gpl.parse(gpl.build(gpl.Gpl(1, [], [], 0, [group()]))))
+        lines = text.splitlines()
+        for old in ('- name: "em0100"', '- mName: "hit"'):
+            at = next(i for i, x in enumerate(lines, 1) if x.strip() == old)
+            bad = text.replace(old, old[:-1] + '\\ud800"', 1)
+            with self.assertRaises(ParamError) as e:
+                gpl.yaml_to_bytes(bad, "g.yaml")
+            self.assertEqual(e.exception.line, at, old)
+        kept = text.replace('- name: "em0100"', '- name: "em\\udc80"', 1)          # a byte that is not UTF-8
+        self.assertEqual(gpl.parse(gpl.yaml_to_bytes(kept)).groups[0]["mUnitKindList"][0]["name"], "em\udc80")
+
     def test_inspect(self):
         rep = inspect.describe(gpl.build(SAMPLE), typemap.BY_EXT["gpl"])
         self.assertTrue(rep.editable)

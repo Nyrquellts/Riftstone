@@ -188,11 +188,18 @@ def _ft(bits: int) -> str:
     return f32_bits_text(bits)
 
 
+def _num(v: int, text: str) -> str:
+    """A number for a message: in decimal, or its text cut short past 64 bits (int -> str refuses over
+    4,300 digits, and a hex number has no such limit)."""
+    return str(v) if v.bit_length() <= 64 else repr(text.strip()[:16] + "...")
+
+
 def to_yaml(f: Fca, name: str | None = None) -> str:
     from . import yamlish
     from .yamlish import Map, Scalar, Seq
 
-    head = ["Riftstone facial animation (.fca, rFacialAnimation: lip sync)" + (f" -- {name}" if name else ""),
+    shown = " -- " + "".join(c if c.isprintable() else " " for c in name) if name else ""   # stays in its comment
+    head = ["Riftstone facial animation (.fca, rFacialAnimation: lip sync)" + shown,
             f"{len(f.tracks)} tracks x keys over {f.frame_num} frames. A key is MtFCurve's: frame, interpolation",
             "(0 track default, 1 step, 2 linear, 3 bezier with the tangents, 4 hermite), value, tangents,",
             "right/left (UNKNOWN; they equal value in the game's files). A track needs at least one key;",
@@ -245,7 +252,7 @@ class _Y:
         except ValueError:
             raise self.err(f"{what}: {node.text!r} is not a whole number", node) from None
         if not lo <= v <= hi:
-            raise self.err(f"{what}: {v} is outside {lo}..{hi}", node)
+            raise self.err(f"{what}: {_num(v, node.text)} is outside {lo}..{hi}", node)
         return v
 
     def f32(self, node, what):

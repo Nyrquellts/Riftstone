@@ -14,6 +14,8 @@ import world_fixture
 from riftstone import arc, names, typemap
 from riftstone.index import Index
 
+setUpModule, tearDownModule = helpers.module_env("RIFTSTONE_HOME")
+
 TABLE = names.Names({"em0100": "Goblins", "em0101": "Hobgoblins", "em0103": "Greater Goblins", "em5300": "Hydras",
                      "em0300": "Skeletons", "em8300": "Oxen"},
                     {424: ["Hall of Tests", "Crypt"], 220: ["Urban Quarter", "Gran Soren Cathedral"]},

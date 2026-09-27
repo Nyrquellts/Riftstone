@@ -266,6 +266,9 @@ def from_yaml(text: str, source: str | None = None) -> Gmd:
     doc = yamlish.parse(text, source)
     if not isinstance(doc, Map) or not isinstance(doc.get("riftstone"), Scalar) or doc.get("riftstone").text != TAG:
         raise ParamError(f"not a Riftstone text file (expected 'riftstone: {TAG}')", 1, 1, source)
+    for k, _ in doc.items:                        # a misspelled key was passed over ('mesages': no messages)
+        if k.text not in ("riftstone", "resource", "version", "language", "name", "label_base", "reserved", "messages"):
+            raise ParamError(f"unknown top-level key {k.text!r}", k.line, k.col, source)
 
     def at(node):
         return getattr(node, "line", None), getattr(node, "col", None)

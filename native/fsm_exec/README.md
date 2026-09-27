@@ -25,6 +25,11 @@ and compares every result with `fsmcheck.step` and with fsmcheck's verdicts (alw
 conditions fsmcheck leaves open are counted). `docs/formats.md` ("FSM" and "How the game runs a
 machine") has what it found. Online's routines were read, not run.
 
+Every count in a case file (states, links, conditions, operands, the once-list) is checked against the
+16 MB arena before its size is computed, so a count whose size does not fit in 32 bits is refused ("the
+case needs more than ... bytes") instead of wrapping round to a small block that the case then writes
+past; `run_tests.py` feeds four such case files first.
+
 ```bat
 native\fsm_exec\build.cmd
 python native\fsm_exec\test\run_tests.py

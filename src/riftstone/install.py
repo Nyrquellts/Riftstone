@@ -4,15 +4,21 @@ Two modes:
 
 * overlay -- the Riftstone loader (dinput8.dll) is installed: archives go to
   <game>/riftstone/overlay/<path under nativePC>; the loader opens them
-  instead of the originals.  nativePC is never touched.
-* direct  -- no loader: the original archive is first copied to
-  <game>/riftstone/vanilla/ and checked byte for byte, then replaced.
+  instead of the originals.  nativePC is never touched.  Dark Arisen mods
+  install only this way: the game's own files stay as Steam installed them.
+* direct  -- Dragon's Dogma Online, whose client the loader has not run in yet
+  (docs/runtime.md): the original archive is first copied to
+  <game>/riftstone/vanilla/ and checked byte for byte, then replaced.  Dark
+  Arisen archives a Riftstone before this one installed directly are still
+  restored from there.
 
 ``apply`` is idempotent: it computes the whole desired state from vanilla
 plus every enabled mod, writes only archives whose bytes change, and restores
-archives no enabled mod touches any more.  Every write goes to a temporary
-file, is flushed, then renamed over the target, so an interruption never
-leaves a half-written archive; the next apply finishes the job.
+archives no enabled mod touches any more.  It builds every archive and checks
+every original before the first write, so a refusal changes nothing.  Every
+write goes to a temporary file, is flushed, then renamed over the target, so
+an interruption never leaves a half-written archive; the next apply finishes
+the job.
 """
 from __future__ import annotations
 
@@ -97,7 +103,11 @@ def _process_names() -> list[str] | None:
 
 def game_running(game: Game) -> bool:
     """True when the game's exe (DDDA.exe or DDO.exe) is running."""
-    exe = game.exe.name
+    return exe_running(game.exe.name)
+
+
+def exe_running(exe: str) -> bool:
+    """True when a process of that executable name is running (no game folder needed)."""
     names = _process_names()
     if names is not None:
         return any(n.lower() == exe.lower() for n in names)
@@ -191,6 +201,32 @@ def matches_vanilla(p: Path, want: str, sha256: str | None = None) -> bool:
     return (sha256 or sha256_file(p)) == want
 
 
+def _state_problem(state) -> str | None:
+    """What is wrong with the shape of a state.json that apply wrote (None when nothing is)."""
+    if not isinstance(state, dict):
+        return "it is not an object"
+    mods = state.get("mods", [])
+    if not isinstance(mods, list):
+        return "its mods are not a list"
+    for m in mods:
+        if not (isinstance(m, dict) and all(isinstance(m.get(k), str) for k in ("path", "name", "version"))
+                and m["path"] and isinstance(m.get("priority"), int)):
+            return f"a mod entry is not {{path, name, version, priority}}: {json.dumps(m)[:80]}"
+    if state.get("mode") not in (None, "overlay", "direct"):
+        return f"its mode is {json.dumps(state['mode'])[:40]}"
+    for key in ("archives", "server"):
+        records = state.get(key, {})
+        if not isinstance(records, dict):
+            return f"its {key} are not an object"
+        for name, entry in records.items():
+            if not (isinstance(entry, dict) and isinstance(entry.get("sha256"), str)
+                    and isinstance(entry.get("vanilla_sha256", ""), (str, type(None)))):
+                return f"the record of {name} is not {{sha256, ...}}"
+    if state.get("server") and not isinstance(state.get("server_assets"), str):
+        return "it has server files but no server folder"
+    return None
+
+
 def load_state(game: Game) -> dict:
     f = game.state_dir / "state.json"
     if not f.is_file():
@@ -198,10 +234,18 @@ def load_state(game: Game) -> dict:
     try:
         state = json.loads(f.read_text(encoding="utf-8"))
     except ValueError as e:
-        raise RiftError(f"{f} is damaged ({e}); run 'riftstone restore' to return every archive to vanilla") from None
-    if state.get("schema") != STATE_SCHEMA:
-        raise RiftError(f"{f} was written by an incompatible Riftstone")
-    return state
+        problem = str(e)
+    else:
+        if isinstance(state, dict) and state.get("schema") != STATE_SCHEMA:
+            raise RiftError(f"{f} was written by an incompatible Riftstone")
+        problem = _state_problem(state)
+        if problem is None:
+            return state
+    # Without its record Riftstone cannot tell what it changed, so it cannot put it back itself.
+    undo = ("restore the game's archives (ddon text restore, or re-extract them from the client RAR) and the "
+            "server's files" if game.is_ddo else "verify the game files in Steam, delete riftstone\\overlay")
+    raise RiftError(f"{f} is damaged ({problem}), so Riftstone cannot tell what it changed: {undo}, then delete "
+                    f"state.json")
 
 
 def save_state(game: Game, state: dict) -> None:
@@ -211,6 +255,11 @@ def save_state(game: Game, state: dict) -> None:
 
 def mode_for(game: Game) -> str:
     return "overlay" if game.loader_installed() else "direct"
+
+
+NEEDS_LOADER = ("Riftstone serves Dark Arisen mods through its loader, so the game's own files stay as Steam "
+                "installed them: install the loader first (Riftstone.cmd loader install, or the Loader tile in "
+                "Studio), then install the mods")
 
 
 @dataclass
@@ -225,6 +274,9 @@ class ApplyReport:
     server_written: list[str] = field(default_factory=list)    # DDO: asset files written into the server
     server_restored: list[str] = field(default_factory=list)
     server_assets: str | None = None
+    merged: list[dict] = field(default_factory=list)       # files several mods change, merged (gplmerge, servermerge)
+    renumbered: list[dict] = field(default_factory=list)
+    unmoved: list[dict] = field(default_factory=list)
     loose_written: list[str] = field(default_factory=list)     # loose/ files written into the overlay
     loose_removed: list[str] = field(default_factory=list)
 
@@ -260,7 +312,9 @@ def _backup(game: Game, arc: str, known_vanilla: dict[str, str] | None) -> str:
 
 def apply(game: Game, index, mod_roots: list[Path], dry_run: bool = False,
           known_vanilla: dict[str, str] | None = None, progress=None, mode: str | None = None) -> ApplyReport:
-    """Make the game match vanilla + the given mods (in priority order)."""
+    """Make the game match vanilla + the given mods (in priority order).  Every archive is built, and every
+    original a change replaces or puts back is checked (and kept aside) before the first file is written, so
+    a refusal leaves the game as it was.  Built archives wait in <game>\\riftstone\\staging until then."""
     mode = mode or mode_for(game)
     # Overlay files may change under a running game: each write is a fresh file renamed into
     # place, and Windows refuses the rename while the game holds that archive open.  nativePC
@@ -268,60 +322,95 @@ def apply(game: Game, index, mod_roots: list[Path], dry_run: bool = False,
     if not dry_run and mode == "direct" and game_running(game):
         raise RiftError("Dragon's Dogma is running. Close the game, then install again "
                         "(or install the loader: with it, mods can be updated while the game runs).")
-    mods = [modlib.Mod.load(r) for r in mod_roots]
-    p = modlib.plan(game, index, mods)
-    modlib.check_plan(p)
-    report = ApplyReport(mode, conflicts=p.conflicts, dry_run=dry_run)
+    seen: set[str] = set()
+    mods = []
+    for r in mod_roots:                             # each folder once
+        where = str(Path(r).resolve()).lower()
+        if where not in seen:
+            seen.add(where)
+            mods.append(modlib.Mod.load(r))
     with Lock(game):
         state = load_state(game)
+        # the numbers the last install gave groups that several mods add stay theirs (gplmerge.renumber)
+        p = modlib.plan(game, index, mods, keep=state.get("renumbered"),
+                        installed=[m.get("name") for m in state.get("mods", []) if isinstance(m, dict)])
+        modlib.check_plan(p)
+        report = ApplyReport(mode, conflicts=p.conflicts, dry_run=dry_run, merged=p.merged,
+                             renumbered=p.renumbered, unmoved=p.unmoved)
         if state.get("mode") and state["mode"] != mode and state.get("archives"):
             raise RiftError(f"mods were installed in {state['mode']} mode; run 'riftstone restore' before switching to {mode}")
         installed: dict = state.setdefault("archives", {})
-        desired: set[str] = set()
-        for arc_name in sorted(p.archives):
-            built = modlib.build_archive(game, arc_name, p.archives[arc_name])
-            if not built.replaced and not built.added:
-                report.same_as_vanilla.append(arc_name)   # the mod's files equal the originals here
-                continue
-            desired.add(arc_name)
-            digest = hashlib.sha256(built.data).hexdigest()
-            target = _target(game, arc_name, mode)
-            entry = {"sha256": digest, "replaced": built.replaced, "added": built.added,
-                     "mods": sorted({c.mod for c in p.archives[arc_name]})}
-            if target.is_file() and installed.get(arc_name, {}).get("sha256") == digest and sha256_file(target) == digest:
-                report.unchanged.append(arc_name)
-                continue
-            report.written.append({"archive": arc_name, **entry, "bytes": len(built.data)})
-            if progress:
-                progress.advance(1, arc_name)
-            if dry_run:
-                continue
-            if mode == "direct":
-                entry["vanilla_sha256"] = _backup(game, arc_name, known_vanilla)
-            try:
-                write_file(target, built.data)
-            except PermissionError:
-                raise RiftError(f"{arc_name}.arc is in use by the game right now; leave that area "
-                                "(or close the game) and save again") from None
-            if sha256_file(target) != digest:
-                raise BuildError(f"{target} did not verify after writing; run 'riftstone restore'")
-            installed[arc_name] = entry
-            state["mode"] = mode
-            save_state(game, state)   # after every archive: an interruption loses nothing
-        for arc_name in sorted(set(installed) - desired):
-            report.restored.append(arc_name)
+        staging = game.state_dir / "staging"
+        shutil.rmtree(staging, ignore_errors=True)      # what an interrupted run left there
+        try:
+            desired: set[str] = set()
+            todo: list[tuple[str, Path, Path, dict]] = []
+            for arc_name in sorted(p.archives):
+                built = modlib.build_archive(game, arc_name, p.archives[arc_name])
+                if not built.replaced and not built.added:
+                    report.same_as_vanilla.append(arc_name)   # the mod's files equal the originals here
+                    continue
+                desired.add(arc_name)
+                digest = hashlib.sha256(built.data).hexdigest()
+                target = _target(game, arc_name, mode)
+                entry = {"sha256": digest, "replaced": built.replaced, "added": built.added,
+                         "mods": sorted({m for c in p.archives[arc_name] for m in c.mods})}
+                if target.is_file() and installed.get(arc_name, {}).get("sha256") == digest and sha256_file(target) == digest:
+                    report.unchanged.append(arc_name)
+                    continue
+                if mode == "direct" and not game.is_ddo:
+                    raise RiftError(NEEDS_LOADER)          # before anything is written
+                report.written.append({"archive": arc_name, **entry, "bytes": len(built.data)})
+                if progress:
+                    progress.advance(1, arc_name)
+                if not dry_run:
+                    staged = staging / f"{len(todo)}.arc"      # on disk, not in memory: a mod can touch many
+                    staged.parent.mkdir(parents=True, exist_ok=True)
+                    staged.write_bytes(built.data)
+                    todo.append((arc_name, target, staged, entry))
+            drops = sorted(set(installed) - desired)
+            report.restored += drops
             if not dry_run:
+                if mode == "direct":
+                    for arc_name, _, _, entry in todo:
+                        entry["vanilla_sha256"] = _backup(game, arc_name, known_vanilla)
+                if state.get("mode", mode) == "direct":
+                    for arc_name in drops:
+                        _original(game, arc_name, installed[arc_name])
+            server = _plan_server(game, mods, state, report, dry_run)
+            # loose files: checked now, so a refusal writes nothing; written after the archives
+            _apply_loose(game, index, mods, state, report if dry_run else ApplyReport(mode), True, mode)
+            if dry_run:
+                return report
+            for arc_name, target, staged, entry in todo:
+                try:
+                    write_file(target, staged.read_bytes())
+                except PermissionError:
+                    raise RiftError(f"{arc_name}.arc is in use by the game right now; leave that area "
+                                    "(or close the game) and save again") from None
+                if sha256_file(target) != entry["sha256"]:
+                    raise BuildError(f"{target} did not verify after writing; run 'riftstone restore'")
+                installed[arc_name] = entry
+                state["mode"] = mode
+                save_state(game, state)   # after every archive: an interruption loses nothing
+            for arc_name in drops:
                 _restore_one(game, arc_name, installed[arc_name], state.get("mode", mode))
                 del installed[arc_name]
                 save_state(game, state)
-        _apply_server(game, mods, state, report, dry_run)
-        _apply_loose(game, index, mods, state, report, dry_run, mode)
-        if not dry_run:
+            if server:
+                _write_server(game, state, server)
+            _apply_loose(game, index, mods, state, report, False, mode)
             state["mods"] = [{"path": str(m.root), "name": m.name, "version": m.version, "priority": m.priority}
                              for m in mods]
+            if p.renumbered:
+                state["renumbered"] = p.renumbered
+            else:
+                state.pop("renumbered", None)
             if not installed:
                 state.pop("mode", None)
             save_state(game, state)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
     return report
 
 
@@ -332,23 +421,49 @@ def _server_target(assets: Path, rel: str) -> Path:
     return assets.joinpath(*parts)
 
 
-def _apply_server(game: Game, mods: list, state: dict, report: ApplyReport, dry_run: bool) -> None:
-    """DDO: make the local server's asset folder match its originals + the mods' server/ files."""
+def _plan_server(game: Game, mods: list, state: dict, report: ApplyReport, dry_run: bool):
+    """DDO: what makes the local server's asset folder match its originals + the mods' server/ files: (the
+    folder, the files to write, the files to put back), or None when there is nothing to do.  The spawn table
+    and the shops several mods change are merged against the server's own (servermerge.py); for any other file
+    the later mod's copy wins.  It writes no server file; each original a file replaces for the first time is
+    kept aside and verified, and each one to put back is checked."""
     wanted: dict[str, tuple[bytes, list[str]]] = {}
+    copies: dict[str, dict[str, bytes]] = {}
+    fights: dict[str, list[dict]] = {}
     for m in sorted(mods, key=lambda m: (m.priority, m.name.lower())):
         for rel, data in modlib.collect_server(m).items():
             prev = wanted.get(rel)
             if prev is not None and prev[0] != data:
-                report.conflicts.append({"archive": "server", "resource": rel, "loser": prev[1][-1], "winner": m.name})
+                fights.setdefault(rel, []).append({"archive": "server", "resource": rel, "loser": prev[1][-1],
+                                                   "winner": m.name})
             wanted[rel] = (data, (prev[1] if prev else []) + [m.name])
+            copies.setdefault(rel, {})[m.name] = data
     done: dict = state.setdefault("server", {})
     if not wanted and not done:
-        return
-    from . import ddo
+        return None
+    from . import ddo, servermerge
 
     assets = Path(state["server_assets"]) if done and state.get("server_assets") else ddo.need_assets(game)
     report.server_assets = str(assets)
     backups = game.state_dir / "server-vanilla"
+    writes = []
+    for rel, found in sorted(fights.items()):
+        why = None
+        if rel in servermerge.FILES:
+            base = _server_base(game, assets, rel, done)
+            try:
+                if base is None:
+                    raise servermerge.MergeError("the server has no such file to merge against")
+                data, fs = servermerge.merge(rel, base, list(copies[rel].items()))
+            except servermerge.MergeError as e:
+                why = str(e)
+            else:
+                wanted[rel] = (data, wanted[rel][1])
+                report.merged.append({"archive": "server", "resource": rel, "mods": list(copies[rel])})
+                report.conflicts.extend({"archive": "server", "resource": rel, "loser": lose, "winner": win,
+                                         "detail": what} for lose, win, what in fs)
+                continue
+        report.conflicts.extend({**f, "detail": f"not merged: {why}"} if why else f for f in found)
     for rel, (data, names) in sorted(wanted.items()):
         target = _server_target(assets, rel)
         digest = hashlib.sha256(data).hexdigest()
@@ -372,20 +487,47 @@ def _apply_server(game: Game, mods: list, state: dict, report: ApplyReport, dry_
             entry["vanilla_sha256"] = orig
         else:
             entry["vanilla_sha256"] = None   # a new file: restore removes it
+        writes.append((rel, target, data, entry))
+    drops = sorted(set(done) - set(wanted))
+    report.server_restored += drops
+    if not dry_run:
+        for rel in drops:
+            _server_original(game, rel, done[rel])
+    return assets, writes, drops
+
+
+def _write_server(game: Game, state: dict, plan) -> None:
+    """Write what _plan_server planned, recording each file as it lands."""
+    assets, writes, drops = plan
+    done = state["server"]
+    for rel, target, data, entry in writes:
         write_file(target, data)
-        if sha256_file(target) != digest:
+        if sha256_file(target) != entry["sha256"]:
             raise BuildError(f"{target} did not verify after writing; run 'riftstone restore'")
         done[rel] = entry
         state["server_assets"] = str(assets)
         save_state(game, state)
-    for rel in sorted(set(done) - set(wanted)):
-        report.server_restored.append(rel)
-        if not dry_run:
-            _restore_server_one(game, assets, rel, done[rel])
-            del done[rel]
-            save_state(game, state)
+    for rel in drops:
+        _restore_server_one(game, assets, rel, done[rel])
+        del done[rel]
+        save_state(game, state)
     if not done:
         state.pop("server_assets", None)
+
+
+def _server_base(game: Game, assets: Path, rel: str, done: dict) -> bytes | None:
+    """The server's own copy of a file, to merge against: the backup install keeps once it has changed the file
+    (checked), else the file in the asset folder; None when the server has no such file."""
+    if rel in done:
+        want = done[rel].get("vanilla_sha256")
+        if want is None:
+            return None                     # a file the mods added
+        b = _server_target(game.state_dir / "server-vanilla", rel)
+        if not b.is_file() or sha256_file(b) != want:
+            raise RiftError(f"the original of server file {rel} is missing or damaged in {b.parent}")
+        return b.read_bytes()
+    t = _server_target(assets, rel)
+    return t.read_bytes() if t.is_file() else None
 
 
 def _loose_target(game: Game, rel: str) -> Path:
@@ -421,11 +563,11 @@ def _apply_loose(game: Game, index, mods: list, state: dict, report: ApplyReport
         if target.is_file() and done.get(rel, {}).get("sha256") == digest and sha256_file(target) == digest:
             report.unchanged.append("loose/" + rel)
             continue
+        if target.is_file() and rel not in done:          # refused in the check before anything is written
+            raise RiftError(f"{target} is already there and Riftstone did not put it there; move it away first")
         report.loose_written.append(rel)
         if dry_run:
             continue
-        if target.is_file() and rel not in done:
-            raise RiftError(f"{target} is already there and Riftstone did not put it there; move it away first")
         write_file(target, data)
         if sha256_file(target) != digest:
             raise BuildError(f"{target} did not verify after writing; run 'riftstone restore'")
@@ -433,6 +575,9 @@ def _apply_loose(game: Game, index, mods: list, state: dict, report: ApplyReport
         save_state(game, state)
     for rel in sorted(set(done) - set(wanted)):
         report.loose_removed.append(rel)
+        target = _loose_target(game, rel)
+        if dry_run and target.is_file() and sha256_file(target) != done[rel].get("sha256"):
+            raise RiftError(f"{target} changed since Riftstone wrote it; it was left in place")
         if not dry_run:
             _remove_loose_one(game, rel, done[rel])
             del done[rel]
@@ -461,18 +606,37 @@ def _remove_loose_one(game: Game, rel: str, entry: dict) -> None:
         d = d.parent
 
 
-def _restore_server_one(game: Game, assets: Path, rel: str, entry: dict) -> None:
-    target = _server_target(assets, rel)
+def _server_original(game: Game, rel: str, entry: dict) -> Path | None:
+    """The kept original of a server file, verified; None for a file a mod added (restore removes it)."""
     want = entry.get("vanilla_sha256")
     if want is None:
-        target.unlink(missing_ok=True)
-        return
+        return None
     backup = _server_target(game.state_dir / "server-vanilla", rel)
     if not backup.is_file() or sha256_file(backup) != want:
         raise RiftError(f"the original of server file {rel} is missing or damaged in {backup.parent}")
+    return backup
+
+
+def _restore_server_one(game: Game, assets: Path, rel: str, entry: dict) -> None:
+    target = _server_target(assets, rel)
+    backup = _server_original(game, rel, entry)
+    if backup is None:
+        target.unlink(missing_ok=True)
+        return
     write_file(target, backup.read_bytes())
-    if sha256_file(target) != want:
+    if sha256_file(target) != entry["vanilla_sha256"]:
         raise RiftError(f"restoring server file {rel} did not verify")
+
+
+def _original(game: Game, arc_name: str, entry: dict) -> tuple[Path, str]:
+    """The kept original of an archive replaced in direct mode, verified: its path and sha256."""
+    backup = game.vanilla_dir / game.arc_path(arc_name).relative_to(game.native)
+    if not backup.is_file():
+        raise RiftError(f"no vanilla backup for {arc_name}.arc; verify the game files in Steam to repair it")
+    want = entry.get("vanilla_sha256") or sha256_file(backup)
+    if sha256_file(backup) != want:
+        raise RiftError(f"the vanilla backup of {arc_name}.arc is damaged; verify the game files in Steam")
+    return backup, want
 
 
 def _restore_one(game: Game, arc_name: str, entry: dict, mode: str) -> None:
@@ -483,12 +647,7 @@ def _restore_one(game: Game, arc_name: str, entry: dict, mode: str) -> None:
         except PermissionError:
             raise RiftError(f"{arc_name}.arc is in use by the game right now; try again after leaving that area") from None
         return
-    backup = game.vanilla_dir / game.arc_path(arc_name).relative_to(game.native)
-    if not backup.is_file():
-        raise RiftError(f"no vanilla backup for {arc_name}.arc; verify the game files in Steam to repair it")
-    want = entry.get("vanilla_sha256") or sha256_file(backup)
-    if sha256_file(backup) != want:
-        raise RiftError(f"the vanilla backup of {arc_name}.arc is damaged; verify the game files in Steam")
+    backup, want = _original(game, arc_name, entry)
     tmp = target.with_name(target.name + ".riftstone-tmp")
     shutil.copyfile(backup, tmp)
     os.replace(tmp, target)
@@ -521,6 +680,7 @@ def restore_all(game: Game) -> list[str]:
         state["archives"] = {}
         state["mods"] = []
         state.pop("mode", None)
+        state.pop("renumbered", None)
         save_state(game, state)
         return done
 

@@ -284,6 +284,29 @@ class SoundTest(unittest.TestCase):
         with self.assertRaises(ParamError):                             # mTable holds exactly 16 picks
             sound.from_yaml(ys.replace("      - {mReqNo: 0, mRate: 0}\n", "", 1))
 
+    def test_yaml_name_stays_in_its_comment(self):
+        # the resource name went into the header comment as it was: a newline in it began a YAML line
+        # of its own (here a second 'riftstone:' key, which also fooled params' tag detection)
+        from riftstone import params
+        for make in SAMPLES:
+            s = make()
+            raw = sound.build(s)
+            y = sound.to_yaml(s, "x\nriftstone: xfs/1\r\t\"#")
+            self.assertEqual(sound.yaml_to_bytes(y), raw, s.fmt)
+            self.assertEqual(params.yaml_to_resource(y), raw, s.fmt)
+
+    def test_yaml_long_hex_number(self):
+        # base 16 has no digit limit, but 3,572 hex digits are over 4,300 decimal ones: the range message
+        # printed the number and leaked int -> str's ValueError
+        big = "0x" + "f" * 3572
+        y, yr = sound.to_yaml(srq_ddda()), sound.to_yaml(sar())
+        for bad in (y.replace("mReqNo: 25", "mReqNo: " + big), y.replace("mPitchShift: -300", "mPitchShift: -" + big),
+                    yr.replace("mStageNo: 101", "mStageNo: " + big)):
+            self.assertNotIn(bad, (y, yr))
+            with self.assertRaises(ParamError) as cm:
+                sound.from_yaml(bad)
+            self.assertLess(len(str(cm.exception)), 200)
+
     def test_yaml_edit(self):
         y = sound.to_yaml(srq_ddda())
         self.assertIn("mPacFileNameTableIndex: 0  # sound\\se\\om\\om1520\\om1520\n", y)   # cues name their package
@@ -297,6 +320,21 @@ class SoundTest(unittest.TestCase):
         yn = sound.to_yaml(sound.Sound("srq", {**srq_ddda().data, "packages": [b"\x81\x7f"]}))
         self.assertIn("{hex: ", yn)                                      # bytes that are not text travel as hex
         self.assertEqual(sound.from_yaml(yn).data["packages"], [b"\x81\x7f"])
+
+    def test_yaml_cue_comments_stay_short(self):
+        # each cue's package / bank / source index had the whole path as its comment, so one long path named by
+        # many cues multiplied in the YAML: 1,000 cues naming one 100 KB package were a 244 KB file and 100 MB of
+        # YAML. The comment is cut short; the path itself is written once.
+        def cues(path):
+            return sound.Sound("srq", {**srq_ddda().data, "packages": [path],
+                                       "elements": [rec(sound._SRQ_ELEMENT, mReqNo=n, mPacFileNameTableIndex=0)
+                                                    for n in range(1000)]})
+        s = cues(b"p" * 100000)
+        raw = sound.build(s)
+        y = sound.to_yaml(s)
+        self.assertLess(len(y) - len(sound.to_yaml(cues(b"p"))), 3 * 100000)    # the path once, not per cue
+        self.assertEqual(sound.yaml_to_bytes(y), raw)
+        self.assertIn("mPacFileNameTableIndex: 0  # ppp", y)
 
 
 def game_found(kind: str) -> bool:

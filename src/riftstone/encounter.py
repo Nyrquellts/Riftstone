@@ -66,6 +66,9 @@ MAX_POINTS = 31               # the most placements any vanilla enemy layout hol
 FAR = 6000.0                  # a template group farther than this from the spot is reported
 GROUND_SNAP = 1000.0          # cm: how far from the spot the nearest walkable ground may be
 GROUND_RISE = 400.0           # cm: how far above or below the spot the ground may lie
+GROUND_RINGS = 100            # rings of candidate spawn points searched at most (6 x ring each): with any spread of
+                              # 40 cm or more they reach the 40 m walk limit; a smaller spread no longer searches
+                              # 3 x (4000 / spread)^2 candidates (0.01 cm: hours) in a spot too tight for them
 
 
 @dataclass
@@ -192,12 +195,6 @@ def _mix(weights: list[int], n: int) -> list[int]:
     return [i for _, i in slots]
 
 
-def _source_record(game, idx, w: World, em: str, stage: int):
-    """The one vanilla placement a single copy takes: the enemy's most common ordinary setup."""
-    pick, rec, _ = _source_records(game, idx, w, em, stage)[0]
-    return pick, rec
-
-
 def parse_skins(value) -> list[int] | None:
     """--skin: one number (every placement wears it) or several, "1,2" (placements take them in turn)."""
     if value is None or value == "" or value == []:
@@ -246,7 +243,7 @@ def _ground_points(mesh, at: tuple, n: int, spread: float, room: float):
     reach = mesh.distances([start.triangle], limit=limit)
     within = set(reach)
     pts, far, ring = [start.point], 0.0, 1
-    while len(pts) < n and spread * ring <= limit * 100.0:
+    while len(pts) < n and ring <= GROUND_RINGS and spread * ring <= limit * 100.0:
         r, k = spread * ring, 6 * ring
         for i in range(k):
             if len(pts) >= n:

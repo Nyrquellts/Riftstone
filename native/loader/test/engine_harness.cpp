@@ -69,6 +69,9 @@ void Stamp(wchar_t* out, size_t cap) { wcsncpy_s(out, cap, L"20260101-000000", _
 BOOL HookImport(const char*, const char*, void*, void**) { return FALSE; }
 void LiveNote(const char*, const wchar_t*) {}
 
+// resources.cpp is the loader's file side; the engine harness runs fixes.cpp's engine code only.
+void ResourcesInit() {}
+HANDLE ArchiveOpen(const wchar_t*, LPSECURITY_ATTRIBUTES, DWORD) { return INVALID_HANDLE_VALUE; }
 #include "../fixes.cpp"
 
 namespace {
@@ -273,7 +276,26 @@ void TestEnemySlots() {
     Check(!EnemySlots(&active, &usable, &slots), "no manager yet: unknown");
     *(uint32_t*)0x018FA504 = 0x10;
     Check(!EnemySlots(&active, &usable, &slots), "a manager pointer that is not memory: unknown, no fault");
-    *(uint32_t*)0x018FA504 = 0;
+    // A manager over several regions (pages of different protection, all readable, as an image's written and
+    // untouched pages are): a loader before 0.4.0 read only the first region and called the pool unknown.
+    const SIZE_T size = 0x1C000, page = 0x1000;
+    uint8_t* split = (uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (split) {
+        memcpy(split, manager, 0x1B8D4);
+        DWORD old = 0;
+        VirtualProtect(split + 0x10000, page, PAGE_READONLY, &old);
+        *(uint32_t*)0x018FA504 = (uint32_t)(uintptr_t)split;
+        active = usable = slots = -1;
+        ok = EnemySlots(&active, &usable, &slots);
+        Check(ok && active == 3 && usable == 10 && slots == 10,
+              "a manager spanning regions of different protection, all readable: 3 of 10 slots, 10 usable");
+        VirtualProtect(split + 0x10000, page, PAGE_NOACCESS, &old);
+        Check(!EnemySlots(&active, &usable, &slots), "a manager with a page that cannot be read: unknown, no fault");
+        *(uint32_t*)0x018FA504 = 0;
+        VirtualFree(split, 0, MEM_RELEASE);
+    } else {
+        Check(false, "VirtualAlloc for the split manager");
+    }
 }
 
 // sResource::registTable (0x00DB9B70, thiscall, ret 8) and sResource::release (0x00DBA940, thiscall, ret 4).

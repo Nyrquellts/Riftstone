@@ -316,7 +316,7 @@ def _where(node, source):
 
 
 def _word(node, what: str, t: str, source) -> int:
-    from .params import f32_bits
+    from .params import f32_bits, shown
     from .yamlish import Scalar
     if not isinstance(node, Scalar):
         raise ParamError(f"{what} must be a single value, not a list or mapping", *_where(node, source))
@@ -325,14 +325,15 @@ def _word(node, what: str, t: str, source) -> int:
         try:
             return f32_bits(text)
         except (ValueError, OverflowError):
-            raise ParamError(f"{what}: {text!r} is not a 32-bit float", *_where(node, source)) from None
+            raise ParamError(f"{what}: {shown(text)!r} is not a 32-bit float", *_where(node, source)) from None
     try:
         v = int(text, 0)
     except ValueError:
-        raise ParamError(f"{what} must be a whole number, not {text!r}", *_where(node, source)) from None
+        raise ParamError(f"{what} must be a whole number, not {shown(text)!r}", *_where(node, source)) from None
     lo, hi = (-(1 << 31), (1 << 31) - 1) if t == "s32" else (0, 0xFFFFFFFF)
     if not lo <= v <= hi:
-        raise ParamError(f"{what}: {v} is out of range for a {t} ({lo}..{hi})", *_where(node, source))
+        # the value as written: a hex one past 4,300 decimal digits has no decimal form (int -> str refuses)
+        raise ParamError(f"{what}: {shown(text)} is out of range for a {t} ({lo}..{hi})", *_where(node, source))
     return v & 0xFFFFFFFF
 
 

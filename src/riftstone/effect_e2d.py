@@ -33,8 +33,8 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 
-from .effect_efl import (Region, _fields_node, _hex_node, _w, _yf32, _yfields, _yhex, _yint, decode, encode,
-                         schema_size)
+from .effect_efl import (Region, _fields_node, _hex_node, _w, _yf32, _yfields, _yhex, _yint, _ykeys, _ylist, _yregion,
+                         decode, encode, schema_size)
 from .errors import FormatError, ParamError
 
 MAGIC = b"E2D\0"
@@ -234,7 +234,8 @@ def to_yaml(e: E2d, name: str | None = None) -> str:
     from .params import f32_bits_text
     from .yamlish import Map, Scalar, Seq
 
-    head = ["Riftstone 2D effect (.e2d)" + (f" -- {name}" if name else ""),
+    shown = " -- " + "".join(c if c.isprintable() else " " for c in name) if name else ""   # stays in its comment
+    head = ["Riftstone 2D effect (.e2d)" + shown,
             "units: one emitter each -- the regions (by number) holding its generator, particle, life and",
             "move. prefix: the block before the units (render-target and back texture paths). Particle",
             "texture/anim/model paths are named; other bytes are hex. Rebuilds byte-for-byte when untouched."]
@@ -280,6 +281,8 @@ def from_yaml(text: str, source: str | None = None) -> E2d:
     doc = yamlish.parse(text, source)
     if not isinstance(doc, Map) or not isinstance(doc.get("riftstone"), Scalar) or doc.get("riftstone").text != TAG:
         raise ParamError(f"not a Riftstone 2D effect (expected 'riftstone: {TAG}')", 1, 1, source)
+    _ykeys(doc, ("riftstone", "resource", "version", "mBaseFps", "reserved", "prefix", "units", "regions"), "the file",
+           source)
     version = _yint(doc.get("version") or doc, "version", source)
     if version not in VERSIONS:
         raise ParamError(f"version must be 0x{VERSION_DDDA:08x} or 0x{VERSION_DDO:08x}",
@@ -290,14 +293,18 @@ def from_yaml(text: str, source: str | None = None) -> E2d:
         if not isinstance(res, Seq) or len(res.items) != 3:
             raise ParamError("'reserved' is three numbers", *_w(res, source))
         e.reserved = tuple(_yint(x, "reserved", source) for x in res.items)
+    if doc.get("prefix") is None:
+        raise ParamError("'prefix' is missing", *_w(doc, source))
     try:
-        e.prefix = encode(PREFIX, _yfields(doc.get("prefix") or doc, PREFIX, "prefix", source))
+        e.prefix = encode(PREFIX, _yfields(doc.get("prefix"), PREFIX, "prefix", source))
     except FormatError as exc:
         raise ParamError(f"prefix: {exc}", *_w(doc.get("prefix"), source)) from None
-    units = doc.get("units")
-    for n, u in enumerate(units.items if isinstance(units, Seq) else []):
+    units = _ylist(doc, "units", source)
+    for n, u in enumerate(units):
         if not isinstance(u, Map):
             raise ParamError("each unit is a mapping", *_w(u, source))
+        _ykeys(u, ("generator_unk", "generator", "particle_type", "particle", "life_type", "life", "move_type", "move"),
+               f"unit {n}", source)
 
         def g(k, hi=0xFF, null=False):
             v = u.get(k)
@@ -307,13 +314,12 @@ def from_yaml(text: str, source: str | None = None) -> E2d:
         e.entries.append(Entry(g("generator_unk"), g("generator", MAX_OFFSET, True), g("particle_type"),
                                g("particle", MAX_OFFSET, True), g("life_type"), g("life", MAX_OFFSET, True),
                                g("move_type"), g("move", MAX_OFFSET, True)))
-    regs = doc.get("regions")
-    nodes = regs.items if isinstance(regs, Seq) else []
+    nodes = _ylist(doc, "regions", source)
     for n, en in enumerate(e.entries):
         for what, i in (("generator", en.generator), ("particle", en.particle), ("life", en.life), ("move", en.move)):
             if i is not None and i >= len(nodes):
                 raise ParamError(f"unit {n}: {what} names region {i}; there are {len(nodes)}",
-                                 *_w(units.items[n], source))
+                                 *_w(units[n], source))
     e.regions = [Region(b"") for _ in nodes]
     for en in e.entries:
         for role, i, t in (("generator", en.generator, None), ("particle", en.particle, en.particle_type),
@@ -323,6 +329,7 @@ def from_yaml(text: str, source: str | None = None) -> E2d:
     for i, r in enumerate(nodes):
         if not isinstance(r, Map):
             raise ParamError("each region is a mapping", *_w(r, source))
+        _yregion(r, i, source)
         tail = _yhex(r.get("tail"), "tail", source) if r.get("tail") is not None else b""
         fn = r.get("fields")
         if fn is None:

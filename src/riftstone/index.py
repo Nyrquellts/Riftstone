@@ -51,7 +51,7 @@ class Index:
 
     def refresh(self, progress=None) -> dict:
         """Re-read the directories of new or changed archives; drop vanished ones."""
-        live = {self.game.arc_name(p): p for p in self.game.archives()}
+        live = dict(self.game.archive_names())
         known = {row[0]: (row[1], row[2]) for row in self.db.execute("SELECT arc, size, mtime FROM arcs")}
         changed = 0
         todo = []
@@ -81,8 +81,7 @@ class Index:
         """How many archives refresh() would re-read (0 means the index is current)."""
         known = {row[0]: (row[1], row[2]) for row in self.db.execute("SELECT arc, size, mtime FROM arcs")}
         n = 0
-        for p in self.game.archives():
-            arc = self.game.arc_name(p)
+        for arc, _p in self.game.archive_names():
             st = self.game.vanilla_arc(arc).stat()
             if known.get(arc) != (st.st_size, st.st_mtime_ns):
                 n += 1
@@ -90,6 +89,13 @@ class Index:
 
     def archives_with(self, name: bytes, type_id: int) -> list[str]:
         return [r[0] for r in self.db.execute("SELECT arc FROM res WHERE name=? AND type=? ORDER BY arc", (name, type_id))]
+
+    def names_under(self, folder: str, type_id: int) -> list[bytes]:
+        """Every resource name of one type under a folder (``scr\\st424\\etc\\``; any case), each once."""
+        prefix = folder.lower().replace("/", "\\").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = self.db.execute("SELECT DISTINCT name FROM res WHERE type=? AND name_lc LIKE ? ESCAPE '\\'",
+                               (type_id, prefix + "%"))
+        return [r[0] for r in rows]
 
     def search(self, text: str, type_id: int | None = None, limit: int = 200) -> list[dict]:
         """Names containing text.  An extension is understood too: 'shl' also lists every .shl
@@ -109,7 +115,9 @@ class Index:
         return self._search(text, type_id, limit)
 
     def _search(self, text: str, type_id: int | None, limit: int) -> list[dict]:
-        pattern = "%" + text.lower().replace("/", "\\").replace("%", r"\%").replace("_", r"\_") + "%"
+        # the engine's separator is also the LIKE escape: double it before escaping the wildcards
+        pattern = "%" + (text.lower().replace("/", "\\").replace("\\", "\\\\")
+                         .replace("%", r"\%").replace("_", r"\_")) + "%"
         q = "SELECT name, type, size, COUNT(*), MIN(arc) FROM res WHERE name_lc LIKE ? ESCAPE '\\'"
         args: list = [pattern]
         if type_id is not None:

@@ -7,22 +7,24 @@ updates the DLL and keeps your settings. Sources: `native/loader/` (`loader.cpp`
 `live.cpp`, `fixes.cpp`, `session.cpp`, `overlay.cpp`, `graphics.cpp`). Python side: `src/riftstone/runtime.py`
 and `pe.py`, the `live`, `crash`, `saves` and `laa` commands, `loader d3d9`, `doctor`, and Studio's Game tab.
 
-**Status, honestly:** every part below runs in a harness: 274 checks on a stand-in game, real
+**Status, honestly:** every part below runs in a harness: 304 checks on a stand-in game, real
 Direct3D 9 frames (the in-game panel read back from them, over Windows' Direct3D 9 and over DXVK), and the
 engine parts on the real DDDA.exe code mapped read-only. **In the game itself it is UNKNOWN** until the first launch. The loader's hooks and
 overlay *did* run in the game on 2026-09-24 (`riftstone\logs\loader.log`: all five hooks installed,
-archives redirected, two plugins loaded), so the base is proven; the new parts are not yet.
+archives redirected, two plugins loaded), so the base is proven; the new parts are not yet. Loader 0.4.1
+fixes eleven faults a review found in 0.3.2, each reproduced in the harness first (below, "Loader 0.4.1").
 
 ## What it does
 
 | Part | What you get | Default | Game |
 |---|---|---|---|
-| Crash reports | `riftstone\logs\crash-<time>.txt` + `.dmp`: the fault, which plugin or module it is in, the **engine class** of each object in the registers and on the stack (`uEm5200`, `sSetManager`...), memory headroom with a verdict when the game ran out of address space, the stage, the last files opened, the files it looked for and did not find | on | both |
+| Crash reports | `riftstone\logs\crash-<time>.txt` + `.dmp`: the fault, which plugin or module it is in, the **engine class** of each object in the registers and on the stack (`uEm5200`, `sSetManager`...), memory headroom with a verdict when the game ran out of address space, the stage, the last files opened, the files it looked for and did not find. A stack overflow gets one too (written from a helper thread) | on | both |
 | Fatal-error reports | the game's own "Failed open file" box becomes `fatal-<time>.txt` (the missing file, what it means) and the box gains one line naming it | on | both |
 | Hang reports | no frame for 20 s while the game is in front: `hang-<time>.txt` with where the main thread waits. The game is not touched | on | both |
 | **Why the game closed** | a normal exit leaves no report, so the loader watches it happen: Alt+F4 (and whether the key came from the keyboard or a program), the close button or window menu, a close message from another program, Windows ending the session, the game's own exit menu, its fatal error. `loader.log` gets an `exit` line and the exit summary ends `ended by: ...`; `runtime-state.ini` keeps it; `Riftstone.cmd crash`, `doctor` and Studio's Game tab say it, and whether it was a crash | on | both (the exit menu: DDDA 2364871) |
 | Report rotation | the newest 10 of each kind; `loader.prev.log` keeps the last session's log | on | both |
 | **Missing-texture guard** | a texture the game needs and cannot find gets a neutral 4x4 grey stand-in instead of stopping the game; `loader.log` names it | on | both |
+| **Archive guard** (1.0.1) | a resource the game asks for as a loose file before its archive was read (a skipped cutscene, a slow drive) gets its own bytes from that archive instead of stopping the game; `loader.log` names it and the archive | on | DDDA |
 | **Safe mode** | two crashes in a row during start-up that no plugin explains: the next runs start without plugins and without the overlay (vanilla), with one notice box, until a mod or plugin changes or `Riftstone.cmd loader safe-mode off` | on | both |
 | **Plugin quarantine** | a plugin whose code was at fault in two start-up crashes in a row is skipped until its file changes (`Riftstone.cmd loader plugin release <name>`) | on | both |
 | Live stats | shared memory `Local\RiftstoneLive`: address space used and the largest free block, peak commit and a memory verdict (headroom/tight/bound), frame times (Present), stutters, overlay/missing/stand-in counters, plugins, the stage, enemy slots in use, the resource table's fill, what Direct3D holds by pool and which Direct3D 9 it is, the pressure watch | on | both (stage, enemies, resources: DDDA) |
@@ -31,7 +33,7 @@ archives redirected, two plugins loaded), so the base is proven; the new parts a
 | **Memory pressure watch** | past 3,400 MB of commit, or with the address space nearly used up: one `loader.log` line saying what holds the memory and what would help. Nothing is flushed: the engine keeps no resource no one uses (below) | on | both |
 | Large-address check | `loader.log` says whether the exe is large-address aware (4 GB, not 2 GB); `Riftstone.cmd laa` checks any exe and writes a copy with the flag set | always | both |
 | **In-game panel** | F10 shows a small panel over the game: enemy slots in use and the session's peak, address space with the warning level, each plugin's state, frame rate, stage (below) | on, hidden until F10 | both (enemies, stage: DDDA 2364871) |
-| Save backups | the save folder copied to `%LOCALAPPDATA%\Riftstone\saves\DDDA\<account>\<time>` before the game reads it, only when it changed; newest 20 kept; `Riftstone.cmd saves list / backup / restore` (the list also holds the `save_backup` plugin's copies, `docs/saves.md`) | on | DDDA |
+| Save backups | the save folder copied to `%LOCALAPPDATA%\Riftstone\saves\DDDA\<account>\<time>` before the game reads it, only when it changed; newest 20 kept (only folders named `YYYYMMDD-HHMMSS[-n]` count as backups: anything else there is never counted or removed); `Riftstone.cmd saves list / backup / restore` (the list also holds the `save_backup` plugin's copies, `docs/saves.md`) | on | DDDA |
 | Borderless window | windowed mode without a frame, covering the monitor | off | both |
 | Keep running when alt-tabbed | windowed/borderless only; the mouse is released while the game is behind | off | both |
 | Frame-rate ceiling | the options menu's "Variable" frame rate means `[fps] max_fps` (30..360) instead of 150 | off | DDDA 2364871 |
@@ -70,6 +72,40 @@ plugin enemy_cap.asi*; *it had nearly run out of address space (3950 MB of 4096 
 block 42 MB)*; *the game looked for model\em\e52\e5200\s01\e5200_skin_BM.tex; installed mods that
 mention it: DDO Chimeras*; *engine objects involved: sSetManager, uEm5200*.
 
+### The ini files, and how Windows reads them
+
+| File | Who reads / writes it | How |
+|---|---|---|
+| `riftstone_loader.ini` (next to the game) | the loader reads it; `loader install` merges new keys in | `GetPrivateProfileIntW` / `GetPrivateProfileStringW`; the loader itself drops a trailing `; comment` and trailing blanks from a text value (the API keeps them) |
+| `riftstone\runtime-state.ini` | the loader reads and writes it; `Riftstone.cmd crash`, `doctor`, Studio read it, `safe-mode off` and `plugin release` write it | the loader: `GetPrivateProfileStringW` / `WritePrivateProfileStringW` (every value it writes is ASCII) |
+| `riftstone\plugins\enemy_cap.ini`, `inclination_lock.ini`, `lod_tuner.ini`, `save_backup.ini` | each plugin reads its own | `GetPrivateProfileIntW` / `GetPrivateProfileStringW` |
+| the game's `config.ini` | `lod_tuner` reads `Resolution`, `CameraFov`, `ViewRange` | `GetPrivateProfileStringW` |
+| `riftstone\logs\last-crash.txt` | not an ini: `key=value` lines the loader writes after a crash and reads at the next start | UTF-8, `CreateFile` / `WriteFile`, parsed line by line by the loader |
+
+No native part reads or writes an ini any other way. What Windows' profile API does with the bytes,
+**measured** on this PC (2026-09-26, Windows 11 build 26200, ANSI code page 1252, a ctypes probe of
+`GetPrivateProfileStringW` / `WritePrivateProfileStringW`; another lane measured the same):
+
+- A file without a UTF-16 byte-order mark is read in the ANSI code page: `E9` reads as `é`, and UTF-8's
+  `C3 A9` as `Ã©`. A UTF-8 file with a byte-order mark is read the same way, and the mark also hides its
+  first section (none of that section's keys are found).
+- A UTF-16LE file with its byte-order mark is read, and written, as Unicode.
+- `WritePrivateProfileStringW` creates a new file in ANSI; a character the code page does not have is
+  written as `?` and reads back as `?`. Into an existing file without a mark it writes ANSI bytes, whatever
+  the rest of the file is.
+- A value in double quotes (`Folder = "D:\My Saves"`) is read without them. A `; comment` after a value is
+  part of the value (`c = 5 ; note` reads as `5 ; note`; `GetPrivateProfileIntW` still reads 5).
+- A key with `=` in it is written as it is but read back only under the part before the first `=`
+  (`crash=plugin.asi` → the key `crash` with the value `plugin.asi=1`), and a second write adds a second
+  line. That, and the `?` for characters outside the code page, is why runtime-state.ini keeps a plugin whose
+  file name is no plain ini key under `~` and the hex of its name (below, Safe mode); the Python side shows
+  that key as it is.
+
+So the inis belong in the ANSI code page (or UTF-16 with its mark), never UTF-8. Riftstone's Python side reads
+and writes them in that code page to match (`runtime.ini_text` / `ini_bytes` / `ini_value`, used by
+`plugins.py`, `loader.py`, `saves.py`; bug-sweep 4c126bd). **UNKNOWN**: other code pages, and Windows' "Use
+Unicode UTF-8 for worldwide language support" (ANSI code page 65001); not measured.
+
 ## In-game panel (F10)
 
 F10 (while the game is in front) shows a small panel in a corner of the game, and F10 again hides it.
@@ -77,7 +113,7 @@ Top to bottom:
 
 | Row | What it says |
 |---|---|
-| `NryQ // Riftstone v0.3.3` ... `F10` | the loader's version, and the key that hides the panel |
+| `NryQ // Riftstone v0.4.1` ... `F10` | the loader's version, and the key that hides the panel |
 | ACTIVE ENEMY POOL `3 / 10 slots` | enemies in `sSetManager`'s slots now, of the slots there are (10, or `enemy_cap`'s count). The meter fills with the share in use; a cyan tick and `peak 7` mark the most at once this session. DDDA 2364871 only |
 | MEMORY GUARD `2.71 / 4.00 GB` | the game's address space used, of all it has (a 32-bit game crashes when it runs out). A white notch marks the loader's warning level, 400 MB before the end; `32.2% headroom` is what is left |
 | chips | each plugin in load order: `ACTIVE` (loaded), `FAILED` (did not load), `SKIPPED` (quarantined, or safe mode); `safe mode: ON` first when it is on; `+N more` when two rows are full |
@@ -143,6 +179,26 @@ safe mode and the window fixes need no engine address at all.
   `0x99`, then succeeds when the texture can be created from its header; the stand-in is a valid 4x4 BC1
   texture with 3 mips (DDO's gets revision `0x9D`).
   Intercepting the box alone could not help: `exit(1)` follows it regardless.
+- **The archive guard** (1.0.1, `resources.cpp`, `[guard] from_archives = 1`). The same path stops the game
+  for any resource, not only a texture, whenever the game asks for it before the archive that holds it has
+  been read. Players report it at the ending's cutscenes: `"Failed open file.
+  ...\nativePC\id\credit_02\credit2_01_99.gmd 3"` (Steam community, "The Great Hereafter Cutscene Crash"; what
+  helped them was a faster drive). That resource (106 bytes) is in `rom\stage\stage800\stage802.arc` and never
+  loose (`riftstone find credit2_01_99`); a skipped cutscene asks for the next scene's resources early in the
+  same way. The guard answers such an open with the resource's own bytes. It looks first in the archives the
+  game opened most recently (the one it is reading), then in every archive under `nativePC`. Their directories
+  are read once, on the first miss, into a table of name hashes that `loader.log` times. Each candidate is
+  checked by name and type, and a mod's copy of an archive in `riftstone\overlay` is read instead of the
+  game's. The bytes go to `riftstone\standin\nativePC\<path>` and are opened read-only. The rules:
+  - the type comes from the path's extension (`restypes.inc`, generated from the type map);
+  - `.arc` is never answered: a missing archive is not a resource inside another;
+  - a payload whose zlib stream or Adler-32 does not check is not served;
+  - a resource no archive holds still fails, except a texture, which gets the grey stand-in.
+
+  Dark Arisen only (Online's archives are encrypted). The loader harness (`archives`) decodes stored, fixed and
+  dynamic streams, checks the choice between two copies and the overlay's, the switch, Online and 16 threads
+  at once, and reads 37 resources of 36 types from the real `stage802.arc` (the credits text among them) byte
+  for byte. **In game: UNKNOWN** until a session shows `was not read in yet` in `loader.log`.
 - **Frame-rate ceiling.** The mode switch loads 150.0 / 60.0 / 30.0 (`movss xmm0, [0x01433AA8]` at
   `0x00EDD4AD`, the options' apply; the same at `0x00EDDC86`, the options' save to `MaxFPS`) and calls
   `sMain::setTargetFPS` (`0x00DBE120`, target at `sMain+0x3C`). At start-up the game reads `MaxFPS` from
@@ -168,15 +224,33 @@ safe mode and the window fixes need no engine address at all.
   only (it is Direct3D 9's own rough estimate).
 - **Direct3D 9 chain and pools, the pressure watch, the large-address check.** Their own sections below.
 - **Crash filter.** Installed first and kept first (re-asserted every 5 s); the game's filter and any
-  other module's are called after the report. Debugger and anti-tamper probes (breakpoint,
-  single-step, debug-print, thread naming, a read of `0xFFFFFFFF`) pass straight through without a
-  report, and a filter further down that recovers keeps the game running (up to three reports a
-  session), so a probe cannot use up the report a real crash needs.
+  other module's are called after the report (up to four other modules' filters, newest first). A module
+  that sets its own filter over ours got ours as the filter before it and may call it in turn: a guard in
+  the filter answers a call on a thread that is already inside it at once, so one crash is one report and
+  each filter runs once (before 0.4.1 the two called each other until the stack ran out, with three reports).
+  Debugger and anti-tamper probes (breakpoint, single-step, debug-print, thread naming, a read of
+  `0xFFFFFFFF`) pass straight through without a report, and a filter further down that recovers keeps the
+  game running (up to three reports a session), so a probe cannot use up the report a real crash needs.
+  `[loader] crash_reports = 0` leaves `SetUnhandledExceptionFilter` unhooked, so the game's own filter
+  reaches Windows as it would without the loader.
+- **A crash with little stack left.** Writing a report takes tens of KB of stack; after a stack overflow the
+  crashing thread has a few KB. So for a stack overflow, or any crash with less than 64 KB of the thread's
+  stack left (Windows 8 and later can tell; on 7 only the overflow counts), the crash note is written first
+  with static buffers (a few hundred bytes of stack), then the report and minidump on a helper thread with a
+  stack of its own while the crashing thread waits (up to 30 s). When the crashing thread holds the loader
+  lock (a crash inside a `DllMain`, e.g. a plugin's while the loader loads it), no new thread can start, so
+  only the note is written. Before 0.4.1 the report and the note were left empty and the process ended with a
+  second fault (`0xC0000005`), so a stack overflow never counted towards safe mode or quarantine.
 - **Safe mode.** `riftstone\runtime-state.ini` remembers how each session ended; the crash handler
   leaves `riftstone\logs\last-crash.txt` (uptime, faulting module). "Start-up" means the first two
   minutes. A clean exit, or a run past two minutes, resets the count. The setup fingerprint covers
   `riftstone\plugins`, `riftstone\overlay`, the ini and the DLL `[d3d9] chain` names. Safe mode turns off the overlay; mods installed
-  directly into `nativePC` (without the loader) are not covered.
+  directly into `nativePC` (without the loader) are not covered. A plugin's strikes and quarantine are kept
+  under its file name, or, when the name is no plain ini key (it has `=`, starts with `;` `#` `[` `~` or a
+  blank, ends in a blank, or leaves printable ASCII), under `~` and the hex of its lower-case UTF-8: the ini
+  reader splits a key at its first `=`, so before 0.4.1 such a plugin's strikes never added up. An older
+  loader's entry under the bare name is moved to the new key when it is read, and its split lines removed.
+  `Riftstone.cmd loader plugin release` takes the plugin's name or its `~` key (`loader.log` names it).
 - **Why the game closed.** Below, with the exit paths it rests on (`session.cpp`, `exit_sites.h`).
 
 ### Why the game closed
@@ -430,6 +504,29 @@ header), or warns when an exe lacks it: Windows then gives it 2 GB instead of 4 
 `doctor` checks the game's exe, and the loader harness sets the flag on its own stand-in copy for the pressure
 test, which commits 3.45 GB in one process.
 
+## Loader 0.4.1: faults fixed
+
+A review of 0.3.2 found these; each was reproduced in the harness first (the check failed on 0.3.2) and
+passes on 0.4.1. What they prove is the stand-in game's behaviour; **in the game itself all of it is
+UNKNOWN** until a launch.
+
+| Fault in 0.3.2 | Now | Harness (`run_tests.py --only ...`) |
+|---|---|---|
+| A stack overflow left an empty report and an empty crash note: the report writer faulted again on the few KB of stack left and the process ended with `0xC0000005`; the next start read the empty note as "a crash after 0 s", not during start-up, so safe mode and quarantine never counted it | the note first with static buffers, the report and minidump from a helper thread (above) | `overflow`: the process ends with `0xC00000FD`, the game's filter still runs, one full report and minidump, a complete note; two start-up overflows start safe mode; two in a plugin quarantine it |
+| A plugin that hooked one of the game's imports itself (CreateFileW in its `DllMain`) was taken for the DRM restoring the table: the loader put its own hook back in front and called the plugin's, which called the loader's, until the stack ran out, at the first file the game opened | an import slot is hooked again only when it holds what it held before the loader hooked it, or the export itself; any other value is another module's hook, left in place and named once in `loader.log` | `hooks`: the game runs, the overlay still serves through the plugin's hook, `loader.log` says it was left in place |
+| A module's own crash filter set over the loader's (it had the loader's as the filter before it) made one crash go round the two filters: three identical reports and minidumps, each filter run tens of thousands of times, the process ending in a stack overflow | the filter answers a call on a thread already inside it at once (one crash, one report), and the module's filter is still called after the report | `filters`: one report, one minidump, the module's filter runs once, the process ends with the access violation |
+| A folder name of 64 characters or more in the save-backup folder stopped every start: a fixed 64-character copy fail-fasted inside the loader's start-up (`0xC0000409`), in safe mode too, with no report | only folders named like a backup (`YYYYMMDD-HHMMSS`, or with `-<n>`) are read, into buffers that fit them | `foreignsaves`: a 72-character folder name, the game starts and the save is backed up |
+| Pruning removed folders it had not made: every folder in the backup folder counted as a backup, and those sorting before the time stamps (`(`, `!`, `0`...) were deleted file by file; one sorting after them was taken for the newest backup, so an unchanged save was copied again each start | the same: only backup-named folders are counted, compared or pruned (never a junction); a second backup in the same second gets `-1`, `-2`... instead of reusing the folder | `foreignsaves`: with `keep = 1` user folders and their files stay; an unchanged save is not copied again |
+| `[loader] crash_reports = 0` also switched off the game's own crash filter: its `SetUnhandledExceptionFilter` call was kept for the loader's filter, which was never installed | with reports off, `SetUnhandledExceptionFilter` is not hooked (and the hook passes the call on) | `crashoff`: the game's filter runs, no report |
+| A plugin whose file name holds `=` was never quarantined: its key in runtime-state.ini was split at the `=` (strikes stayed at 1 and a line was added each run), and each of its start-up crashes reset the safe-mode count | such names (and others that are no plain ini key) are kept under `~` and the hex of the name; an older loader's lines for it are removed | `names`: quarantined after two start-up crashes, no split lines; an older loader's quarantine under a non-ASCII bare name is still honoured and moved |
+| `[loader] chain = dinput8.dll` loaded the loader itself as the chain, so `DirectInput8Create` called itself (`0xC0000005` at start); so did a chain whose export forwards to `dinput8.DirectInput8Create` | a chain that is the loader, or whose export is the loader's own, is refused (logged); the system dinput8 answers | `dinputchain`: both, the game runs with DirectInput |
+| After a session without a crash, the last-session record could carry stack garbage as `report=` (the crash note's parts were left unset when there was no note) | every part is set before the note is read | `state`: with `[loader] test_stack_fill = 1` (the harness's way in: the stack is filled with old data first) no `report` is recorded |
+| The texture stand-in was made without a lock: two threads missing a texture at once could collide (the second's exclusive open failed and the game got its fatal error), and a reader could see the path half written | made once (`InitOnceExecuteOnce`), written under a name of its own and moved into place | `guard`: 32 threads at once, all get the stand-in, 5 fresh starts (0.3.2: 6 of 32 and 1 of 32 in two of them) |
+| enemy_cap was found only as `enemy_cap.asi`: renamed (`01_enemy_cap.asi`), the live view and the panel read the vanilla ten slots (`7 / 10`) instead of its own | found by its `EnemyCap_Slots` export among the loaded plugins (then by the old name) | `cap`: with a renamed stand-in enemy_cap, 17 of its 30 slots |
+
+The loader's version is written once (`runtime.h`); the panel's header, the log, the reports and the live
+page take it from there (a harness check fails if a loader source spells a version out).
+
 ## Dragon's Dogma Online
 
 `DDO.exe` imports DirectInput8Create, so the same `dinput8.dll` loads there, and the runtime knows it
@@ -456,7 +553,7 @@ symbols (2026-09-25):
 | 2,048-slot texture descriptor cache; purge every frame; raise to 16k; dedupe textures | **False** | `sResource` has 16,384 slots (2,048 buckets x 8); a resource whose 17 candidate buckets are all full stays unregistered and is loaded again on the next request; nothing purges the table each frame. **Built:** the live view measures the fill. Textures with one path are already loaded once. |
 | route `MtHeapAllocator` into mimalloc | **Not applicable** | the pools are committed up front (`MtHeapAllocator` one `VirtualAlloc`; `MtVirtualAllocator` reserves 512 MiB); swapping the allocator frees nothing. The live view and crash reports measure the real limit instead: address space and the largest free block. |
 | DXVK "integration" | **Built, the owner's choice** | `[d3d9] chain` (`loader d3d9 add <DXVK release>`): DXVK's `d3d9.dll` from `riftstone\dxvk`, nothing in the game folder; measured in the harness (682 MB of managed textures: +711 MB of address space under Windows' Direct3D 9, +125 MB under DXVK 3.1.1). Nothing is downloaded or bundled: the owner's own DXVK release goes in. |
-| null-resource fallback | **Applicable, built** | the texture guard (above), proven safe by the fatal-path trace. Other resource types have no safe stand-in. |
+| null-resource fallback | **Applicable, built** | the texture guard (above), proven safe by the fatal-path trace; since 1.0.1 any resource an archive holds gets its own bytes instead (the archive guard). A resource no archive holds has no safe stand-in but a texture. |
 | clamp `.lot` coordinates to the navmesh | **Not at run time** | positions are checked where they are made (Studio's map, `encounter`); the engine's navmesh query is not mapped. |
 | corrupted records skip to the next 4-byte boundary | **Not at run time** | Riftstone's strict, fuzzed parsers refuse damaged data before it reaches the game. |
 | VEH crash logger with DTI-resolved call stacks, 5 rotated logs | **Applicable, built** | an unhandled-exception filter (a VEH would see every handled exception too); class names from the DTI; 10 of each kind kept. |
@@ -469,11 +566,17 @@ window's size, but it multiplies the radius within which its cells load (the LOD
 
 ## Proof
 
-- `python native/loader/test/run_tests.py`: 216 checks. On stand-in games (`harness.exe` copied in as
+- `python native/loader/test/run_tests.py`: 304 checks. On stand-in games (`harness.exe` copied in as
   DDDA.exe, DDO.exe or a launcher): overlay rules, missing files and the stand-in (it parses with
-  `tex.py`), the import table put back after start-up, plugins, crash/fatal/hang reports, report
-  rotation, probes that are not crashes, plugin quarantine, safe mode on and off, live stats with real
-  Direct3D 9 frames, borderless and background running, save backups, pass-through. Why the game closed,
+  `tex.py`; also 32 threads missing textures at once), the import table put back after start-up and a
+  plugin's own import hook left in place (`chain_plugin.asi`), a chained dinput8 that is the loader or
+  forwards back to it refused (`fwd_chain.dll`), plugins, crash/fatal/hang reports (a stack overflow's,
+  on the main thread and in a plugin; one crash through a module's chaining filter), crash reports
+  switched off, report rotation, probes that are not crashes, plugin quarantine (a name with `=`, and an
+  older loader's entry under a non-ASCII name), safe mode on and off (two stack overflows start it too), the
+  last session's record after a clean exit, live stats with real Direct3D 9 frames (and a renamed enemy_cap,
+  `cap_plugin.asi`), borderless and background running, save backups (next to a 72-character folder name
+  and folders of the user's), pass-through, and that no loader source spells out a version. Why the game closed,
   with DDDA's window procedure and loop stood in (`close <how>`): Alt+F4, the close button, the window
   menu, a destroyed window, an exit with no message, a `WM_CLOSE` posted and one sent from another
   process, `SC_CLOSE`, `WM_QUIT` and `WM_DESTROY` from outside, `WM_ENDSESSION` (written before the

@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Callable
 
 from .errors import FormatError, RiftError
+from .runtime import ini_text
 
 SIZE = 524_288
 HEADER = 32
@@ -136,12 +137,15 @@ def steam_saves(roots: list[Path] | None = None) -> list[tuple[str, Path]]:
 
 
 def _ini_folder(ini: Path) -> str | None:
+    """save_backup.ini's Folder as the plugin reads it (in the code page: runtime.ini_text)."""
     cp = configparser.ConfigParser(interpolation=None, strict=False)
     try:
-        cp.read_string(ini.read_text(encoding="utf-8-sig", errors="replace"))
+        cp.read_string(ini_text(ini.read_bytes()))
     except (OSError, configparser.Error):
         return None
     value = cp.get("backup", "Folder", fallback="").strip()
+    if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":   # Windows drops a pair of quotes
+        value = value[1:-1].strip()
     return None if not value or value.lower() == "auto" else os.path.expandvars(value)
 
 
@@ -273,7 +277,7 @@ def pick(listed: list[Backup], which: str, account: str | None = None) -> Backup
     if len(accounts) > 1:
         raise RiftError(f"copies of several accounts ({', '.join(accounts)}); choose one with --account")
     if which.isascii() and which.isdigit():
-        n = int(which)
+        n = int(which) if len(which) <= 9 else 0      # int() refuses more than 4,300 digits
         if not 1 <= n <= len(listed):
             raise RiftError(f"there are {len(listed)} copies; pick 1 (the newest) to {len(listed)}")
         return listed[n - 1]
@@ -319,10 +323,11 @@ def backup(save: Path, root: Path, account: str) -> tuple[Path, bool]:
 
 def _refuse_while_running(game_running: Callable[[], bool] | None) -> None:
     if game_running is None:
-        from .install import game_running as _running
+        from .game import KINDS
+        from .install import exe_running
 
         def game_running() -> bool:
-            return _running(None)
+            return exe_running(KINDS["ddda"]["exe"])
     if game_running():
         raise RiftError("Dragon's Dogma is running. Close it first: the game would write over the restored save.")
 

@@ -114,6 +114,28 @@ class DddaCameraTest(unittest.TestCase):
             with self.assertRaises(ParamError):
                 camera.from_yaml(broken)
 
+    def test_yaml_name_stays_in_its_comment(self):
+        # the resource name went into the header comment as it was: a newline in it began a YAML line
+        # of its own (here a second 'riftstone:' key, which also fooled params' tag detection)
+        from riftstone import params
+        for cl in (ddda_sample(), ddo_sample()):
+            raw = camera.build(cl)
+            y = camera.to_yaml(cl, "x\nriftstone: xfs/1\r\t\"#")
+            self.assertEqual(camera.yaml_to_bytes(y), raw)
+            self.assertEqual(params.yaml_to_resource(y), raw)
+
+    def test_yaml_long_hex_number(self):
+        # base 16 has no digit limit, but 3,572 hex digits are over 4,300 decimal ones: the range message
+        # printed the number and leaked int -> str's ValueError
+        big = "0x" + "f" * 3572
+        y, yd = camera.to_yaml(ddda_sample()), camera.to_yaml(ddo_sample())
+        for bad in (y.replace("slot: 7", "slot: " + big), y.replace("version: 3", "version: " + big),
+                    yd.replace("[256, 256, 256, 504, 5]", "[256, 256, 256, 504, " + big + "]")):
+            self.assertNotIn(bad, (y, yd))
+            with self.assertRaises(ParamError) as cm:
+                camera.from_yaml(bad)
+            self.assertLess(len(str(cm.exception)), 200)
+
     @unittest.skipUnless(ddda_found(), "Dragon's Dogma: Dark Arisen not found")
     def test_corpus_byte_exact(self):
         from riftstone import corpus, typemap

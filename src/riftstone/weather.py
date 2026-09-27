@@ -533,7 +533,8 @@ def to_yaml(w: Weather, name: str | None = None) -> str:
     from . import yamlish
     from .yamlish import Map, Scalar
     k = KINDS[w.kind]
-    head = [f"Riftstone {k.cls} (.{k.ext}, version {k.version})" + (f" -- {name}" if name else "")]
+    shown = " -- " + "".join(c if c.isprintable() else " " for c in name) if name else ""   # stays in its comment
+    head = [f"Riftstone {k.cls} (.{k.ext}, version {k.version})" + shown]
     head += _HEAD_NOTES.get(w.kind, [])
     head.append("Floats are exact; rebuilds byte-for-byte when untouched.")
     items = [(Scalar("riftstone"), Scalar(f"{k.ext}/1"))]
@@ -543,6 +544,12 @@ def to_yaml(w: Weather, name: str | None = None) -> str:
     for nm, t in k.fields:
         items.append((Scalar(nm), _node(t, w.data[nm], nm)))
     return yamlish.emit(Map(items), head)
+
+
+def _num(v: int, text: str) -> str:
+    """A number for a message: in decimal, or its text cut short past 64 bits (int -> str refuses over
+    4,300 digits, and a hex number has no such limit)."""
+    return str(v) if v.bit_length() <= 64 else repr(text.strip()[:16] + "...")
 
 
 class _Y:
@@ -575,7 +582,7 @@ class _Y:
             raise self.err(f"{what}: {txt!r} is not a whole number", node) from None
         lo, hi = _RANGE[t]
         if not lo <= v <= hi:
-            raise self.err(f"{what}: {v} is outside {lo}..{hi}", node)
+            raise self.err(f"{what}: {_num(v, txt)} is outside {lo}..{hi}", node)
         return v
 
     def f32(self, node, what):
@@ -597,9 +604,11 @@ class _Y:
         if isinstance(node, Map):
             h = node.get("hex")
             try:
+                if len(node.items) != 1:
+                    raise ValueError
                 return bytes.fromhex(h.text)
             except (AttributeError, ValueError):
-                raise self.err(f"{what}: hex must be pairs of hex digits", node) from None
+                raise self.err(f'{what}: raw bytes are {{hex: "..."}}, pairs of hex digits', node) from None
         if not isinstance(node, Scalar):
             raise self.err(f"{what} must be text", node)
         try:

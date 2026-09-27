@@ -706,7 +706,7 @@ static int BuildPanel() {
     char a[32], b[32], c[64];
     DrawShape();
 
-    // NryQ // Riftstone v1.0.0                                                     F10
+    // NryQ // Riftstone v<RIFTSTONE_VERSION_A, runtime.h>                          F10
     _snprintf_s(c, _countof(c), _TRUNCATE, "NryQ // Riftstone v%s", RIFTSTONE_VERSION_A);
     Text(F_HEAD, X(CL), Base(HEAD_Y, HEAD_H, F_HEAD), c, text);
     char key[8];

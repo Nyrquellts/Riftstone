@@ -12,6 +12,10 @@ import helpers
 from riftstone import arc, studio, typemap, xfs
 from riftstone.game import Game
 
+# the environment this module's classes set (a stand-in RIFTSTONE_HOME) is put back when it ends: a later
+# module that reads the real game (test_compat) otherwise found an empty stand-in index
+setUpModule, tearDownModule = helpers.module_env("RIFTSTONE_HOME", "RIFTSTONE_GAME", "RIFTSTONE_DDO", "RIFTSTONE_DDO_ASSETS", "RIFTSTONE_MODS", "RIFTSTONE_WORKSPACE")
+
 STATUS = 0x215896C2
 
 
@@ -133,6 +137,46 @@ class StudioTest(unittest.TestCase):
         self.assertIn("between 0 and 255", v["error"])
         self.assertIsNotNone(v["line"])
 
+    def test_a_crash_report_says_who_it_is_for(self):
+        from riftstone import legal
+        logs = self.game.state_dir / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "crash-20260926-080000.txt").write_text("Riftstone crash report (Riftstone loader 0.3.1)\r\n"
+                                                        "uptime      3.000 s\r\n", encoding="utf-8")
+        code, r = self.req("GET", "/api/crash?name=crash-20260926-080000.txt")
+        self.assertEqual(code, 200, r)
+        self.assertEqual(r["support"], legal.SUPPORT)
+        self.assertIn("not to Capcom's support", r["support"])
+
+    def test_share_and_receive_a_package(self):
+        import base64
+        import io
+        import zipfile
+
+        from riftstone import mod as modlib
+        self.assertEqual(self.req("POST", "/api/mods/new", {"name": "Shared"})[0], 200)
+        code, r = self.req("POST", "/api/mods/extract", {"mod": "Shared", "path": "param/status/enemy.statusparam"})
+        self.assertEqual(code, 200, r)
+        f = self.workspace / "Shared" / r["file"]
+        f.write_text(f.read_text(encoding="utf-8").replace("mByte: 200", "mByte: 201"), encoding="utf-8")
+        before = {(c.name, c.type_id): c.data for c in modlib.collect(modlib.Mod.load(self.workspace / "Shared"))}
+        code, pkg = self.req("GET", "/api/files/package?mod=Shared")
+        self.assertEqual(code, 200, pkg)
+        data = base64.b64decode(pkg["b64"])
+        self.assertLess(pkg["new_bytes"], 16)                        # one changed number, the rest the game's
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            self.assertFalse(any(z.read(n).startswith((b"XFS\0", b"ARC\0")) for n in z.namelist()))
+        code, r = self.req("POST", "/api/files/receive", {"b64": pkg["b64"]})
+        self.assertEqual(code, 400)                                  # the mod is there already
+        (self.workspace / "Shared").rename(self.workspace / "Shared (mine)")
+        code, r = self.req("POST", "/api/files/receive", {"b64": pkg["b64"]})
+        self.assertEqual(code, 200, r)
+        self.assertEqual(r["mods"], ["Shared"])
+        after = {(c.name, c.type_id): c.data for c in modlib.collect(modlib.Mod.load(self.workspace / "Shared"))}
+        self.assertEqual(after, before)
+        code, r = self.req("POST", "/api/files/receive", {"b64": base64.b64encode(b"not a zip").decode()})
+        self.assertEqual(code, 400)
+
     def test_paths_from_the_page_cannot_escape(self):
         self.req("POST", "/api/mods/new", {"name": "Safe"})
         for route, body in (("mods/new", {"name": "../escape"}), ("mods/new", {"name": "C:\\x"}),
@@ -216,6 +260,106 @@ class StudioTest(unittest.TestCase):
         from test_lot import SAMPLE
         self.assertEqual(self.studio.validate(lot.to_yaml(lot.parse(SAMPLE)), "l.yaml")["summary"], "4 records")
         self.assertEqual(self.studio.validate(itl.to_yaml(itl.parse(item_list())), "i.yaml")["summary"], "5 items")
+
+    def test_bodies_of_the_wrong_type_are_400(self):
+        """Wrong types reached code that expects others: mods/new {"game": [1]} (unhashable), install {"mods": 5},
+        mods/extract {"path": 5} (fsmap), help {"text": ["x"]}, port {"as": ["x"]} (port.py): each answered 500.
+        An unknown search type searched every type."""
+        from unittest import mock
+
+        from riftstone import mod
+
+        self.req("POST", "/api/mods/new", {"name": "Typed"})
+        mod.Mod.create(self.workspace / "Online Typed", "Online Typed", game="ddo")
+        port = {"mod": "Online Typed", "path": "model/x.tex"}
+        cases = [("mods/new", {"name": "Typed 2", "game": [1]}), ("mods/new", {"name": "Typed 3", "game": {"a": 1}}),
+                 ("install", {"mods": 5}), ("install", {"mods": None}), ("install", {"mods": "Typed"}),
+                 ("install", {"mods": [5]}), ("mods/extract", {"mod": "Typed", "path": 5}),
+                 ("mods/extract", {"mod": "Typed", "path": ["x"]}), ("mods/extract", {"mod": "Typed", "path": None}),
+                 ("help", {"text": ["x"]}), ("help", {"text": 5}), ("help", {"text": {"a": 1}}),
+                 ("port", {**port, "as": ["x"]}), ("port", {**port, "as": 5}), ("port", {**port, "like": [1]})]
+        # the port refusals come before Studio looks for the other game's install
+        with mock.patch.object(studio, "find_game", side_effect=AssertionError("looked for the other game")):
+            for route, body in cases:
+                code, r = self.req("POST", "/api/" + route, body)
+                self.assertEqual(code, 400, (route, body, r))
+        self.assertFalse((self.workspace / "Typed 2").exists() or (self.workspace / "Typed 3").exists())
+        code, r = self.req("GET", "/api/search?q=status&type=nope")
+        self.assertEqual(code, 400, r)
+        self.assertIn("nope", r["error"])
+        self.assertEqual(self.req("GET", "/api/search?q=status&type=statusparam")[0], 200)
+
+    def test_help_for_a_parameter_file_follows_its_path(self):
+        """Every parameter file's YAML is tagged xfs/1, and the tag won: a state machine got the XFS help (no fields)
+        instead of its own."""
+        for path, tag, want in (("files/quest/q9999_b00.fsm.yaml", "xfs", "fsm"),
+                                ("files/param/status/enemy.statusparam.yaml", "xfs", "xfs"),
+                                ("files/scr/st424/etc/st424_e.gpl.yaml", "gpl", "gpl"), ("", "xfs", "xfs")):
+            code, r = self.req("GET", f"/api/help?path={path}&tag={tag}")
+            self.assertEqual((code, r["help"]["topic"]), (200, want), path)
+
+    def test_the_editor_saves_only_text_files(self):
+        """GET file opens only .yaml/.txt/.json, but POST file wrote any file: a texture became "hello" (no history)."""
+        self.req("POST", "/api/mods/new", {"name": "Text Only"})
+        tex = self.workspace / "Text Only" / "files" / "model" / "sky" / "cube.tex"
+        tex.parent.mkdir(parents=True)
+        tex.write_bytes(b"TEX\0" + bytes(16))
+        code, r = self.req("POST", "/api/file", {"mod": "Text Only", "rel": "files/model/sky/cube.tex", "text": "hello"})
+        self.assertEqual(code, 400, r)
+        self.assertEqual(tex.read_bytes(), b"TEX\0" + bytes(16))
+        code, r = self.req("POST", "/api/file", {"mod": "Text Only", "rel": "files/README.txt", "text": "mine"})
+        self.assertEqual(code, 200, r)
+
+    def test_the_loader_route_takes_install_or_remove(self):
+        """Anything but "install" removed the loader: {} or a typo restored the archives and deleted its ini."""
+        from riftstone import loader
+
+        dll, ini = self.game.root / "dinput8.dll", self.game.root / "riftstone_loader.ini"
+        dll.write_bytes(b"MZ" + loader.MARKER)
+        ini.write_text("[loader]\noverlay = 1\n", encoding="utf-8")
+        try:
+            for body in ({}, {"action": "instal"}, {"action": ["remove"]}):
+                code, r = self.req("POST", "/api/loader", body)
+                self.assertEqual(code, 400, (body, r))
+                self.assertTrue(dll.is_file() and ini.is_file(), body)
+        finally:
+            dll.unlink(missing_ok=True)
+            ini.unlink(missing_ok=True)
+
+    def raw(self, method, path, headers=None, body=b"", timeout=5):
+        """One request with the headers and body exactly as given: (status, JSON or bytes), or (None, the
+        exception) when the server dropped the connection or never answered."""
+        c = http.client.HTTPConnection("127.0.0.1", self.port[0], timeout=timeout)
+        try:
+            c.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+            for k, v in {"Host": f"127.0.0.1:{self.port[0]}", **(headers or {})}.items():
+                c.putheader(k, v)
+            c.endheaders(body)
+            r = c.getresponse()
+            raw = r.read()
+        except (OSError, http.client.HTTPException) as e:
+            return None, e
+        finally:
+            c.close()
+        try:
+            return r.status, json.loads(raw)
+        except ValueError:
+            return r.status, raw
+
+    def test_the_server_answers_malformed_requests(self):
+        """Any web page could reach these: a non-ASCII token (in the page link or the header) made compare_digest
+        raise TypeError and the connection dropped; Content-Length abc raised ValueError; -1 read until the
+        client gave up; deeply nested JSON raised RecursionError, which only ValueError was caught for."""
+        token = {"X-Riftstone-Token": self.studio.token, "Content-Type": "application/json"}
+        self.assertEqual(self.raw("GET", "/?t=%C3%A9")[0], 403)
+        self.assertEqual(self.raw("GET", "/api/state", {"X-Riftstone-Token": "é"})[0], 403)
+        for length in ("abc", "-1", "1e3", "9" * 5000, "²", ""):
+            code, r = self.raw("POST", "/api/validate", {**token, "Content-Length": length}, timeout=3)
+            self.assertEqual(code, 400 if length else 200, (length, r))
+        deep = b"[" * 100000 + b"]" * 100000
+        code, r = self.raw("POST", "/api/validate", {**token, "Content-Length": str(len(deep))}, deep)
+        self.assertEqual(code, 400, r)
+        self.assertEqual(self.raw("GET", "/api/state", {"X-Riftstone-Token": self.studio.token})[0], 200)
 
     def test_bad_requests_are_400_not_500(self):
         for body in (None, [], "text", {"mods": "notalist"}, {"mod": 5, "path": None}):

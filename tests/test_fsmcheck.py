@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -160,6 +161,14 @@ class CheckTest(unittest.TestCase):
         self.assertNotIn("never looked at", kinds(fs))
         self.assertNotIn("never entered", kinds(fs))
 
+    def test_many_states_entered_from_any_state_stay_quick(self):
+        # each state's successors used to copy every entry: 4,000 of them took 3.7 s and 134 MB (x4 per doubling)
+        m = fsmcheck.read(machine([state(f"s{i}", i, entry=1) for i in range(4000)], {1: var("x")}))
+        t = time.perf_counter()
+        fs = fsmcheck.check(m)
+        self.assertLess(time.perf_counter() - t, 0.5)
+        self.assertEqual(fs, [])                        # each is entered from the others, and left for them
+
     def test_entries_whose_condition_cannot_hold(self):
         fs = findings(machine([state("a", 0), state("e", 1, entry=NEVER), state("f", 2, entry=55)]))
         self.assertEqual([f.kind for f in fs if f.severity == "dead"], ["entry never used", "entry never used"])
@@ -253,6 +262,37 @@ class ConditionTest(unittest.TestCase):
             c = op(16 if i % 2 else 17, op(3, var(f"v{i}"), k(i)), c)
         self.assertEqual(verdict(c), "may")
 
+    def test_an_operand_between_two_pairs_is_read_once(self):
+        # op(16, 1, c, 1) reads c in both of its pairs; reading it again for each doubled the work per level
+        # (20 levels took 8 s, 40 would take months), and so did a formula holding c twice
+        shapes = [(k(1), lambda i, c: op(16, k(1), c, k(1)), "always"),
+                  (op(1, var("x")), lambda i, c: op(16, k(1), c, k(1)), "may"),
+                  (op(1, var("x")), lambda i, c: op(17, op(3, var(f"a{i}"), k(i)), c, op(3, var(f"b{i}"), k(i))), "may"),
+                  (op(1, var("x")), lambda i, c: op(2, op(17, op(1, var(f"a{i}")), c, op(1, var(f"b{i}")))), "may")]
+        for inner, wrap, want in shapes:
+            c = inner
+            for i in range(20):
+                c = wrap(i, c)
+            x = xfs.parse(xfs.build(machine([state("a", 0)], {1: c})))
+            t = time.perf_counter()
+            m = fsmcheck.read(x)
+            self.assertLess(time.perf_counter() - t, 0.5)
+            self.assertEqual(m.verdicts[1], want)
+
+    def test_wide_conditions_stay_quick(self):
+        # an and of n operands made its normal form by copying the growing set of literals once per operand
+        # (quadratic: 8,000 took 0.4 s, and more for each), and so did finding an operand repeated in it
+        n = 15000                                           # 60,000 objects: near the most a file holds
+        shapes = [(op(16, *[op(3, var("x"), k(i)) for i in range(n)]), "never"),      # x == 0 and x == 1 ...
+                  (op(16, *[var(f"v{i}") for i in range(n)]), "may"),
+                  (op(17, *[op(3, var("x"), k(i)) for i in range(n)]), "may")]
+        for c, want in shapes:
+            x = xfs.parse(xfs.build(machine([state("a", 0)], {1: c})))
+            t = time.perf_counter()
+            m = fsmcheck.read(x)
+            self.assertLess(time.perf_counter() - t, 1.0)
+            self.assertEqual(m.verdicts[1], want)
+
 
 class StepTest(unittest.TestCase):
     """One transition check as 0x00E06710 makes it (native/fsm_exec compares 6,000 random machines)."""
@@ -326,7 +366,7 @@ class ModelTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             fsmcheck.model(m, 3)
 
-    @unittest.skipUnless(_nyrlang(), "NYR-Lang (C:\\Dev\\NyrLang) is not here")
+    @unittest.skipUnless(_nyrlang(), "NYR-Lang (<path>) is not here")
     def test_nyrlang_proves_what_fsmcheck_says(self):
         m = self.machine()
         report = _nyrlang().check(fsmcheck.model(m))

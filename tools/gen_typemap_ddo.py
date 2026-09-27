@@ -3,7 +3,7 @@
 Same method as tools/gen_typemap.py for DDDA: survey every type id in the installed DDO
 archives, name each by matching it against the JAMCRC of identifier strings in the
 executable, then choose an extension. DDO.exe ships Themida-encrypted, so the strings come
-from an unpacked dump (the one in C:\\Dev\\DDO\\Tools\\Buns_DDOPerfPatch_*; pass another with
+from an unpacked dump (the one in <path>*; pass another with
 --exe). Extensions: the community's (Arrowgene's ArcArchive.cs register list, when given),
 else DDDA's for the same class, else the payload magic, else the class name; every extension
 is unique across both games (typemap.py merges this table where DDDA has no entry).

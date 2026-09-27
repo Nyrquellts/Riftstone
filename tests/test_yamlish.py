@@ -131,6 +131,18 @@ class EmitTest(unittest.TestCase):
         out = yamlish.emit(yamlish.Map([(yamlish.Scalar(key, "double"), yamlish.Scalar("x", "plain"))]))
         self.assertEqual(yamlish.parse(out).items[0][0].text, key)
 
+    def test_a_header_line_stays_one_comment_line(self):
+        # a header line (they carry resource names) was written as is: a line break in it ended the comment,
+        # and what followed became part of the document
+        doc = Map([(Scalar("k"), Scalar("v"))])
+        text = yamlish.emit(doc, ["name a\nk: 2", "b\rc d\te"])
+        self.assertEqual(text.splitlines(), ["# name a?k: 2", "# b?c?d?e", "k: v"])
+        self.assertEqual(plain(yamlish.parse(text)), {"k": "v"})
+        import helpers as h
+        from riftstone import params, xfs
+        raw = xfs.build(h.sample_xfs())
+        self.assertEqual(xfs.build(params.from_yaml(params.to_yaml(xfs.parse(raw), "a\nroot: 1"))), raw)
+
     def test_random_trees_roundtrip(self):
         rng = random.Random(7)
         words = ["a", "b c", "null", "1", "x: y", "é", "#", "'", '"', "\\", "- z", "[", "}", "", " s ", "ok"]

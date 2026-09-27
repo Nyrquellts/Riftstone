@@ -56,23 +56,29 @@ struct Expect {
     {OPERATION_EVAL, "\x8b\x44\x24\x04\x56\x50\x8b\xf1\xe8\xa3\xda\xff"},
 };
 
-// Everything a case builds lives here, cleared per case.
+// Everything a case builds lives here, cleared per case.  Every size is checked against what is left before
+// it is computed, so a count from the case file cannot wrap round 32 bits to a small block that the case
+// then writes past.
 struct Arena {
     uint8_t* base = nullptr;
     size_t used = 0, size = 0;
+    [[noreturn]] void TooBig() const {
+        printf("the case needs more than %u bytes\n", (unsigned)size);
+        ExitProcess(1);
+    }
     void* Take(size_t n) {
-        n = (n + 15) & ~(size_t)15;
-        if (used + n > size) {
-            printf("the case needs more than %u bytes\n", (unsigned)size);
-            ExitProcess(1);
-        }
+        if (n > size - used) TooBig();          // used <= size, so size - used does not wrap
+        n = (n + 15) & ~(size_t)15;             // n <= size (16 MB) here: no wrap either
+        if (n > size - used) TooBig();
         void* p = base + used;
         used += n;
         return p;
     }
     template <class T>
     T* New(long long count = 1) {
-        return (T*)Take(sizeof(T) * (size_t)(count > 0 ? count : 1));
+        if (count < 1) count = 1;
+        if ((unsigned long long)count > (size - used) / sizeof(T)) TooBig();   // before the multiplication
+        return (T*)Take(sizeof(T) * (size_t)count);
     }
     void Reset() {
         memset(base, 0, used);

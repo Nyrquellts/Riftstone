@@ -48,6 +48,12 @@ class CellRuleTest(unittest.TestCase):
         self.assertEqual(terrain.cell_at(dx, dz), C)
         self.assertEqual(terrain.cell_at(dx + 9999.9, dz + 9999.9), C)
 
+    def test_cell_at_refuses_what_is_not_a_position(self):
+        # int(nan) raised ValueError and int(inf) OverflowError (riftstone terrain where nan,0)
+        for x, z in ((float("nan"), 0.0), (0.0, float("inf")), (float("-inf"), 1.0)):
+            with self.subTest(x=x, z=z), self.assertRaises(ParamError):
+                terrain.cell_at(x, z)
+
     def test_frames(self):
         self.assertEqual(terrain.frame(C.model).kind, "cell")
         self.assertEqual(terrain.frame("scr\\st100\\model\\st100_area00_h").kind, "world")

@@ -11,13 +11,15 @@ launched) and fsm_exec_core.dll calls the game's code on cases written here:
   * the condition lookup and the operators (0x0117AAA0 and 0x01179C90 over the game's own
     OperationWorkNode and ConstWorkNode): every operator 0..18, 99 and 0xFFFFFFFF with no operand to
     three integer or float constants, and nested operations; each result is compared with fsmcheck's
-    verdict wherever fsmcheck claims one (always / never), and the rest are counted.
+    verdict wherever fsmcheck claims one (always / never), and the rest are counted;
+  * case files with counts whose size does not fit in 32 bits: refused before anything is built.
 Needs native\\fsm_exec\\build.cmd to have run; without the build or the game it reports a skip.
 Exit status 0 = passed or skipped, 1 = a difference or a fault.
 """
 from __future__ import annotations
 
 import argparse
+import ctypes
 import itertools
 import random
 import shutil
@@ -168,6 +170,25 @@ def expect_condition(t) -> bool | None:
     return True if v == "always" else False if v == "never" else None
 
 
+# -- case files the harness must refuse ---------------------------------------------------------
+
+NODE_SIZE = 0xAC                # cAIFSMNode's MtDTI size (fsm_layout.h)
+
+
+def oversized_cases() -> list[tuple[str, str]]:
+    """Counts whose size in bytes does not fit in 32 bits (or the count itself does not): each must be
+    refused before anything is built, never wrap round to a small allocation that is then written past."""
+    wraps = -(-(1 << 32) // NODE_SIZE)          # the fewest states whose size passes 4 GB: wraps to < 0xAC bytes
+    past_arena = (16 << 20) // NODE_SIZE + 64   # enough states to write past the harness's 16 MB arena
+    return [
+        (f"{wraps} states ({wraps * NODE_SIZE:#x} bytes), {past_arena} of them given",
+         f"T 3 0 0 0 N {wraps} " + " ".join(["S 0 100 0 0 0 0"] * past_arena)),
+        (f"{0x40000001} operands in one condition", f"Q P 1 {0x40000001} " + " ".join(["K 1"] * 8)),
+        (f"a once-list of {0x40000000} entries", f"T 3 0 0 0 N 1 S 0 100 0 0 0 0 C 0 O {0x40000000} " + "1 " * 8),
+        (f"{(1 << 32) + 1} states (more than 32 bits)", f"T 3 0 0 0 N {(1 << 32) + 1} S 0 100 0 0 0 0"),
+    ]
+
+
 # -- running ------------------------------------------------------------------------------------
 
 def run_harness(exe: Path, text: str) -> tuple[int, list[str]]:
@@ -202,6 +223,18 @@ def main() -> int:
         print("fsm_exec skipped: DDDA.exe not found")
         return 0
     print("fsm_exec (Dark Arisen's own state-machine code, mapped read-only; no game launched)")
+    # A harness that faults never shows Windows' error box (the stand-in inherits this).
+    ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)          # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
+    refused = []
+    for label, text in oversized_cases():
+        code, lines = run_harness(exe, text)
+        if code == 2:
+            print("fsm_exec skipped: " + " ".join(lines[-1:]))
+            return 0
+        ok = code == 1 and any(ln.startswith("the case needs more than") for ln in lines)
+        refused.append(ok)
+        print(f"  {'pass' if ok else 'FAIL'}  a case with {label} is refused before anything is built "
+              f"(exit {code & 0xFFFFFFFF:#x}: {' | '.join(lines[-1:])[:90]})")
     rnd = random.Random(a.seed)
     cases = [random_case(rnd) for _ in range(a.cases)]
     terms = condition_terms()
@@ -246,7 +279,7 @@ def main() -> int:
         print("    " + b)
     if len(bad) > 12:
         print(f"    ... {len(bad) - 12} more")
-    return 1 if bad else 0
+    return 1 if bad or not all(refused) else 0
 
 
 if __name__ == "__main__":

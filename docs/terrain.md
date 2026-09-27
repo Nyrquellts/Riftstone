@@ -96,6 +96,9 @@ riftstone terrain localize st100e_47m35n_mrg00.world.sbc                  the sa
 - **Precision.** `localize` of a world-space file is exact: the corner is a multiple of 16 cm, so the
   difference is a float. `worldize` rounds each position to float32, at most 0.0078 cm in Gransys.
   `worldize(localize(W)) == W` byte for byte on all 417 cell models and all 836 cell collisions.
+  The other way round, a cell piece moved into the world and back (`localize(worldize(F))`) is F only
+  to within that rounding: every value comes back within 0.0078 cm, but byte for byte only 1 of the 417
+  cell models and 29 of the 836 cell collisions do (`tools/terrain_proof.py`, 2026-09-26).
 - **Build guard.** A Dark Arisen mod whose cell model or cell collision is in world coordinates **does not
   build**. The build says so and names `terrain localize`. It also fails when vertices leave their own
   bounds: a model's box, or a collision part's box and the file's box. The engine culls and tests by
@@ -108,10 +111,16 @@ riftstone terrain localize st100e_47m35n_mrg00.world.sbc                  the sa
     vanilla collision, 50m51n's `h` mesh.
 - **Proof.**
   - Offline: `tests/test_terrain.py` and `tests/test_sbc.py`.
-  - `check_corpus --only sbc`: all 1,496 collision files follow the layout to the last byte, a move and
-    back is exact, and only positional floats change (39.7 million of them).
+  - `check_corpus --only sbc`: all 1,496 collision files follow the layout to the last byte, and a move
+    by a cell corner changes only positional floats (39.7 million of them). Moved back, every value is
+    within float32 rounding of where it was (half a float32 step of the moved value plus half a step of
+    the value moved back; the largest change is 0.0156 cm, and 76 of the files come back byte for byte),
+    and moving a second time gives the same bytes as the first (2026-09-26).
+  - `tools/terrain_proof.py` checks the same on every cell model and cell collision: largest change
+    0.0078 cm, and moving twice gives the same bytes.
   - The `terrain` fuzz target checks, for a model or collision: it moves by exactly the corner, nothing
-    else changes, `localize` undoes `worldize`, and a moved cell piece cannot pass `check`.
+    else changes, `localize` gives the original back within float32 rounding and moving that into the
+    world again gives the same bytes, and a moved cell piece cannot pass `check`.
 
 ### Editing a cell in Blender (Albam)
 

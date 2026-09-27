@@ -547,6 +547,7 @@ pre.code { padding: 14px 18px; white-space: pre; }
           <div class="libsearch"><svg><use href="#i-search"/></svg><input class="input" id="libq" placeholder="Search plugins and mods" autocomplete="off"></div>
           <div class="libgroups" id="library"><div class="empty">Reading…</div></div>
           <div class="libnew"><input class="input" id="newmod" placeholder="New mod name" autocomplete="off"><button class="btn small primary" id="create">Create</button></div>
+          <div class="libnew"><button class="btn small" id="receive" title="Make a shared package's mods here, from your own game files">Install a package…</button></div>
         </aside>
         <div class="inspector">
           <div class="card insp" id="inspector"><div class="empty"><div class="big">Pick something from the library</div>A plugin shows what it does, whether it is on and its settings; a mod shows its files.</div></div>
@@ -554,7 +555,8 @@ pre.code { padding: 14px 18px; white-space: pre; }
             <div class="card insp" style="margin-top: 24px">
               <div class="row" style="margin-bottom: 10px">
                 <div class="grow"><div class="h2" style="margin: 0 0 6px">Files of <span id="fmmod"></span></div><div class="sub" id="fmsum"></div></div>
-                <button class="btn small" id="fmzip">Download the mod (.zip)</button>
+                <button class="btn small primary" id="fmshare" title="A package with no game data: each player's Riftstone makes the mod from their own game">Share (package)</button>
+                <button class="btn small" id="fmzip" title="The whole mod folder, game data included: a private copy, not for sharing">Keep a copy (.zip)</button>
                 <button class="btn small ghost" id="fmclose">Close</button>
               </div>
               <div class="row" style="margin: 0 0 12px"><div class="chips" id="fmchips" style="margin: 0"></div>
@@ -649,7 +651,7 @@ pre.code { padding: 14px 18px; white-space: pre; }
               <label>Pictures</label><div class="skinpics" id="skpics"></div>
               <label>Title</label><input class="input" id="sktitle" placeholder="White Chimera">
               <label>Number</label><input class="input" id="sknum" type="number" min="1" max="99" placeholder="the next free one">
-              <label>Put it in</label><div id="skdest"></div>
+              <label>Put it in</label><div id="skdestbox"></div>
             </div>
             <div class="row" style="padding: 0 12px 14px"><button class="btn small primary" id="skmake">Make skin</button>
               <span class="sub grow">A skin only adds files: it never clashes with other mods.</span></div>
@@ -779,10 +781,14 @@ pre.code { padding: 14px 18px; white-space: pre; }
           <div class="card gtext">
             <h2 class="gtitle display"><span class="g-en">Legal</span><span class="g-ja">法的事項</span></h2>
             <p class="g-en"><b>Riftstone is an independent, open-source project.</b> It is not affiliated with, endorsed by, sponsored by, or produced by Capcom Co., Ltd. "Dragon's Dogma", "Dragon's Dogma Online" and "Capcom" are trademarks or registered trademarks of Capcom Co., Ltd. All game assets remain the property of their respective owners.</p>
-            <p class="g-en">Riftstone contains <b>no game data</b>. It reads and rewrites the files of a copy of the game <b>you own</b>, on your own computer, and never bypasses any protection. Use it only with a legally purchased copy. A mod you share is your responsibility: share your own changes, and never redistribute the game itself.</p>
+            <p class="g-en">Riftstone contains <b>no game data</b>. It reads and changes the files of a copy of the game <b>you own</b>, on your own computer. Dark Arisen mods are served by the loader from <span class="mono">riftstone\overlay</span>: the game's own files and its executable stay as Steam installed them. Online's archives are encrypted; Riftstone reads the key from your own Online client and ships none.</p>
+            <p class="g-en">To share mods, make a <b>package</b> (Mods, Share): it holds deltas and recipes, never the game's files, and each player's Riftstone makes the mods from their own copy of the game (and of Online, for content that came from it). Share only your own work.</p>
+            <p class="g-en"><b>Free.</b> Riftstone is never sold, and nothing made with it may be sold or put behind a paywall. A crash report from a modded game is for the mods' authors and Riftstone, not for Capcom's support.</p>
             <p class="g-en">Riftstone is released under the MIT License. The Riftstone Blade display font is under the SIL Open Font License 1.1. The full notices are in <span class="mono">LICENSE</span> and <span class="mono">THIRD-PARTY-NOTICES.md</span> next to Riftstone.</p>
             <p class="g-ja"><b>リフトストーンは独立したオープンソースのプロジェクトです。</b>株式会社カプコンとの提携・承認・後援・制作の関係は一切ありません。「ドラゴンズドグマ」「ドラゴンズドグマ オンライン」「カプコン」は株式会社カプコンの商標または登録商標です。ゲームの素材の権利はすべてそれぞれの権利者に帰属します。</p>
-            <p class="g-ja">リフトストーンに<b>ゲームデータは含まれていません</b>。<b>お手持ちの</b>ゲームのファイルをご自身のコンピューター上で読み書きするだけで、保護技術の回避は一切行いません。正規に購入したコピーでのみ使用してください。共有する MOD はご自身の責任で扱い、共有するのはご自身の変更のみとし、ゲーム本体を再配布しないでください。</p>
+            <p class="g-ja">リフトストーンに<b>ゲームデータは含まれていません</b>。<b>お手持ちの</b>ゲームのファイルをご自身のコンピューター上で読み書きします。ダークアリズンの MOD はローダーが <span class="mono">riftstone\overlay</span> から読み込ませるので、ゲーム本体のファイルと実行ファイルは Steam がインストールしたままです。オンラインのアーカイブは暗号化されており、鍵はお手持ちのオンラインのクライアントから読み取ります（リフトストーンは鍵を同梱しません）。</p>
+            <p class="g-ja">MOD を共有するときは<b>パッケージ</b>（MOD、共有）を作ってください。中身は差分とレシピだけでゲームのファイルは含まれず、受け取った人のリフトストーンがその人のゲームから MOD を組み立てます。共有するのはご自身の作品のみにしてください。</p>
+            <p class="g-ja"><b>無料です。</b>リフトストーンは販売されず、これで作ったものを販売したり有料の壁の向こうに置いたりしてはいけません。MOD を入れたゲームのクラッシュレポートは MOD の作者とリフトストーンへ。カプコンのサポートには送らないでください。</p>
             <p class="g-ja">リフトストーンは MIT ライセンスで公開されています。表示用フォント Riftstone Blade は SIL Open Font License 1.1 です。全文は <span class="mono">LICENSE</span> と <span class="mono">THIRD-PARTY-NOTICES.md</span> にあります。</p>
           </div>
         </div>
@@ -868,8 +874,18 @@ try {
 /* ---------- state ---------- */
 function pill(kind, label, value) { return `<span class="pill ${kind}"><span class="dot"></span>${esc(label)}${value ? " <b>" + esc(value) + "</b>" : ""}</span>`; }
 async function refresh() {
+  // Re-render only what changed, so a click never lands on an element being replaced.
+  const changed = (key, value) => { const j = JSON.stringify(value); if (S["sig_" + key] === j) return false; S["sig_" + key] = j; return true; };
   let st;
-  try { st = await api("state"); } catch (e) { return; }
+  try { st = await api("state"); } catch (e) {
+    // say so: a silent return left the page empty after a reload
+    if (changed("pills", "error:" + e.message)) {
+      $("#pills").innerHTML = pill("bad", "Studio", "error"); $("#pills").firstChild.title = e.message;
+      toast(`Studio could not read its state: ${e.message}`, "bad", 12000);
+    }
+    return;
+  }
+  const first = !S.state;
   S.state = st; S.mods = st.mods;
   const g = st.game, ix = st.index;
   let p = "";
@@ -880,18 +896,18 @@ async function refresh() {
     p += pill(g.running ? "ok" : "", "Game", g.running ? "running" : "closed");
   }
   if (!ix.ready) p += pill(ix.error ? "bad" : "warn", "Index", ix.error ? "failed" : `${ix.done}/${ix.total || "…"}`);
-  // Re-render only what changed, so a click never lands on an element being replaced.
-  const changed = (key, value) => { const j = JSON.stringify(value); if (S["sig_" + key] === j) return false; S["sig_" + key] = j; return true; };
   if (changed("pills", p)) $("#pills").innerHTML = p;
   if (changed("games", st.games)) renderSwitch(st.games || []);
   $("#modcount").textContent = st.mods.length ? String(st.mods.length) : "";
   $("#ver").textContent = "v" + st.version;
-  if (changed("mods", [st.mods, g && g.plugins, g && g.loader_version, g && g.kind])) { renderHome(); renderMods(); }
+  if (changed("mods", [st.mods, g && g.plugins, g && g.loader_version, g && g.kind])) { renderHome(); renderMods(); redoDests(); }
   if (changed("game", st.game)) renderGame();
   if (changed("status", [st.ddo_server, g && g.root, g && g.kind, g && g.running])) { renderStatus(st); renderHome(); }
   if (changed("log", st.activity)) renderLog(st.activity);
   if (ix.ready && !S.typesLoaded) loadTypes();
   if (!ix.ready) renderIndexing(ix);
+  // opened on the Mods tab (a reload): the library asked for the plugins before there was a state
+  if (first && $("#view-mods").classList.contains("active")) libraryOpen();
 }
 function renderIndexing(ix) {
   if ($("#q").value) return;
@@ -913,7 +929,8 @@ async function loadTypes() {
     const pick = ["statusparam", "shl", "fsm", "ajp", "eap", "prp", "stm", "mod", "tex", "lmt", "efl", "gmd"];
     const have = new Set(t.types.map(x => x.ext));
     $("#chips").innerHTML = `<button class="chip on" data-t="">All</button>` + pick.filter(x => have.has(x)).map(x => `<button class="chip" data-t="${x}">.${x}</button>`).join("");
-    document.querySelectorAll(".chip").forEach(c => c.onclick = () => { S.type = c.dataset.t; document.querySelectorAll(".chip").forEach(x => x.classList.toggle("on", x === c)); search(); });
+    // only the type chips: every .chip of the page took this handler (the Monsters direction, World's toggles)
+    $("#chips").querySelectorAll(".chip").forEach(c => c.onclick = () => { S.type = c.dataset.t; $("#chips").querySelectorAll(".chip").forEach(x => x.classList.toggle("on", x === c)); search(); });
     const total = t.types.reduce((a, x) => a + x.count, 0);
     if (!$("#q").value) $("#results").innerHTML = `<div class="empty"><div class="big">${total.toLocaleString()} resources, one search box</div>Type part of a name or an extension (<span class="mono">shl</span>, <span class="mono">em0100.shl</span>). Parameter files (green) open as editable YAML.</div>`;
   } catch (e) { S.typesLoaded = false; }
@@ -953,7 +970,7 @@ async function openResource(x) {
       <dl class="kv"><dt>Class</dt><dd>${esc(r.class)} ${r.yaml ? '<span class="badge yaml">editable YAML</span>' : ""}</dd>
       <dt>Size</dt><dd>${human(r.size)}${r.objects ? " · " + r.objects + " objects" : ""}</dd>
       <dt>Archives</dt><dd class="mono">${arcs}</dd></dl></div>
-      <div class="actions row">${mods.length ? `<select id="addto">${mods.map(m => `<option>${esc(m.name)}</option>`).join("")}</select>
+      <div class="actions row">${mods.length ? `<select id="addto">${mods.map(m => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("")}</select>
         <button class="btn primary small" id="addbtn">Add to mod</button>` : `<span class="sub">Create a mod on the Mods tab to edit this.</span>`}
         <span class="sub grow">${r.archives.length > 1 ? "Applies to all " + r.archives.length + " archives." : ""}</span></div>
       ${portRow(r)}
@@ -1104,10 +1121,21 @@ $("#create").onclick = () => busy($("#create"), async () => {
   await api("mods/new", { name }); $("#newmod").value = ""; toast(`Created ${name}`); L.sel = "m:" + name; await refresh();
 });
 $("#newmod").addEventListener("keydown", e => { if (e.key === "Enter") $("#create").click(); });
+$("#receive").onclick = async () => {
+  const file = await pickFile(".zip");
+  if (!file) return;
+  busy($("#receive"), async () => {
+    const r = await api("files/receive", { b64: await fileB64(file) });
+    toast(`Made ${r.mods.join(", ")} from your own game files; every file matches the author's.` + (r.plugins.length ? `\nIts plugins are in the _plugins folder next to the mods.` : ""), "ok", 9000);
+    L.sel = "m:" + r.mods[0]; await refresh();
+  });
+};
 async function installSet(mods, what) {
   const r = await api("install", { mods });
   let msg = what || r.message;
-  if (r.conflicts && r.conflicts.length) msg += `\n${r.conflicts.length} clash(es): the later mod wins - ` + r.conflicts.slice(0, 3).map(c => `${c.resource} (${c.winner} over ${c.loser})`).join(", ");
+  if (r.merged && r.merged.length) msg += `\n${r.merged.length} file(s) several mods change merged, every mod's changes kept: ` + r.merged.slice(0, 3).map(m => `${m.resource} (${m.mods.join(" + ")})`).join(", ")
+    + (r.renumbered && r.renumbered.length ? "; " + r.renumbered.slice(0, 3).map(n => n.record != null ? `${n.mod}'s record ${n.record} is ${n.as}` : `${n.mod}'s group ${n.group} is ${n.as}`).join(", ") : "");
+  if (r.conflicts && r.conflicts.length) msg += `\n${r.conflicts.length} clash(es): the later mod wins - ` + r.conflicts.slice(0, 3).map(c => `${c.resource}${c.detail ? " " + c.detail : ""} (${c.winner} over ${c.loser})`).join(", ");
   toast(msg, r.conflicts && r.conflicts.length ? "warn" : "ok", 8000); await refresh();
 }
 async function installEnabled() { await installSet(installedMods()); }
@@ -1154,6 +1182,11 @@ function allSettings(owner, list) {
 function subtabs(tabs) {
   return `<div class="subtabs">${tabs.map(([k, t]) => `<button class="subtab ${L.tab === k ? "active" : ""}" data-tab="${k}">${t}</button>`).join("")}</div>`;
 }
+function enemyCapLive() {       // the enemy_cap readings of the running game: [active slots, peak]
+  const lv = S.live || {};
+  return [lv.running && lv.enemies_active != null ? `${lv.enemies_active} / ${lv.enemy_slots != null ? lv.enemy_slots : "?"}` : "UNKNOWN",
+          lv.enemy_peak != null ? String(lv.enemy_peak) : L.peak != null ? L.peak + " (last session)" : "UNKNOWN"];
+}
 function renderInspector(it) {
   const box = $("#inspector"), g = S.state && S.state.game;
   if (!it) { box.innerHTML = `<div class="empty"><div class="big">Nothing here yet</div>${g ? "Create a mod below the library, or install the loader on the Diagnostics tab." : "Riftstone did not find the game."}</div>`; return; }
@@ -1199,7 +1232,7 @@ function renderInspector(it) {
         <dt>State</dt><dd class="${g.loader ? "" : "off"}">${g.loader ? "INSTALLED" : "NOT INSTALLED"}</dd>
         <dt>Installed version</dt><dd>${esc(v.installed || "-")}</dd>
         <dt>This Riftstone has</dt><dd>${esc(v.available || "not built")}</dd>
-        <dt>Mods are served from</dt><dd class="plain">${g.mode === "overlay" ? "riftstone\\overlay (the game's files stay untouched)" : "the game's folder, originals kept"}</dd></dl>
+        <dt>Mods are served from</dt><dd class="plain">${g.mode === "overlay" ? "riftstone\\overlay (the game's files stay untouched)" : "nowhere yet: install the loader to use Dark Arisen mods"}</dd></dl>
         <div class="hr"></div>
         <div class="row">${!g.loader ? `<button class="btn primary" id="l-install">Install loader</button>`
           : outdated ? `<button class="btn primary" id="l-install">Update to ${esc(v.available)}</button>` : ""}
@@ -1211,9 +1244,8 @@ function renderInspector(it) {
         <dt>Plugin state</dt><dd class="${p.installed && p.enabled ? "" : "off"}">${!p.installed ? "NOT INSTALLED" : p.enabled ? "ENABLED" : "OFF"}</dd>
         <dt>In the running game</dt><dd class="${live === "LOADED" ? "" : "off"}">${live || (g && g.running ? "NOT LOADED" : "GAME CLOSED")}</dd>`;
       if (p.name === "enemy_cap") {
-        const lv = S.live || {};
-        html += `<dt>Active slots</dt><dd>${lv.running && lv.enemies_active != null ? `${lv.enemies_active} / ${lv.enemy_slots != null ? lv.enemy_slots : "?"}` : "UNKNOWN"}</dd>
-          <dt>Peak occupancy</dt><dd>${lv.enemy_peak != null ? lv.enemy_peak : L.peak != null ? L.peak + " (last session)" : "UNKNOWN"}</dd>`;
+        const [active, peak] = enemyCapLive();
+        html += `<dt>Active slots</dt><dd id="ec-active">${esc(active)}</dd><dt>Peak occupancy</dt><dd id="ec-peak">${esc(peak)}</dd>`;
       }
       html += `<dt>File</dt><dd class="plain mono">${esc(p.file)}${p.update ? " · a newer build is here" : ""}</dd></dl><div class="hr"></div>`;
       html += (QUICK[p.name] || []).map((q, i) => quickControl(owner, settings, q, i)).join("");
@@ -1235,7 +1267,7 @@ function renderInspector(it) {
   wireSettings(box);
   const li = $("#l-install"), lr = $("#l-remove"), pa = $("#p-add"), po = $("#p-on");
   if (li) li.onclick = () => busy(li, async () => { const r = await api("loader", { action: "install" }); toast(r.updated ? "Loader updated; your settings are kept" : "Loader installed" + (r.chained ? `; your previous dinput8.dll is chained as ${r.chained}` : "")); await refresh(); await libraryOpen(); });
-  if (lr) lr.onclick = () => { if (confirm("Remove the loader? Mods move back into the game's folder (originals kept); plugins stop loading.")) busy(lr, async () => { await api("loader", { action: "remove" }); toast("Loader removed"); await refresh(); await libraryOpen(); }); };
+  if (lr) lr.onclick = () => { if (confirm("Remove the loader? The game runs as Steam installed it: your mods and plugins are off until the loader is back.")) busy(lr, async () => { await api("loader", { action: "remove" }); toast("Loader removed"); await refresh(); await libraryOpen(); }); };
   if (pa) pa.onclick = () => busy(pa, async () => { await api("plugins/add", { name: p.name }); toast(`${p.name} installed; it loads at the next game start`); await refresh(); await libraryOpen(); });
   if (po) po.onchange = () => busy(po.closest("label"), async () => {
     try { await api("plugins/toggle", { name: p.name, on: po.checked }); toast(`${p.name} ${po.checked ? "on" : "off"}: from the next game start`); }
@@ -1371,7 +1403,7 @@ function moveInEditor(p, x, z) {
   toast(`Moved ${p.name} to x ${x}, z ${z} (save to keep it)`);
 }
 async function layoutOp(op, number, at) {
-  const r = await api("lot", { text: ta.value, op, number, at });
+  const r = await api("lot", { text: ta.value, op, number, at, mod: S.editing ? S.editing.mod : undefined });
   ta.value = r.text; ta.dispatchEvent(new Event("input"));
   S.lotSel = op === "copy" ? r.count - 1 : null;
   editorMap();
@@ -1459,7 +1491,7 @@ function renderStage() {
         <div class="wsel" id="wsel"><span class="muted">Nothing selected.</span></div></div>
       <div class="wbox"><div class="bh">Encounter: N of an enemy as a new group</div>
         <div class="wform">
-          <label>Put it in</label><div id="edestbox">${destPicker("edest")}</div>
+          <label>Put it in</label><div id="edestbox">${destPicker("edest", null, gameKind())}</div>
           <label>Enemy</label><input class="input" id="eenemy" list="wenemylist" placeholder="goblin, em0100…" value="${esc(W.name || "")}">
           <label>How many</label><input class="input" id="ecount" type="number" min="1" max="9999" value="100">
           <label>At once</label><input class="input" id="eonce" type="number" min="1" max="31" value="10" title="spawn points; the game keeps 10 enemies active, the enemy_cap plugin 30">
@@ -1671,13 +1703,13 @@ async function encounterGo(dry) {
   box.innerHTML = `<div><b>${r.total} × ${esc(r.enemy)} ${esc(r.enemy_name)}</b> as new group <b>#${r.group}</b>, ${r.points} spawn point${r.points === 1 ? "" : "s"}${r.horde ? " (a horde: refilled up to the total)" : ""}${r.skin != null ? `, wearing skin ${r.skin}` : ""}</div>
     <div class="sub">a copy of group ${r.template_group} (${r.template_distance} units away) · ${esc(r.layout)} · ${r.archives.length} archive(s)</div>
     ${r.notes.map(n => `<div class="warn">▲ ${esc(n)}</div>`).join("")}
-    <div class="${r.clashes.length ? "clash" : "sub"}" style="margin-top: 4px">${r.clashes.length ? "▲ " : ""}${esc(r.note)}</div>
+    <div class="sub" style="margin-top: 4px">${esc(r.note)}</div>
     ${r.written.length ? `<div style="margin-top: 6px">Written into <b>${esc(r.mod)}</b>${r.new_mod ? " (a new mod)" : ""}:</div>${r.written.map(f => `<div class="mono sub">${esc(f)}</div>`).join("")}`
       : `<div class="sub" style="margin-top: 6px">Plan only: nothing written${r.new_mod ? `, and the mod ${esc(r.mod)} is made only when you write` : ""}. The gold dots are the spawn points.</div>`}`;
   drawWorld();
   if (!dry) {
     toast(`Encounter written into ${r.mod}. Install it from the Mods tab.`); await refresh();
-    if (r.new_mod) { S.dest.edest = r.mod; $("#edestbox").innerHTML = destPicker("edest", r.mod); wireDest("edest"); }
+    if (r.new_mod) { S.dest.edest = r.mod; $("#edestbox").innerHTML = destPicker("edest", r.mod, gameKind()); wireDest("edest"); }
   }
 }
 async function dungeonGo(dry) {
@@ -1732,6 +1764,17 @@ function pickFile(accept) {
 }
 
 /* ---------- where produced files go: one of your mods, or a new, separate one ---------- */
+const gameKind = () => S.state && S.state.game ? S.state.game.kind : null;
+function redoDests() {           // the mods changed (one was made): each open picker lists them, its choice kept
+  for (const [id, box, kind] of [["edest", "#edestbox", gameKind()], ["skdest", "#skdestbox", gameKind()],
+                                 ["mndest", "#mndestbox", MN.dir === "ddo" ? "ddda" : "ddo"]]) {
+    const s = $("#" + id), n = $("#" + id + "-new");
+    if (!s) continue;
+    const typed = n ? n.value : "";
+    $(box).innerHTML = destPicker(id, s.value, kind); wireDest(id);
+    if (typed) $("#" + id + "-new").value = typed;
+  }
+}
 function destPicker(id, pick, kind) {
   const mods = S.mods.filter(m => !m.error && (!kind || (m.game || "ddda") === kind));
   let cur = pick != null ? pick : S.dest[id] != null ? S.dest[id] : mods.length ? mods[0].name : "";
@@ -1789,7 +1832,7 @@ function renderFiles() {
   $("#fmlist").innerHTML = rows.filter(keep).map(f => {
     const where = f.status === "other" ? "" : f.archive ? `${f.status === "adds" ? "new in" : "in"} ${f.archive}.arc` : f.status === "changes" ? `every archive holding it (${f.archives})` : "new, in every archive";
     return `<div class="fmrow ${F.sel === f.rel ? "sel" : ""}" data-rel="${esc(f.rel)}">${fileBadge(f)}
-      <div style="min-width: 0"><div class="fp">${esc(f.rel)}</div><div class="fa">${esc(where)}${f.also.length ? ` · <span class="clash">also in ${esc(f.also.join(", "))}</span>` : ""}</div></div>
+      <div style="min-width: 0"><div class="fp">${esc(f.rel)}</div><div class="fa">${esc(where)}${f.also.length ? ` · <span class="${f.merges ? "" : "clash"}">also in ${esc(f.also.join(", "))}${f.merges ? " (merged at install)" : ""}</span>` : ""}</div></div>
       <div class="fa">${human(f.size)}</div></div>`;
   }).join("") || `<div class="empty">No file matches.</div>`;
   $("#fmlist").querySelectorAll(".fmrow").forEach(el => el.onclick = () => selectFile(el.dataset.rel));
@@ -1799,7 +1842,10 @@ function fileWhat(f) {
   const res = f.resource ? `<span class="mono">${esc(f.resource)}.${esc(f.type)}</span>` : "";
   if (f.aside) return "Set aside: kept in the mod but not built, so the game does not see it.";
   if (f.status === "adds") return `Adds ${res}, which the game does not have${f.archive ? `, to ${esc(f.archive)}.arc` : ""}. New things never clash with other mods${f.also.length ? " (unless another mod adds the very same name)" : ""}.`;
-  if (f.status === "changes") return `Changes the game's ${res}${f.archive ? ` in ${esc(f.archive)}.arc` : ` in every archive holding it (${f.archives})`}. Another mod that changes it too clashes with this one: the later mod's copy wins.`;
+  if (f.status === "changes") return `Changes the game's ${res}${f.archive ? ` in ${esc(f.archive)}.arc` : ` in every archive holding it (${f.archives})`}. ` + (!f.merges
+    ? "Another mod that changes it too clashes with this one: the later mod's copy wins."
+    : f.type === "lot" ? "Another mod that changes this layout too is merged with this one at install: every mod's placements are kept (an id both add goes to a free one)."
+    : "Another mod that changes this group list too is merged with this one at install: every mod's groups are kept (a number both add goes to a free one, its layouts renamed with it).");
   return "Not a game resource (a note or the mod's own record); the build leaves it alone.";
 }
 async function selectFile(rel) {
@@ -1808,18 +1854,21 @@ async function selectFile(rel) {
   const f = F.rows.find(x => x.rel === rel), v = $("#fmview");
   if (!f) { v.innerHTML = `<div class="empty">That file is gone.</div>`; return; }
   v.innerHTML = `<div class="empty">Loading…</div>`;
-  let p;
-  try { p = await api("files/preview?" + qs({ mod: F.mod, rel })); } catch (e) { v.innerHTML = `<div class="status bad">${esc(e.message)}</div>`; return; }
+  // a file with no preview (a cube map, a damaged texture) still downloads, is replaced and set aside
+  let p = null, failed = "";
+  try { p = await api("files/preview?" + qs({ mod: F.mod, rel })); } catch (e) { failed = e.message; }
   if (F.sel !== rel) return;
-  const yaml = /\.yaml$/i.test(rel), tex = p.kind === "texture";
+  const yaml = /\.yaml$/i.test(rel), tex = !!p && p.kind === "texture";
   let body;
-  if (tex) body = `<img src="${p.png}" alt="" width="${p.shown[0]}" height="${p.shown[1]}"><div class="sub" style="text-align: center">${p.width}×${p.height} · ${esc(p.codec)} · ${p.mips} mip${p.mips === 1 ? "" : "s"} · ${human(p.size)}</div>`;
+  if (!p) body = `<div class="status bad">${esc(failed)}</div>`;
+  else if (tex) body = `<img src="${p.png}" alt="" width="${p.shown[0]}" height="${p.shown[1]}"><div class="sub" style="text-align: center">${p.width}×${p.height} · ${esc(p.codec)} · ${p.mips} mip${p.mips === 1 ? "" : "s"} · ${human(p.size)}</div>`;
   else if (p.kind === "text" || p.kind === "material") body = `<pre class="code">${yaml ? highlight(p.text) : esc(p.text)}</pre>`;
   else body = `<div class="sub" style="margin-top: 10px">A binary file (it starts <span class="mono">${esc(p.magic)}</span>), ${human(p.size)}.</div>`;
-  const accept = tex ? (p.from_png ? ".png,.dds,.tex" : ".dds,.tex") : yaml ? ".yaml,.yml,.txt" : /\.mrl$/i.test(rel) ? ".mrl" : "";
+  const accept = tex ? (p.from_png ? ".png,.dds,.tex" : ".dds,.tex") : /\.tex$/i.test(rel) ? ".dds,.tex" : yaml ? ".yaml,.yml,.txt" : /\.mrl$/i.test(rel) ? ".mrl" : "";
   v.innerHTML = `<div class="mono" style="overflow-wrap: anywhere">${esc(rel)}</div>
     <div class="sub" style="margin-top: 4px">${fileWhat(f)}</div>
-    ${f.also.length ? `<div class="status bad">Also in ${esc(f.also.join(", "))}: installed together, the later mod's copy wins.</div>` : ""}
+    ${f.also.length ? (f.merges ? `<div class="status">Also in ${esc(f.also.join(", "))}: installed together, the copies are merged and every mod's ${f.type === "lot" ? "placements" : "groups"} kept.</div>`
+      : `<div class="status bad">Also in ${esc(f.also.join(", "))}: installed together, the later mod's copy wins.</div>`) : ""}
     ${body}
     <div class="row" style="margin-top: 10px">
       ${yaml && !f.aside ? `<button class="btn small primary" data-a="edit">Edit</button>` : ""}
@@ -1859,17 +1908,24 @@ async function replaceFile(f, file) {
   if (S.editing && S.editing.mod === F.mod && S.editing.rel === f.rel) { S.dirty = false; openEditor(F.mod, f.rel); }
 }
 async function asideFile(f, back) {
-  if (!back && S.editing && S.editing.mod === F.mod && S.editing.rel === f.rel) {
-    if (S.dirty && !confirm("The file is open with unsaved changes. Put it aside anyway?")) return;
-    S.dirty = false; S.editing = null; $("#editorwrap").hidden = true;
-  }
+  // the file open in the editor goes aside, or another copy comes back in its place: the editor's text is stale
+  const open = S.editing && S.editing.mod === F.mod && S.editing.rel === (back ? f.rel.slice("aside/".length) : f.rel);
+  if (open && S.dirty && !confirm(back ? "That file is open with unsaved changes. Bring the copy that was set aside back anyway?"
+                                       : "The file is open with unsaved changes. Put it aside anyway?")) return;
+  if (open && !back) { S.dirty = false; S.editing = null; $("#editorwrap").hidden = true; }
   const r = await api("files/aside", { mod: F.mod, rel: f.rel, back });
   toast(back ? `Brought back ${r.rel}: it is built again.` : `Put aside: kept in the mod, not built.${r.warn ? "\n" + r.warn : ""}`, r.warn ? "warn" : "ok", r.warn ? 10000 : 5200);
   await loadFiles(); selectFile(r.rel); refresh();
+  if (open && back) { S.dirty = false; openEditor(F.mod, r.rel); }   // it held the copy now set aside: Save wrote over this one
 }
 $("#fmzip").onclick = () => busy($("#fmzip"), async () => {
   const r = await api("files/export?" + qs({ mod: F.mod }));
-  saveDownload(r); toast(`Downloaded ${r.name} (${human(r.bytes)}): the whole mod, to keep or share.`);
+  saveDownload(r); toast(`Downloaded ${r.name} (${human(r.bytes)}): a private copy of the whole mod. It holds game data, so keep it to yourself; to share, use Share (package).`, "ok", 9000);
+});
+$("#fmshare").onclick = () => busy($("#fmshare"), async () => {
+  const r = await api("files/package?" + qs({ mod: F.mod }));
+  saveDownload(r);
+  toast(`Downloaded ${r.name} (${human(r.bytes)}): no game data, ${r.new_bytes.toLocaleString()} bytes of your own. A player installs it with Riftstone (Mods, Install a package)${r.needs.length > 1 ? "; it needs both games" : ""}.`, "ok", 9000);
 });
 $("#fmclose").onclick = () => { $("#fmwrap").hidden = true; F.mod = null; F.sel = null; };
 
@@ -1957,7 +2013,7 @@ function renderSkinForm() {
   src.innerHTML = `<option value="">my own pictures</option>` + K.ddo.map(v => `<option value="${esc(v)}">Dragon's Dogma Online: ${esc(v)}</option>`).join("");
   src.value = K.ddo.includes(scur) ? scur : "";
   renderSkinPics();
-  $("#skdest").innerHTML = destPicker("skdest"); wireDest("skdest");
+  $("#skdestbox").innerHTML = destPicker("skdest", null, gameKind()); wireDest("skdest");
 }
 function renderSkinPics() {
   const f = K.families.find(x => x.key === $("#skfam").value) || K.families[0];
@@ -1981,7 +2037,7 @@ function renderSkins() {
     if (x === "edit") {
       $("#skfam").value = s.family; $("#sksrc").value = ""; renderSkinPics();
       $("#sknum").value = s.number; $("#sktitle").value = s.title;
-      $("#skdest").innerHTML = destPicker("skdest", s.mod); wireDest("skdest"); S.dest.skdest = s.mod;
+      $("#skdestbox").innerHTML = destPicker("skdest", s.mod, gameKind()); wireDest("skdest"); S.dest.skdest = s.mod;
       $("#skpics").scrollIntoView({ behavior: "smooth", block: "center" });
       toast(`Pick the edited pictures, then Make skin: skin ${s.number} in ${s.mod} is replaced and its old files are kept in aside/_history.`, "ok", 9000);
       return;
@@ -2120,7 +2176,7 @@ function portRow(r) {
   const mods = S.mods.filter(m => !m.error && m.game === other.kind);
   if (!mods.length) return `<div class="actions row"><input id="portnew" placeholder="new ${esc(other.title)} mod name" style="flex:1">
     <button class="btn small" id="portnewbtn" data-kind="${esc(other.kind)}">New ${esc(other.title)} mod</button></div>`;
-  return `<div class="actions row"><select id="portto">${mods.map(m => `<option>${esc(m.name)}</option>`).join("")}</select>
+  return `<div class="actions row"><select id="portto">${mods.map(m => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("")}</select>
     <input id="portas" class="mono" placeholder="as (a ${esc(other.title)} path; blank = same path)" style="flex:1;min-width:12em">
     <button class="btn small" id="portbtn" title="Converted and checked: textures, text, models with their material and textures, animations (motion lists)">Port to ${esc(other.title)}</button></div>`;
 }
@@ -2154,9 +2210,9 @@ function renderGame() {
   if (!g) { $("#tiles").innerHTML = tile("Game", "Not found", "bad", "Start Studio with --game \"C:\\...\\DDDA\""); $("#dterm").innerHTML = ""; return; }
   $("#tiles").innerHTML = tile("Game folder", g.title, "ok", g.root)
     + tile("Executable", g.build_verified ? g.build : "Different build", g.build_verified ? "ok" : "warn", g.build_verified ? "the build Riftstone is tested on" : "formats likely match; engine patches will not apply")
-    + (g.loader_supported ? tile("Loader", g.loader ? (g.loader_version.installed || "Installed") : "Not installed", g.loader ? "ok" : "", g.loader ? "overlay, plugins, crash reports, F10 panel" : "mods replace archives directly (originals kept)")
-                          : tile("Loader", "Not needed", "", "mods replace archives directly (originals kept)"))
-    + tile("Install mode", g.mode === "overlay" ? "Overlay" : "Direct", "", g.mode === "overlay" ? "riftstone\\overlay serves your archives" : "originals kept in riftstone\\vanilla")
+    + (g.loader_supported ? tile("Loader", g.loader ? (g.loader_version.installed || "Installed") : "Not installed", g.loader ? "ok" : "", g.loader ? "overlay, plugins, crash reports, F10 panel" : "needed for mods: they are served from riftstone\\overlay, never written into the game's files")
+                          : tile("Loader", "Not needed", "", "Online mods replace client archives (originals kept): the loader has not run in its client yet"))
+    + tile("Install mode", g.mode === "overlay" ? "Overlay" : g.loader_supported ? "Needs the loader" : "Direct", g.mode !== "overlay" && g.loader_supported ? "warn" : "", g.mode === "overlay" ? "riftstone\\overlay serves your archives" : g.loader_supported ? "Dark Arisen mods are served only through the loader" : "originals kept in riftstone\\vanilla")
     + tile("Archives changed", String(g.archives_changed), g.drift.length ? "bad" : "ok", g.drift.length ? g.drift.length + " changed by something else" : "all verified")
     + tile(g.exe, g.running ? "Running" : "Closed", g.running ? "ok" : "", g.running ? "live readings above" : "");
   const ls = g.last_session;
@@ -2172,7 +2228,7 @@ function renderGame() {
   $("#crashes").innerHTML = g.crash_reports.length ? g.crash_reports.slice().reverse().map(c => `<div class="file" data-c="${esc(c)}"><span class="badge ${/^crash|^fatal/.test(c) ? "bad" : ""}">${esc(c.split("-")[0])}</span>${esc(c)}</div>`).join("") : `<div class="file static">No crashes, fatal errors or hangs recorded.</div>`;
   document.querySelectorAll("[data-c]").forEach(el => el.onclick = async () => {
     const r = await api("crash?name=" + encodeURIComponent(el.dataset.c)).catch(e => toast(e.message, "bad"));
-    if (r) { $("#modaltitle").textContent = el.dataset.c; $("#modalbody").textContent = (r.explanation || []).map(l => "• " + l).join("\n") + "\n\n" + r.text; $("#modal").classList.add("open"); }
+    if (r) { $("#modaltitle").textContent = el.dataset.c; $("#modalbody").textContent = (r.support ? r.support + "\n\n" : "") + (r.explanation || []).map(l => "• " + l).join("\n") + "\n\n" + r.text; $("#modal").classList.add("open"); }
   });
   // what the tools know right now, the way the terminal says it
   const on = (g.plugins || []).filter(p => p.enabled).length, mods = S.mods.filter(m => m.enabled && !modOther(m)).length;
@@ -2235,6 +2291,8 @@ async function renderLive() {
   const r = await api("live").catch(() => null);
   S.live = r && r.running ? r : null;
   if ($("#view-game").classList.contains("active")) renderPanel(S.live);
+  const ec = $("#ec-active");            // the Mods inspector's enemy_cap readings (it was drawn once)
+  if (ec) { const [active, peak] = enemyCapLive(); ec.textContent = active; $("#ec-peak").textContent = peak; }
 }
 $("#safemodebtn").onclick = () => busy($("#safemodebtn"), async () => {
   await api("safe-mode", {}); toast("Safe mode off: the next start loads plugins and mods"); await refresh();
@@ -2242,7 +2300,7 @@ $("#safemodebtn").onclick = () => busy($("#safemodebtn"), async () => {
 setInterval(renderLive, 1500);
 $("#loaderbtn").onclick = () => {
   const action = $("#loaderbtn").dataset.action || "install";
-  if (action === "remove" && !confirm("Remove the loader? Mods move back into the game's folder (originals kept); plugins stop loading.")) return;
+  if (action === "remove" && !confirm("Remove the loader? The game runs as Steam installed it: your mods and plugins are off until the loader is back.")) return;
   busy($("#loaderbtn"), async () => {
     const r = await api("loader", { action });
     toast(action === "install" ? (r.updated ? "Loader updated; your settings are kept" : "Loader installed" + (r.chained ? `; your previous dinput8.dll is chained as ${r.chained}` : "")) : "Loader removed");

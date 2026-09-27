@@ -548,8 +548,9 @@ My Mod\
 
 ## 11. The loader
 
-An optional `dinput8.dll` that adds three things, all switchable in
-`riftstone_loader.ini`:
+A `dinput8.dll` next to `DDDA.exe`, needed for Dark Arisen mods: Riftstone never
+writes into the game's own files, so the loader is how mods reach the game. It
+adds three things, all switchable in `riftstone_loader.ini`:
 
 ```bat
 Riftstone.cmd loader install     # or Studio > Game
@@ -566,19 +567,20 @@ Riftstone.cmd loader install     # or Studio > Game
 
 ---
 
-## 12. Raising the enemy/unit limit
+## 12. More enemies at once
 
-The GPL per-group unit-kind limit (vanilla 3) is raised by a native plugin,
-vendored and verified byte-for-byte against your exe:
+The game keeps at most 10 enemies active; Riftstone's own `enemy_cap` plugin raises that (default 30,
+10..64 in `enemy_cap.ini`), after checking every site it patches byte for byte against your exe
+(`docs/re-enemy-cap.md`):
 
 ```bat
 Riftstone.cmd loader install
-Riftstone.cmd loader plugin add native\plugins\lod_tuner\out\lod_tuner.asi
+Riftstone.cmd loader plugin add native\plugins\enemy_cap\out\enemy_cap.asi
 ```
 
-Note the memory trade-off documented in
-the third-party unit expander's notes (`vendor/unit_expander/README.md`, outside git): the array size is a big multiplier on
-per-group memory, so keep it as low as your project needs.
+A group list's per-group unit-kind limit (3) is not raised: Riftstone's encounters use one enemy kind per
+group. The third-party unit expander that raised it came without a licence and is not part of Riftstone
+(`THIRD-PARTY-NOTICES.md`).
 
 ---
 
@@ -638,8 +640,8 @@ Full detail: `docs/formats.md` (measured format facts), `docs/roadmap.md`,
 
 - **“Dragon’s Dogma was not found.”** Pass `--game "…\DDDA"` or set
   `RIFTSTONE_GAME`.
-- **“…is in use by the game.”** Close the game (direct mode), or install the
-  loader to edit while it runs.
+- **“…is in use by the game.”** Leave that area (the loader serves mods while
+  the game runs), or close the game (Online's mods replace client archives).
 - **An edit didn’t take effect in game.** The file is valid (Riftstone checks
   that), but a value’s in-game *meaning* is discovered by testing — Riftstone
   guarantees well-formed files, not game behaviour.

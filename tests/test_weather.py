@@ -198,6 +198,37 @@ class WeatherTest(unittest.TestCase):
         with self.assertRaises(ParamError):
             weather.from_yaml(ya.replace("mUnkB8: [0]", "mUnkB8: [0, 1]"))
 
+    def test_yaml_hex_text_has_no_other_field(self):
+        # {hex: ...} took its hex and ignored any other field beside it
+        y = weather.to_yaml(samples()["sky"])
+        self.assertEqual(weather.from_yaml(y.replace('"scr\\\\sky\\\\sun"', '{hex: "41"}')).data["mpSunTexture"], b"A")
+        for bad in (y.replace('"scr\\\\sky\\\\sun"', '{hex: "41", text: B}'), y.replace('"scr\\\\sky\\\\sun"', "{hexx: 41}")):
+            self.assertNotEqual(bad, y)
+            with self.assertRaises(ParamError):
+                weather.from_yaml(bad)
+
+    def test_yaml_name_stays_in_its_comment(self):
+        # the resource name went into the header comment as it was: a newline in it began a YAML line
+        # of its own (here a second 'riftstone:' key, which also fooled params' tag detection)
+        from riftstone import params
+        for key, w in samples().items():
+            raw = weather.build(w)
+            y = weather.to_yaml(w, "x\nriftstone: xfs/1\r\t\"#")
+            self.assertEqual(weather.yaml_to_bytes(y), raw, key)
+            self.assertEqual(params.yaml_to_resource(y), raw, key)
+
+    def test_yaml_long_hex_number(self):
+        # base 16 has no digit limit, but 3,572 hex digits are over 4,300 decimal ones: the range message
+        # printed the number and leaked int -> str's ValueError
+        big = "0x" + "f" * 3572
+        y = weather.to_yaml(samples()["wep"])
+        for bad in (y.replace("version: 1", "version: " + big), y.replace("mMinute: 51", "mMinute: -" + big),
+                    y.replace("mColor: [0, 154, 255, 255]", "mColor: [0, 154, " + big + ", 255]", 1)):
+            self.assertNotEqual(bad, y)
+            with self.assertRaises(ParamError) as cm:
+                weather.from_yaml(bad)
+            self.assertLess(len(str(cm.exception)), 200)
+
     def test_kind_detection(self):
         s = samples()
         for key in ("wep", "wep-ddo", "wfp", "sky", "wsi"):

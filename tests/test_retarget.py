@@ -276,6 +276,62 @@ class RebakeTest(unittest.TestCase):
         with self.assertRaises(RiftError):
             retarget.body(bytes(bad))
 
+    def test_work_is_bounded(self):
+        # review: MAX_FRAMES bounded one motion: 16 track lists claiming 65,535 frames in a 2 KB file took 13 s
+        # and wrote 25 MB (a 140 KB file ~14 minutes, 1.5 GB). Now a file is refused before any per-frame work
+        # when its lists need more than a rebake computes -- long motions, or many lists of vanilla length.
+        import time
+
+        def lists(n, frames, extra=()):
+            ms = [lmt.Motion(lmt.TrackList([const(0, 2, Z180), const(1, 2, (5.0, 0.0, 0.0, 1.0)), *extra]), frames,
+                             -1, ZERO16, ZERO16, 0x800001, [lmt.EventGroup(bytes(64)) for _ in range(4)], None)
+                  for _ in range(n)]
+            return lmt.build(lmt.Lmt(67, ms))
+
+        for label, data in (("16 x 65,535 frames", lists(16, 0xFFFF)), ("600 x 1,800 frames", lists(600, 1800))):
+            with self.subTest(label):
+                t0 = time.perf_counter()
+                with self.assertRaises(RiftError):
+                    retarget.rebake(data, "ddo", self.src, self.dst)
+                self.assertLess(time.perf_counter() - t0, 2.0)
+        # tracks of joints neither body's chain needs are not sampled at every frame (each of 3,000 was, twice),
+        # and of duplicate tracks only the one that counts (the last)
+        others = [const(1, 9, (1.0, 2.0, 3.0, 1.0)) for _ in range(1500)] + \
+                 [const(0, 1, retarget.IDENTITY) for _ in range(1500)]
+        data = lists(1, 1800, others)
+        sampled = []
+        real = retarget.sample
+        retarget.sample = lambda keys, times, rotation, mode="nlerp": sampled.append(len(times)) or \
+            real(keys, times, rotation, mode)
+        try:
+            out = lmt.parse(retarget.rebake(data, "ddo", self.src, self.dst))
+        finally:
+            retarget.sample = real
+        self.assertEqual(sampled, [1800] * 5)          # joint 1's turn and joint 2's two tracks; joint 2's again
+        rt = next(t for t in out.motions[0].tracks.tracks if t.bone == 2 and t.usage == 0)
+        pt = next(t for t in out.motions[0].tracks.tracks if t.bone == 2 and t.usage == 1)
+        self.assertEqual((rt.codec, pt.codec, len(lmtcodec.keys(3, pt.buffer.data))), (6, 3, 1800))
+        for _, v in lmtcodec.values(3, pt.buffer.data):            # joint 1 unturned: 5 cm along x, 10 up
+            self.assertEqual(v, (5.0, 10.0, 0.0))
+        # the tracks of a rebaked joint were each rebuilt by searching the whole list again: 16,000 more rotation
+        # tracks on joint 2 (a 576 KB file) took ~6 s, 100,000 minutes
+        data = lists(1, 10, [const(0, 2, Z180) for _ in range(16000)])
+        t0 = time.perf_counter()
+        out = lmt.parse(retarget.rebake(data, "ddo", self.src, self.dst))
+        self.assertLess(time.perf_counter() - t0, 1.5)
+        self.assertEqual(len(out.motions[0].tracks.tracks), 16002)
+
+    def test_parent_scale_that_is_no_number_is_noted(self):
+        # a scale that is not a number compared false with 1 +- 1e-4, so a destination parent the motion scales
+        # so was left out of the note that the rebake does not carry parents' scale to children
+        for scale in ((2.0, 1.0, 1.0, 0.0), (float("nan"), 1.0, 1.0, 0.0)):
+            with self.subTest(scale=scale):
+                res = retarget.rebake_ex(motion_list(self.tracks() + [const(2, 0, scale)]), "ddo", self.src, self.dst)
+                self.assertEqual(res.scaled_parents, {0: 1})
+        res = retarget.rebake_ex(motion_list(self.tracks() + [const(2, 0, (1.0, 1.0, 1.0, 0.0))]), "ddo", self.src,
+                                 self.dst)
+        self.assertEqual(res.scaled_parents, {})
+
     def test_unkeyed_and_untouched(self):
         data = motion_list([const(0, 1, retarget.IDENTITY)])
         self.assertEqual(retarget.rebake(data, "ddo", self.src, self.dst), data)   # nothing to do: same bytes

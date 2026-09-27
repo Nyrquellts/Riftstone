@@ -214,7 +214,7 @@ char g_require[MAX_REQUIRE][72];
 int g_requireCount = 0;
 
 // compat.ini
-bool g_enabled = true;
+bool g_enabled = false;                  // experimental: on only when compat.ini says so
 int g_slotProgram[2][3] = {{-1, -1, -1}, {-1, -1, -1}};  // [main|sub][slot]
 int g_levelMap[4] = {5, 5, 8, 10};                       // Dark Arisen level type (0..3) -> Online level
 int g_testKey = 0, g_testProgram = -1, g_testLevel = 10;
@@ -945,7 +945,7 @@ bool Verify() {
 }
 
 void ReadSettings() {
-    g_enabled = GetPrivateProfileIntW(L"compat", L"enabled", 1, g_ini) != 0;
+    g_enabled = GetPrivateProfileIntW(L"compat", L"enabled", 0, g_ini) != 0;    // no line: off
     g_trace = GetPrivateProfileIntW(L"compat", L"trace", 0, g_ini) != 0;
     wchar_t w[128];
     char name[128];
@@ -1047,7 +1047,7 @@ void Setup(HMODULE self) {
     for (int i = 0; i < nfound; i++) parsed &= LoadPrograms(found[i]), files++;
     if (!files) Log("no skill programs: neither %ls nor riftstone\\overlay\\compat\\*.skills (install a compat mod)", skills);
     ReadSettings();
-    if (!g_enabled) return Log("compat: off in compat.ini ([compat] enabled=0)");
+    if (!g_enabled) return Log("compat: off in compat.ini (experimental: [compat] enabled=1 turns it on)");
     if (!parsed) Log("compat: some lines of %ls were not understood (see above); those skills may be incomplete", skills);
     int ready = 0;
     for (int i = 0; i < g_programCount; i++) ready += CheckProgramFiles(g_programs[i]) ? 1 : 0;

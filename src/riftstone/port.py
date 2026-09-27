@@ -26,11 +26,13 @@ someone plays it.
 
 from __future__ import annotations
 
+import bisect
 import copy
 import math
 import struct
 import zlib
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import gmd, mrl, sbc, tex, typemap
 from .errors import RiftError
@@ -201,6 +203,37 @@ def convert_mod(data: bytes, src: str, dst: str, like: bytes | None = None) -> P
 
 
 # -- materials -----------------------------------------------------------------------------------
+# What a rebuild compares and copies, against the games' own files (every material file of both games):
+# at most 69 materials in a file and 69 material names in a model, every material's bindings inside its
+# own command block, the blocks mrl.blocks cuts at most 2.2 times the file, one material's blocks at most
+# 3,160 bytes, the largest file 101,936 bytes.
+MATERIAL_PAIRS = 1 << 16     # materials to build x template materials to compare
+MATERIAL_OVERLAP = 4         # a file's blocks, as cut, against its size
+MATERIAL_BYTES = 1 << 22     # the rebuilt file
+
+
+def _material_blocks(raw: bytes, m, what: str) -> None:
+    """Refuse a material file whose blocks overlap past what the games' files do, before anything is cut
+    from it: a binding past its material's own command block (re-pointing it would write past the block's
+    copy), or blocks shared so often that a copy for each material would outgrow the file many times."""
+    starts = sorted({x.fields[11] for x in m.materials} | {x.fields[12] for x in m.materials if x.fields[10]}
+                    | {len(raw)})
+
+    def size(o: int) -> int:        # mrl.blocks: a block runs to the next block's start
+        return starts[bisect.bisect_right(starts, o)] - o if o < len(raw) else 0
+
+    total = 0
+    for i, x in enumerate(m.materials):
+        cmd = size(x.fields[11])
+        if (x.fields[4] & 0xFFF) * mrl.CMD.size > cmd:
+            raise RiftError(f"{what}: material {i}'s {x.fields[4] & 0xFFF} binding(s) run past its command block "
+                            f"({cmd} bytes); the games' materials keep them in their own")
+        total += cmd + (size(x.fields[12]) if x.fields[10] else 0)
+    if total > MATERIAL_OVERLAP * len(raw):
+        raise RiftError(f"{what}: its materials share blocks so often that a copy for each would take "
+                        f"{total:,} bytes from a {len(raw):,}-byte file (the games' files: at most 2.2 times)")
+
+
 def retarget(template: bytes, dst: str | None = None, source: bytes | None = None,
              material_names: list[bytes] | None = None, material_hashes: list[int] | None = None,
              rename=None) -> Ported:
@@ -218,14 +251,13 @@ def retarget(template: bytes, dst: str | None = None, source: bytes | None = Non
         raise RiftError(f"the template is a revision 0x{tpl.version:x} material, not {dst.upper()}'s")
     if not tpl.materials:
         raise RiftError("the template has no materials to copy")
+    _material_blocks(template, tpl, "the template")
     rename = rename or (lambda p: p)
-    tpl_parts = mrl.blocks(template, tpl)
-    tpl_slots = [{b.slot: b for b in mrl.bindings(template, x) if b.kind == mrl.SET_TEXTURE}
-                 for x in tpl.materials]
     src_slots: dict[int, dict[int, str]] = {}
     src_order: list[int] = []
     if source is not None:
         s = mrl.parse(source)
+        _material_blocks(source, s, "the source material")
         for x in s.materials:
             src_order.append(x.material_hash)
             src_slots[x.material_hash] = {b.slot: s.textures[b.value - 1].name for b in mrl.bindings(source, x)
@@ -238,6 +270,12 @@ def retarget(template: bytes, dst: str | None = None, source: bytes | None = Non
         keys = src_order
     if not keys:
         raise RiftError("no materials to build: give the model's material names or a source material file")
+    if len(keys) * len(tpl.materials) > MATERIAL_PAIRS:
+        raise RiftError(f"{len(keys):,} material(s) to build, each compared with {len(tpl.materials):,} template "
+                        f"material(s): over {MATERIAL_PAIRS:,} pairs (the games' files hold at most 69 materials)")
+    tpl_parts = mrl.blocks(template, tpl)
+    tpl_binds = [mrl.bindings(template, x) for x in tpl.materials]
+    tpl_slots = [{b.slot: b for b in bs if b.kind == mrl.SET_TEXTURE} for bs in tpl_binds]
     textures: list[mrl.Texture] = []
     where: dict[str, int] = {}
 
@@ -251,13 +289,18 @@ def retarget(template: bytes, dst: str | None = None, source: bytes | None = Non
 
     recs, parts, notes = [], [], []
     moved = kept = 0
+    size = 0
     for i, key in enumerate(keys):
         want = src_slots.get(key, {})
         # the template material sharing most texture slots with the source material (ties: same index)
         j = max(range(len(tpl.materials)),
                 key=lambda k: (len(set(want) & set(tpl_slots[k])), k == min(i, len(tpl.materials) - 1)))
+        size += mrl.MAT_ENTRY + len(tpl_parts[j][0]) + len(tpl_parts[j][1])
+        if size > MATERIAL_BYTES:
+            raise RiftError(f"{len(keys):,} copies of the template's materials would make a material file over "
+                            f"{MATERIAL_BYTES:,} bytes (the games' largest: 101,936)")
         cmd = bytearray(tpl_parts[j][0])
-        for n, b in enumerate(mrl.bindings(template, tpl.materials[j])):
+        for n, b in enumerate(tpl_binds[j]):
             if b.kind != mrl.SET_TEXTURE or not 0 < b.value <= len(tpl.textures):
                 continue
             like = tpl.textures[b.value - 1]
@@ -385,6 +428,7 @@ def convert_lmt(data: bytes, src: str, dst: str, like: bytes | None = None,
         raise RiftError(f"motion list version {m.version} is not {src.upper()}'s ({LMT_VERSION[src]})")
     m.version = LMT_VERSION[dst]
     cache: dict = {}
+    room = len(data)     # source bytes re-encoded, each distinct reading once (vanilla: at most 0.64 x the file)
     seen: set[int] = set()
     recoded = dropped = cleared = dropped_tracks = 0
     worst = 0.0
@@ -410,8 +454,13 @@ def convert_lmt(data: bytes, src: str, dst: str, like: bytes | None = None,
                 if (ext is None) != (src == "ddda"):
                     raise RiftError(f"a codec {t.codec} track {'with' if ext else 'without'} extremes is not how "
                                     f"{src.upper()} stores them; not guessing its values")
-                key = (id(t.buffer), id(t.extremes), t.reference)
+                key = (id(t.buffer), id(t.extremes), t.reference, t.codec)   # the codec names the stored axis
                 if key not in cache:
+                    room -= len(t.buffer.data)
+                    if room < 0:
+                        raise RiftError("single-axis rotation tracks read one buffer with so many references or "
+                                        "extremes that a copy for each would need more than the file's "
+                                        f"{len(data):,} bytes (no game file shares one so)")
                     vals = lmtcodec.values(t.codec, t.buffer.data, ext, t.reference)
                     ks = lmtcodec.keys(t.codec, t.buffer.data)
                     new = lmt.Blob(lmtcodec.pack(6, [(d, tuple(_q14(c) for c in q)) for (d, _), (_, q) in zip(ks, vals)]))
@@ -477,12 +526,18 @@ def skeleton(data: bytes) -> dict[int, Joint]:
 
 def skeleton_diff(a: bytes, b: bytes, tolerance: float = 0.5) -> dict:
     """Compare two models' skeletons by joint id: shared joints whose parent differs or whose offset
-    from the parent differs by more than `tolerance` model units, and the joints only one side has."""
+    from the parent differs by more than `tolerance` model units ((joint, largest difference); None when
+    either offset is not a finite number, which is no known place), and the joints only one side has."""
+    if not isinstance(tolerance, (int, float)) or not math.isfinite(tolerance) or tolerance < 0:
+        raise RiftError(f"tolerance {tolerance!r}: a finite number of model units, 0 or more")
     sa, sb = skeleton(a), skeleton(b)
     common = sorted(set(sa) & set(sb))
     parent = [j for j in common if sa[j].parent != sb[j].parent]
     moved = []
     for j in common:
+        if not all(math.isfinite(v) for v in (*sa[j].offset, *sb[j].offset)):
+            moved.append((j, None))      # NaN compares false with everything, so it never looked moved
+            continue
         d = max(abs(p - q) for p, q in zip(sa[j].offset, sb[j].offset))
         if d > tolerance:
             moved.append((j, round(d, 3)))
@@ -525,6 +580,8 @@ class PortResult:
     written: list = field(default_factory=list)   # paths written into the mod
     notes: list[str] = field(default_factory=list)
     textures: list = field(default_factory=list)  # the converted textures a model's material brought along
+    dyed: object = None                           # with ``dye``: what ddodye.dye_port wrote and removed
+    dye_label: str = ""                           # the colour baked in, in words
 
 
 def _locate(idx, game, rel: str, arc_hint: str | None = None):
@@ -541,6 +598,16 @@ def _locate(idx, game, rel: str, arc_hint: str | None = None):
     if e is None:
         raise RiftError(f"{arcs[0]} does not contain {rel}")
     return name, tid, e.data(), arcs
+
+
+def _archive_name(value: str) -> str:
+    """'rom\\enemy\\em0100.arc' -> 'rom/enemy/em0100', or a RiftError unless every part is a plain archive-name
+    part (Game.arc_path's rule: no drive, root, '.' or '..'), so what is written for it stays in the mod."""
+    from .game import Game
+
+    Game(Path("mod")).arc_path(value)
+    rel = value.replace("\\", "/")
+    return rel[:-4] if rel.lower().endswith(".arc") else rel
 
 
 def _write(mod_root, dst_idx, rel: str, data: bytes, tid: int, arcs: list[str] | None) -> list:
@@ -563,10 +630,59 @@ def _write(mod_root, dst_idx, rel: str, data: bytes, tid: int, arcs: list[str] |
     return targets
 
 
+def _stamps(root) -> dict[str, tuple[int, int]]:
+    out = {}
+    for top in ("files", "archives"):
+        base = Path(root) / top
+        if base.is_dir():
+            for f in base.rglob("*"):
+                if f.is_file():
+                    st = f.stat()
+                    out[f.relative_to(root).as_posix()] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
 def into_mod(mod_root, src_game, dst_game, src_idx, dst_idx, resource: str, as_: str | None = None,
              like: str | None = None, arc_name: str | None = None, from_arc: str | None = None,
              model_only: bool = False, rebake: bool = False, material: str | None = None,
-             alternates: bool = False) -> PortResult:
+             alternates: bool = False, record: bool = True, dye: str | None = None) -> PortResult:
+    """_into_mod, and (``record``) the recipe in the mod's riftstone-sources.json: the files it wrote hold the
+    source game's content, so a package carries the recipe and the player's Riftstone ports them again from
+    the player's own copy of that game (sources.py, package.py).
+
+    ``dye`` (an Online model into a Dark Arisen mod): a colour baked into the model's colour maps
+    (ddodye.py: ``default``, ``material``, a dye such as ``red``, a colour number or ``#rrggbb``), checked
+    before anything is written.  The recipe records it, so a package's replay bakes the same colour."""
+    plan = dye_before = None
+    if dye:
+        from . import ddodye
+        plan = ddodye.port_plan(resource, dye, src_game, src_idx, dst_game.kind, model_only)
+        dye_before = ddodye.snapshot(mod_root)
+    before = _stamps(mod_root) if record else {}
+    out = _into_mod(mod_root, src_game, dst_game, src_idx, dst_idx, resource, as_, like, arc_name, from_arc,
+                    model_only, rebake, material, alternates)
+    if plan is not None:
+        from . import ddodye
+        out.dyed = ddodye.dye_port(mod_root, plan[1], plan[0], ddodye.changed_since(mod_root, dye_before), src_game,
+                                   src_idx)
+        out.dye_label = plan[0].label
+    if record:
+        from . import sources
+        files = [rel for rel, st in _stamps(mod_root).items() if before.get(rel) != st]
+        args = {"src": src_game.kind, "dst": dst_game.kind, "resource": resource, "as_": as_, "like": like,
+                "arc_name": arc_name, "from_arc": from_arc, "model_only": bool(model_only), "rebake": bool(rebake),
+                "material": material, "alternates": bool(alternates)}
+        if dye:
+            args["dye"] = dye           # only when set: an undyed port's recipe stays what it always was
+        if files:
+            sources.record(mod_root, "port", args, files, foreign=src_game.title)
+    return out
+
+
+def _into_mod(mod_root, src_game, dst_game, src_idx, dst_idx, resource: str, as_: str | None = None,
+              like: str | None = None, arc_name: str | None = None, from_arc: str | None = None,
+              model_only: bool = False, rebake: bool = False, material: str | None = None,
+              alternates: bool = False) -> PortResult:
     """Port `resource` of src_game into the mod at mod_root (a dst_game mod), converted and checked.
     A model brings its material (rebuilt from `like`, default the replaced model's material) and the
     textures that material binds, namespaced under <source game>\\ in the target's archives.
@@ -576,9 +692,17 @@ def into_mod(mod_root, src_game, dst_game, src_idx, dst_idx, resource: str, as_:
     `alternates` (a model over another): also rebuild every other material made for the replaced model
     (alternate_materials), so whichever material the game puts on it holds the ported model's materials.
     `rebake` (player motion lists): rebake the re-parented weapon joints between the two games' player
-    bodies (PLAYER_BODY), so weapons and their hit shapes keep their place."""
+    bodies (PLAYER_BODY), so weapons and their hit shapes keep their place.
+    `arc_name`: add the resource into this destination archive (a plain name such as rom/enemy/em0100,
+    the rule of Game.arc_path) instead of over an existing resource."""
     from . import fsmap
 
+    for what, value in (("as", as_), ("like", like), ("arc", arc_name), ("from-arc", from_arc),
+                        ("material", material)):
+        if value is not None and not isinstance(value, str):
+            raise RiftError(f"{what}: expected an engine path or archive name as text, not {type(value).__name__}")
+    if arc_name:
+        arc_name = _archive_name(arc_name)
     src, dst = src_game.kind, dst_game.kind
     _check_kinds(src, dst)
     if src == dst:
@@ -591,6 +715,7 @@ def into_mod(mod_root, src_game, dst_game, src_idx, dst_idx, resource: str, as_:
     tname, ttid = fsmap.decode_path(target)
     if ttid != tid:
         raise RiftError(f"the destination must be a .{typemap.extension(tid)} path like the source")
+    target = fsmap.encode_name(tname, ttid)    # the file a mod keeps that name in, not the path as typed ('a:b')
     arcs = [arc_name] if arc_name else None
     ext = typemap.extension(tid)
     out = PortResult()

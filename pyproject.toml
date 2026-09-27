@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "riftstone"
-version = "0.3.1"
+version = "1.0.1"
 description = "Dragon's Dogma: Dark Arisen and Dragon's Dogma Online modding suite: archives, parameter YAML, mods, the loader and its plugins, Studio"
 readme = "README.md"
 license = {file = "LICENSE"}

@@ -4,12 +4,22 @@
 // throwaway game folder under the name of the game it plays.  Each mode prints one line per
 // check; the Python driver asserts on them.  Nothing here takes focus: windows are never shown.
 //
-//   files        overlay redirection, missing files, the missing-texture stand-in
+//   files        overlay redirection, missing files, the missing-texture stand-in (and, with
+//                chain_plugin.asi loaded, how many of the game's CreateFileW calls its own hook saw)
 //   reset        the import table restored after start-up (what a DRM stub could do)
 //   crash        installs its own crash filter, then faults in its own code
-//   plugincrash  faults inside riftstone\plugins\crash_plugin.asi
+//   stackoverflow  installs a quiet crash filter, then recurses until the main thread's stack is gone
+//   chainfilter  a module sets its own crash filter directly, after the loader's, and passes crashes on
+//                to the one it replaced; once the loader has taken it in, a fault
+//   plugincrash [name]  faults inside riftstone\plugins\<name> (crash_plugin.asi)
+//   plugindeep   runs out of stack inside riftstone\plugins\crash_plugin.asi
 //   fatal        the game's "Fatal error: Failed open file" box (only once the hook is confirmed)
-//   live         Direct3D 9 frames, then waits for <root>\done so the driver can read live stats
+//   guardrace    32 threads open missing textures at the same moment
+//   resources ...  open:<path> opens an archive as the game streams one; <label>=<path> reads a file whole
+//                (the archive guard: resources the game asks for loose before their archives were read)
+//   resourcerace <path>  16 threads read one such resource at the same moment
+//   live [engine-cap]  Direct3D 9 frames, then waits for <root>\done so the driver can read live stats
+//                (engine-cap, DDDA layout: a stand-in sSetManager whose slots enemy_cap moved to its tail)
 //   hang         some frames, then none (the hang detector's case)
 //   window       creates the game window; prints its style and size, and whether focus loss reached it
 //   addon        loads riftstone_loader.dll the way another loader would
@@ -69,6 +79,34 @@ static void CheckBinary(const char* label, const char* path) {
     printf("%s size=%lu magic=%.3s word1=%08x\n", label, got, got >= 3 ? (char*)buf : "", w1);
 }
 
+// A whole file: "size=<n> fnv=<its FNV-1a 64>", or "<cannot open> error=<n>".
+static unsigned long long Fnv(HANDLE h, unsigned long* total) {
+    unsigned long long fnv = 14695981039346656037ULL;
+    BYTE buf[16384];
+    DWORD got = 0;
+    *total = 0;
+    while (ReadFile(h, buf, sizeof buf, &got, NULL) && got) {
+        for (DWORD i = 0; i < got; i++) {
+            fnv ^= buf[i];
+            fnv *= 1099511628211ULL;
+        }
+        *total += got;
+    }
+    return fnv;
+}
+
+static void CheckWhole(const char* label, const char* path) {
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        printf("%s <cannot open> error=%lu\n", label, GetLastError());
+        return;
+    }
+    unsigned long total = 0;
+    unsigned long long fnv = Fnv(h, &total);
+    CloseHandle(h);
+    printf("%s size=%lu fnv=%016llx\n", label, total, fnv);
+}
+
 static BYTE* ImportSlotOf(const char* dll, const char* name) {
     BYTE* base = (BYTE*)GetModuleHandleW(NULL);
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
@@ -119,6 +157,72 @@ static LONG WINAPI RecoveringFilter(EXCEPTION_POINTERS* ep) {
     printf("recovering-filter 0x%08lx\n", ep->ExceptionRecord->ExceptionCode);
     fflush(stdout);
     return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// The game's crash filter for a crash that leaves almost no stack: no CRT, one WriteFile.
+static LONG WINAPI QuietGameFilter(EXCEPTION_POINTERS*) {
+    static const char line[] = "game-filter-called\n";
+    DWORD w;
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line, sizeof line - 1, &w, NULL);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+#pragma warning(push)
+#pragma warning(disable : 4717)   // recursive on every path: it is meant to use up the stack
+static __declspec(noinline) int Deep(volatile int* depth) {
+    volatile char pad[256];
+    pad[0] = (char)++*depth;
+    return Deep(depth) + pad[0];
+}
+#pragma warning(pop)
+
+// A module that sets its own crash filter directly (kernel32's, not through the game's import table)
+// after the loader's, and passes a crash on to the filter it replaced: the loader's.
+typedef LPTOP_LEVEL_EXCEPTION_FILTER(WINAPI* SetUEF_t)(LPTOP_LEVEL_EXCEPTION_FILTER);
+static LPTOP_LEVEL_EXCEPTION_FILTER g_moduleNext;
+static volatile LONG g_moduleCalls;
+static LONG WINAPI ModuleFilter(EXCEPTION_POINTERS* ep) {
+    LONG n = InterlockedIncrement(&g_moduleCalls);
+    if (n <= 3) {                        // a loop through the two filters would print tens of thousands
+        char line[48];
+        int len = _snprintf_s(line, sizeof line, _TRUNCATE, "module-filter %ld\n", n);
+        DWORD w;
+        if (len > 0) WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line, (DWORD)len, &w, NULL);
+    }
+    if (g_moduleNext) g_moduleNext(ep);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Many threads asking for missing textures at the same moment (the stand-in is made on first use).
+static HANDLE g_raceGo;
+static volatile LONG g_raceOk;
+static const char* g_resRacePath;
+static volatile LONG g_resRaceOpened;
+static unsigned long long g_resRaceHash[16];
+static unsigned long g_resRaceSize[16];
+static DWORD WINAPI ResRaceOpen(LPVOID arg) {
+    int i = (int)(INT_PTR)arg;
+    WaitForSingleObject(g_raceGo, INFINITE);
+    HANDLE h = CreateFileA(g_resRacePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    g_resRaceHash[i] = Fnv(h, &g_resRaceSize[i]);
+    CloseHandle(h);
+    InterlockedIncrement(&g_resRaceOpened);
+    return 0;
+}
+static DWORD WINAPI RaceOpen(LPVOID arg) {
+    char path[MAX_PATH];
+    sprintf_s(path, "nativePC\\rom\\model\\race_%d_BM.tex", (int)(INT_PTR)arg);
+    WaitForSingleObject(g_raceGo, INFINITE);
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        char buf[128];
+        DWORD got = 0;
+        ReadFile(h, buf, sizeof buf, &got, NULL);
+        CloseHandle(h);
+        if (got == 52 && memcmp(buf, "TEX", 3) == 0) InterlockedIncrement(&g_raceOk);
+    }
+    return 0;
 }
 
 static volatile LONG g_activateSeen = 0;
@@ -366,7 +470,8 @@ static int CloseMode(const wchar_t* root, const char* how) {
 
 #ifdef HARNESS_DDDA_LAYOUT
 // What fixes.cpp reads in build 2364871 (docs/re-enemy-cap.md; the game's stage reader 0x005BAF40), stood in.
-static unsigned char g_setManager[0x1B8D0 + 0x100];      // sSetManager: slots at +0x844, mUnitNumEnemy +0x1B8D0
+// sSetManager: slots at +0x844, mUnitNumEnemy +0x1B8D0, and the slots enemy_cap moves to its tail (+0x1B950)
+static unsigned char g_setManager[0x1B950 + 64 * 0x20];
 static unsigned char g_area[0x3834 + 0x10];               // sArea: the current stage record at +0x3834
 static unsigned char g_stageNow[0x724 + 0x10];            // set-up flag +0x20, stage number +0x724
 
@@ -384,6 +489,19 @@ static bool StandInEngine(int active, int stage) {
     *(unsigned long*)(g_area + 0x3834) = (unsigned long)(uintptr_t)g_stageNow;
     g_stageNow[0x20] = 1;
     *(int*)(g_stageNow + 0x724) = stage;
+    return true;
+}
+
+// What enemy_cap leaves: `slots` slots at the manager's tail (+0x1B950), `active` of them in use, and
+// mUnitNumEnemy raised to the new count.  The vanilla slots keep what StandInEngine put there.
+static bool StandInEngineMoved(int slots, int active) {
+    if (slots > 64) return false;
+    for (int i = 0; i < slots; i++) {
+        unsigned char* s = g_setManager + 0x1B950 + i * 0x20;
+        *(unsigned long*)s = 0x01562414;
+        *(unsigned long*)(s + 4) = i < active ? 0x2000u + i : 0;
+    }
+    *(int*)(g_setManager + 0x1B8D0) = slots;
     return true;
 }
 #endif
@@ -969,6 +1087,8 @@ static int PressureMode(const wchar_t* root, int targetMb) {
 }
 
 int main(int argc, char** argv) {
+    // A crash in a test never shows Windows' error box (run_tests.py sets the same for every stand-in).
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(NULL, exe, MAX_PATH);
     *wcsrchr(exe, L'\\') = 0;
@@ -1012,14 +1132,89 @@ int main(int argc, char** argv) {
         *p = 1;                                               // a real crash afterwards: its own report
         return 3;
     }
-    if (strcmp(mode, "plugincrash") == 0) {
-        HMODULE plugin = GetModuleHandleW(L"crash_plugin.asi");
+    if (strcmp(mode, "stackoverflow") == 0) {
+        SetUnhandledExceptionFilter(QuietGameFilter);         // through the import table, as the game does
+        printf("recursing\n");
+        fflush(stdout);
+        volatile int depth = 0;
+        Deep(&depth);                                         // the loader must still report this one
+        return 3;
+    }
+    if (strcmp(mode, "chainfilter") == 0) {
+        SetUEF_t set = (SetUEF_t)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetUnhandledExceptionFilter");
+        g_moduleNext = set ? set(ModuleFilter) : NULL;
+        printf("module-filter-set %s\n", g_moduleNext ? "over-another" : "first");
+        // The loader looks at the filter every 5 s; it logs when it has taken this one in.
+        printf("adopted %s\n", LogSays(exe, "crash    another module", 8000) ? "yes" : "no");
+        fflush(stdout);
+        volatile int* p = (int*)0x10;
+        *p = 1;
+        return 3;
+    }
+    if (strcmp(mode, "plugincrash") == 0 || strcmp(mode, "plugindeep") == 0) {
+        wchar_t name[MAX_PATH] = L"crash_plugin.asi";
+        if (argc > 2) MultiByteToWideChar(CP_ACP, 0, argv[2], -1, name, MAX_PATH);
+        HMODULE plugin = GetModuleHandleW(name);
         printf("crash-plugin %s\n", plugin ? "loaded" : "absent");
         fflush(stdout);
         if (!plugin) return 4;
+        if (strcmp(mode, "plugindeep") == 0) {
+            SetUnhandledExceptionFilter(QuietGameFilter);
+            ((void (*)())GetProcAddress(plugin, "RiftstoneTestDeep"))();
+            return 3;
+        }
         SetUnhandledExceptionFilter(GameFilter);
         ((void (*)())GetProcAddress(plugin, "RiftstoneTestBoom"))();
         return 3;
+    }
+    if (strcmp(mode, "guardrace") == 0) {
+        const int n = 32;
+        HANDLE threads[n];
+        g_raceGo = CreateEventW(NULL, TRUE, FALSE, NULL);
+        for (int i = 0; i < n; i++) threads[i] = CreateThread(NULL, 0, RaceOpen, (LPVOID)(INT_PTR)i, 0, NULL);
+        Sleep(200);                                           // every thread waits at the start line
+        SetEvent(g_raceGo);
+        WaitForMultipleObjects(n, threads, TRUE, 30000);
+        printf("race-ok %ld/%d\n", g_raceOk, n);
+        return 0;
+    }
+    if (strcmp(mode, "resources") == 0) {
+        for (int i = 2; i < argc; i++) {
+            if (strncmp(argv[i], "open:", 5) == 0) {           // as the game streams an archive: its first bytes
+                HANDLE h = CreateFileA(argv[i] + 5, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL, NULL);
+                char head[8];
+                DWORD got = 0;
+                if (h != INVALID_HANDLE_VALUE) {
+                    ReadFile(h, head, sizeof head, &got, NULL);
+                    CloseHandle(h);
+                }
+                continue;
+            }
+            const char* eq = strchr(argv[i], '=');
+            char label[64];
+            if (!eq || eq - argv[i] >= (int)sizeof label) continue;
+            memcpy(label, argv[i], eq - argv[i]);
+            label[eq - argv[i]] = 0;
+            CheckWhole(label, eq + 1);
+        }
+        return 0;
+    }
+    if (strcmp(mode, "resourcerace") == 0 && argc > 2) {
+        const int n = 16;
+        HANDLE threads[n];
+        g_resRacePath = argv[2];
+        g_raceGo = CreateEventW(NULL, TRUE, FALSE, NULL);
+        for (int i = 0; i < n; i++) threads[i] = CreateThread(NULL, 0, ResRaceOpen, (LPVOID)(INT_PTR)i, 0, NULL);
+        Sleep(200);                                           // every thread waits at the start line
+        SetEvent(g_raceGo);
+        WaitForMultipleObjects(n, threads, TRUE, 60000);
+        int same = 0;
+        for (int i = 0; i < n; i++)
+            same += g_resRaceSize[i] && g_resRaceSize[i] == g_resRaceSize[0] && g_resRaceHash[i] == g_resRaceHash[0];
+        printf("resrace opened=%ld same=%d size=%lu fnv=%016llx\n", g_resRaceOpened, same, g_resRaceSize[0],
+               g_resRaceHash[0]);
+        return 0;
     }
     if (strcmp(mode, "fatal") == 0) {
         CheckA("before-fatal", "nativePC\\rom\\enemy\\em0100.arc");
@@ -1033,6 +1228,10 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (strcmp(mode, "live") == 0 || strcmp(mode, "hang") == 0) {
+#ifdef HARNESS_DDDA_LAYOUT
+        if (argc > 2 && strcmp(argv[2], "engine-cap") == 0)   // 7 of the vanilla ten in use; enemy_cap's 30, 17 in use
+            printf("engine %s\n", LayOutDdda() && StandInEngine(7, 100) && StandInEngineMoved(30, 17) ? "stand-in" : "missing");
+#endif
         CheckA("before-live", "nativePC\\rom\\enemy\\em0100.arc");
         HWND w = MakeWindow(WS_OVERLAPPEDWINDOW);
         IDirect3DDevice9* dev = Draw(w, strcmp(mode, "live") == 0 ? 60 : 30, 5);
@@ -1094,6 +1293,12 @@ int main(int argc, char** argv) {
         CloseHandle(w);
     } else {
         printf("write-open <cannot open>\n");
+    }
+    // A plugin that hooked the game's CreateFileW itself (chain_plugin.asi): how many calls its hook passed on.
+    if (HMODULE chain = GetModuleHandleW(L"chain_plugin.asi")) {
+        typedef LONG (*Calls_t)();
+        Calls_t calls = (Calls_t)GetProcAddress(chain, "ChainPlugin_Calls");
+        printf("chain-calls %ld\n", calls ? calls() : -1L);
     }
     return 0;
 }

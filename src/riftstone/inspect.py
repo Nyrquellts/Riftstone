@@ -22,7 +22,9 @@ from dataclasses import dataclass, field
 from . import typemap, xfs
 
 _ID = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{2,63}")
-_PATH = re.compile(rb"[A-Za-z0-9_]{2,}[\\/][ -~]{2,190}")
+# a path starts where its first name does: tried at every offset of a long run of letters, the scan was
+# quadratic (100,000 letters took 26 s)
+_PATH = re.compile(rb"(?<![A-Za-z0-9_])[A-Za-z0-9_]{2,}[\\/][ -~]{2,190}")
 _F = struct.Struct("<f")
 
 

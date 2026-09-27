@@ -124,6 +124,40 @@ class EpvTest(unittest.TestCase):
             with self.assertRaises(ParamError):
                 effect.yaml_to_bytes(bad)
 
+    def test_yaml_sections_are_not_dropped(self):
+        # the reader never checked the top-level or index keys and took a missing section as empty:
+        # 'motSync:' built with no motion-sync entries, 'indexes:' with no indices
+        text = effect.to_yaml(effect.parse(effect.build(epv_sample(0))))
+        for bad in (text.replace("motsync:", "motSync:"), text.replace("indices:", "indexes:"),
+                    text.replace("  - elements:", "  - element:", 1),
+                    text.replace("  - elements:", "  - count: 1\n    elements:", 1),
+                    text[:text.index("events:")],                                  # a section left out
+                    text.replace("motsync:\n", "motsync: 3\nx:\n")):
+            self.assertNotEqual(bad, text)
+            with self.assertRaises(ParamError):
+                effect.from_yaml(bad)
+
+    def test_yaml_name_stays_in_its_comment(self):
+        # the resource name went into the header comment as it was: a newline in it began a YAML line
+        # of its own (here a second 'riftstone:' key, which also fooled params' tag detection)
+        from riftstone import params
+        for mod, m in ((effect, epv_sample(22)), (effect_efl, efl_sample()), (effect_e2d, e2d_sample())):
+            raw = mod.build(m)
+            y = mod.to_yaml(m, "x\nriftstone: xfs/1\r\t\"#")
+            self.assertEqual(mod.yaml_to_bytes(y), raw, mod.__name__)
+            self.assertEqual(params.yaml_to_resource(y), raw, mod.__name__)
+
+    def test_yaml_long_hex_number(self):
+        # base 16 has no digit limit, but 3,572 hex digits are over 4,300 decimal ones: the range message
+        # printed the number and leaked int -> str's ValueError
+        big = "0x" + "f" * 3572
+        text = effect.to_yaml(effect.parse(effect.build(epv_sample(0))))
+        for bad in (text.replace("version: 0", "version: " + big), text.replace("mJointNo: 12", "mJointNo: -" + big)):
+            self.assertNotEqual(bad, text)
+            with self.assertRaises(ParamError) as cm:
+                effect.from_yaml(bad)
+            self.assertLess(len(str(cm.exception)), 200)
+
 
 # -- .efl --------------------------------------------------------------------------------------------
 def _head(schema, **values):
@@ -238,6 +272,65 @@ class EflTest(unittest.TestCase):
                     text.replace("      ParticleNum: 4\n", "")):
             with self.assertRaises(ParamError):
                 effect_efl.yaml_to_bytes(bad)
+
+    def test_yaml_fields_are_not_dropped(self):
+        # units / joints / regions were read as '.items if a list else []' and other top-level keys were
+        # ignored: 'joints: 4' or 'joint: [4]' built with no joints. Keys a unit, region, head or range does
+        # not have were ignored too; a region's number was never checked. (.e2d reads the same way.)
+        text = effect_efl.to_yaml(effect_efl.parse(effect_efl.build(efl_sample())))
+        tex = '"effect\\\\tex\\\\cm\\\\t_a_GM"'
+        raw_tex = '{hex: "' + (b"effect\\tex\\cm\\t_a_GM".ljust(64, b"\0")).hex() + '"'
+        self.assertEqual(effect_efl.yaml_to_bytes(text.replace(tex, raw_tex + "}")), effect_efl.build(efl_sample()))
+        cases = [(effect_efl, text, a, b) for a, b in (
+            ("joints: [4]", "joints: 4"), ("joints: [4]", "joint: [4]"), ("units:\n", "units: 4\nx:\n"),
+            ("regions:\n", "units2: []\nregions:\n"), ("move_unk: 0, move: 3}", "move_unk: 0, move: 3, moves: 1}"),
+            ("param: 5}", "param: 5, params: 6}"), ("  - region: 2  #", "  - region: 7  #"),
+            ("  - region: 2  # life Frame, 16 bytes\n    tail:", "  - region: 2\n    tails: []\n    tail:"),
+            ("      ParticleNum: 4\n", "      ParticleNum: 4\n      ParticleNumber: 5\n"),
+            ("ParticleScale: {s: 1.0, r: 0.5}", "ParticleScale: {s: 1.0, r: 0.5, t: 2.0}"),
+            (tex, raw_tex + ", text: x}"))]
+        t2 = effect_e2d.to_yaml(e2d_sample())
+        cases += [(effect_e2d, t2, a, b) for a, b in (
+            ("units:\n", "units: 4\nx:\n"), ("regions:\n", "regionz:\n"), ("  - region: 1  #", "  - region: 0  #"),
+            ("move_type: 2, move: 3}", "move_type: 2, move: 3, moves: 1}"),
+            ("  RTTexturePath:\n", "  RTTexturePaths: []\n  RTTexturePath:\n"))]
+        for mod, good, a, b in cases:
+            bad = good.replace(a, b, 1)
+            self.assertNotEqual(bad, good, a)
+            with self.assertRaises(ParamError, msg=b):
+                mod.from_yaml(bad)
+
+    def test_region_at_offset_zero_refused(self):
+        # with no units and no joints the tables take no bytes, so region 0 starts at offset 0, which the
+        # format reads as none: unit [0, None, None, None] built, and parsed back as [None] * 4
+        E = effect_efl
+        e = E.Efl(E.VERSION_DDDA, f(30.0), 0x100, (0, 0), [], [], [0, None, None, None], b"",
+                  [E.Region(bytes(0xC0))])
+        with self.assertRaises(FormatError):
+            E.build(e)
+        e.regions.insert(0, E.Region(bytes(16)))                        # another region first: it has a place
+        e.unit = [1, None, None, None]
+        raw = E.build(e)
+        self.assertEqual(E.parse(raw).unit, [1, None, None, None])
+        text = ("riftstone: efl/1\nversion: 0x20110318\nmBaseFps: 30.0\nflags: 0x100\nunit: {generator: 0, "
+                "move: null, joint: null, param: null}\nunits: []\njoints: []\nregions:\n  - region: 0\n    tail: ["
+                + "00" * 0xC0 + "]\n")
+        with self.assertRaises(ParamError):
+            E.from_yaml(text)
+
+    def test_yaml_long_hex_number(self):
+        # base 16 has no digit limit, but 3,572 hex digits are over 4,300 decimal ones: the range message
+        # printed the number and leaked int -> str's ValueError (.e2d reads its numbers the same way)
+        big = "0x" + "f" * 3572
+        text = effect_efl.to_yaml(effect_efl.parse(effect_efl.build(efl_sample())))
+        t2 = effect_e2d.to_yaml(e2d_sample())
+        for mod, bad in ((effect_efl, text.replace("particle: 1,", "particle: " + big + ",")),
+                         (effect_efl, text.replace("ParticleNum: 4", "ParticleNum: " + big)),
+                         (effect_e2d, t2.replace("version: 0x20110314", "version: " + big))):
+            self.assertNotIn(bad, (text, t2))
+            with self.assertRaises(ParamError) as cm:
+                mod.from_yaml(bad)
+            self.assertLess(len(str(cm.exception)), 200)
 
     def test_kind_names(self):
         self.assertEqual(effect_efl.particle_kind(5), "Model")

@@ -53,7 +53,10 @@ _UNCOMP = {40: 4}
 _FOURCC = {19: b"DXT1", 20: b"DXT1", 25: b"DXT1", 24: b"DXT5", 37: b"DXT5",
            43: b"DXT5", 47: b"DXT5", 31: b"ATI2"}
 # a .dds coming in maps back to one of these ids when no template texture is given (best effort)
-_FMT_FROM_FOURCC = {b"DXT1": 20, b"DXT5": 24, b"DXT3": 24, b"ATI2": 31}
+_FMT_FROM_FOURCC = {b"DXT1": 20, b"DXT5": 24, b"ATI2": 31}
+# 32-bit uncompressed .dds pixels by their (R, G, B) channel masks: format 40 keeps each pixel's bytes as
+# B, G, R, A (A8R8G8B8); A8B8G8R8 has red and blue the other way round
+_RGB32 = {(0x00FF0000, 0x0000FF00, 0x000000FF): "BGR", (0x000000FF, 0x0000FF00, 0x00FF0000): "RGB"}
 
 
 @dataclass
@@ -174,8 +177,9 @@ def to_dds(t: Tex) -> bytes:
     return bytes(hdr) + pixels
 
 
-def _read_dds(dds: bytes) -> tuple[int, int, int, bytes, bytes]:
-    """(width, height, mip_count, fourcc_or_empty, pixels)."""
+def _read_dds(dds: bytes) -> tuple[int, int, int, str, bytes]:
+    """(width, height, mip_count, pixel format, pixels).  The format is the four-cc (DXT1, DXT5, ATI2), or
+    for 32-bit uncompressed pixels the order of each pixel's bytes: BGRA, RGBA, or BGRX / RGBX (no alpha)."""
     if len(dds) < _DDS_HEADER_LEN or _U.unpack_from(dds, 0)[0] != _DDS_MAGIC:
         raise FormatError("dds", "not a DDS file")
     if _U.unpack_from(dds, 4)[0] != 124:
@@ -183,10 +187,29 @@ def _read_dds(dds: bytes) -> tuple[int, int, int, bytes, bytes]:
     height, width = _U.unpack_from(dds, 12)[0], _U.unpack_from(dds, 16)[0]
     mip = _U.unpack_from(dds, 28)[0] or 1
     pf_flags = _U.unpack_from(dds, 80)[0]
-    fourcc = dds[84:88] if pf_flags & _DDPF_FOURCC else b""
-    if fourcc == b"DX10":
-        raise FormatError("dds", "DX10 extended header is not supported; save as DXT1/DXT5/ATI2 or uncompressed")
-    return width, height, mip, fourcc, dds[_DDS_HEADER_LEN:]
+    if pf_flags & _DDPF_FOURCC:
+        fourcc = bytes(dds[84:88])
+        if fourcc == b"DX10":
+            raise FormatError("dds", "DX10 extended header is not supported; save as DXT1/DXT5/ATI2 or uncompressed")
+        if fourcc == b"DXT3":
+            raise FormatError("dds", "DXT3 stores alpha in a way Dragon's Dogma textures do not; save it as DXT5")
+        if fourcc not in _FMT_FROM_FOURCC:
+            raise FormatError("dds", f"four-cc {fourcc!r} is not a Dragon's Dogma texture format")
+        kind = fourcc.decode("ascii")
+    else:
+        bits, r, g, b, a = struct.unpack_from("<5I", dds, 88)
+        order = _RGB32.get((r, g, b))
+        alpha = bool(pf_flags & _DDPF_ALPHAPIXELS)
+        if not pf_flags & _DDPF_RGB or bits != 32 or order is None or (alpha and a != 0xFF000000):
+            raise FormatError("dds", "an uncompressed .dds must be 32-bit A8R8G8B8, X8R8G8B8, A8B8G8R8 or "
+                                     "X8B8G8R8; save it as one of those, or as DXT1/DXT5/ATI2")
+        kind = order + ("A" if alpha else "X")
+    return width, height, mip, kind, dds[_DDS_HEADER_LEN:]
+
+
+def _dds_kind(fmt: int) -> str:
+    """How a .dds holds a texture of this format id."""
+    return _FOURCC[fmt].decode("ascii") if fmt in _FOURCC else "uncompressed 32-bit"
 
 
 def attr1_for(attr1: int, version: int) -> int:
@@ -201,38 +224,45 @@ def attr1_for(attr1: int, version: int) -> int:
 def dds_to_tex(dds: bytes, template: Tex | None = None, version: int = VERSION) -> Tex:
     """Turn a ``.dds`` back into a ``.tex``.  With ``template`` (the original texture) the exact
     format id and header attributes are preserved, so a texture that was exported and re-imported
-    unchanged rebuilds byte-for-byte.  Without one, a fresh flat texture is synthesised."""
-    width, height, mip, fourcc, pixels = _read_dds(dds)
+    unchanged rebuilds byte-for-byte; the .dds must hold the template's kind of pixels (DXT1, DXT5, ATI2 or
+    32-bit), exactly as many as its header announces.  Without one, a fresh flat texture is synthesised.
+    Uncompressed pixels come in as the game keeps them: B, G, R, A bytes, opaque when the .dds has no alpha."""
+    width, height, mip, kind, pixels = _read_dds(dds)
     # a Dragon's Dogma texture holds width/height in 13 bits and mipCount in 6; reject anything that
     # would not fit (and, as importantly, would make the mip loop below run for billions of levels).
     if not 1 <= width <= 0x1FFF or not 1 <= height <= 0x1FFF:
         raise FormatError("dds", f"{width}x{height} is out of range for a texture (1..8191)")
     if not 1 <= mip <= 0x3F:
         raise FormatError("dds", f"{mip} mip levels is out of range (1..63)")
+    held = _FMT_FROM_FOURCC.get(kind.encode("ascii"), 40)
     if template is not None:
         fmt = template.fmt
         attr1, version, depth, attr3 = template.attr1, template.version, template.depth, template.attr3
         if depth != 1:
             raise FormatError("dds", "the template is a cube map; import it as a raw .tex")
+        if fmt not in _BLOCK and fmt not in _UNCOMP:
+            raise FormatError("dds", f"format id {fmt} cannot be imported")
+        if _dds_kind(held) != _dds_kind(fmt):      # its blocks would be read as the texture's own
+            raise FormatError("dds", f"this .dds is {_dds_kind(held)}, the texture is {_dds_kind(fmt)}; "
+                                     f"save it as {_dds_kind(fmt)}")
     else:
-        if fourcc:
-            fmt = _FMT_FROM_FOURCC.get(fourcc)
-            if fmt is None:
-                raise FormatError("dds", f"four-cc {fourcc!r} is not a Dragon's Dogma texture format")
-        else:
-            fmt = 40  # uncompressed
+        fmt = held
         if version not in VERSIONS:
             raise FormatError("dds", f"texture revision 0x{version:x} is not one Riftstone writes")
         # the most common flat-texture attr1 of each game (DDDA 0x20000, 11,199 of 11,221; DDO 0x20002,
         # 26,726 of 27,142)
         attr1, depth, attr3 = (0x20002 if version == VERSION_DDO else 0x20000), 1, 1
-    if fmt not in _BLOCK and fmt not in _UNCOMP:
-        raise FormatError("dds", f"format id {fmt} cannot be imported")
     expect = sum(_mip_size(width, height, m, fmt) for m in range(mip))
-    if len(pixels) < expect:
-        raise FormatError("dds", f"pixel data is {len(pixels)} bytes, need {expect} for "
-                          f"{width}x{height} with {mip} mips")
-    pixels = pixels[:expect]
+    if len(pixels) != expect:
+        raise FormatError("dds", f"pixel data is {len(pixels)} bytes; a {width}x{height} {_dds_kind(fmt)} "
+                                 f"texture with {mip} mip(s) is {expect}")
+    if fmt in _UNCOMP and kind != "BGRA":           # into the game's B, G, R, A byte order
+        px = bytearray(pixels)
+        if kind.startswith("RGB"):
+            px[0::4], px[2::4] = pixels[2::4], pixels[0::4]
+        if kind.endswith("X"):
+            px[3::4] = b"\xff" * (len(px) // 4)
+        pixels = bytes(px)
     table_start = 16 + 4 * mip
     offs, off = [], table_start
     for m in range(mip):

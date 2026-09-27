@@ -74,6 +74,36 @@ class FlatTest(unittest.TestCase):
         with self.assertRaises(FormatError):
             flat.parse(b"ajp\0" + struct.pack("<iiff", 1, 1, 2.0, 3.0), "ajp")  # trailing bytes
 
+    def test_huge_numbers_are_refused_in_a_short_message(self):
+        # a hex number thousands of digits long parses; writing it in decimal for the message raised
+        # ValueError ("Exceeds the limit (4300 digits)")
+        for value in ("0x" + "F" * 3600, "9" * 5000):
+            with self.assertRaises(ParamError) as cm:
+                flat.yaml_to_bytes(f"riftstone: spn/1\nmConst: {value}\nmpPlace: []\n", "s.yaml")
+            self.assertLess(len(str(cm.exception)), 200)
+
+    def test_text_utf8_cannot_hold_is_refused(self):
+        # a lone surrogate in a string field crashed the build with UnicodeEncodeError
+        rec = {"mCategory": 1, "mComment": "sword", "mEpvCrc": 2, "mEpvType": 3, "mSrqCrc": 4, "mSrqType": 5}
+        good = flat.to_yaml(flat.Flat("wcrt", 0, {"version": 1, "mpArray": [rec]}))
+        for bad in ("\\ud800", "\\udc41"):
+            with self.assertRaises(ParamError) as cm:
+                flat.yaml_to_bytes(good.replace('"sword"', f'"a{bad}b"'), "w.yaml")
+            self.assertIn("cannot be stored as UTF-8", str(cm.exception))
+            self.assertIsNotNone(cm.exception.line)
+        # a byte that is not UTF-8 is shown as \udcXX and comes back as that byte
+        self.assertIn(b"a\xffb\0", flat.yaml_to_bytes(good.replace('"sword"', '"a\\udcffb"')))
+
+    def test_a_list_is_refused_when_its_count_field_cannot_hold_it(self):
+        # eap/sap count their records in an s16: 32,768 overflowed it and the build crashed (struct.error)
+        d = _sample(flat.SCHEMAS["eap"][1])
+        one = flat.to_yaml(flat.Flat("eap", flat.SCHEMAS["eap"][0], d))
+        head, rec = one.split("mpStudyDisableAttrAdrs:\n")
+        with self.assertRaises(ParamError) as cm:
+            flat.yaml_to_bytes(head + "mpStudyDisableAttrAdrs:\n" + rec * 32768, "e.yaml")
+        self.assertIn("mpStudyDisableAttrAdrs holds 32768 items; its count studyDisableNum (s16) holds at most 32767",
+                      str(cm.exception))
+
     def test_new_ai_and_quest_formats(self):
         # eap/sap/map/qct/rst use nested records and inline/counted lists; a synthetic sample with one
         # record at every level must parse->build and YAML round-trip byte-for-byte.

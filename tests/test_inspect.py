@@ -1,4 +1,5 @@
 import struct
+import time
 import unittest
 
 import helpers
@@ -40,6 +41,16 @@ class InspectTest(unittest.TestCase):
         rep = inspector.describe(data, typemap.BY_EXT["lot"])
         self.assertTrue(rep.editable)
         self.assertIn("turn 86 deg", rep.text("x"))
+
+    def test_long_runs_of_letters_scan_quickly(self):
+        # the path scan was retried from every offset of an alphanumeric run: 100,000 letters took 26.6 s
+        for data in (b"a" * 40_000, b"a" * 40_000 + b"/\0" + b"b" * 40_000, b"ab_c/\1" * 20_000):
+            t = time.perf_counter()
+            inspector.describe(data, 0)
+            self.assertLess(time.perf_counter() - t, 0.5)
+        # a path is still found whole, from where its name starts
+        rep = inspector.describe(b"\0\0\0\0" + b"q" * 100 + b"\\model\\em0100\0" + bytes(8), 0)
+        self.assertIn(b"q" * 100 + b"\\model\\em0100", [f.value for f in rep.strings if f.kind == "path"])
 
     def test_unknown_type_still_opens(self):
         rep = inspector.describe(b"\x01\x02\x03\x04" + b"hello_world\0" + b"\0" * 20, 0)

@@ -201,6 +201,53 @@ class SkinWorldTest(unittest.TestCase):
         with self.assertRaises(RiftError):                                  # a taken layout name
             encounter.plan(self.game, self.idx, self.w, root, 424, "em5200", 1, "0,-350,0", group=1)
 
+    def test_a_manifest_of_the_wrong_shape_is_refused_before_anything_is_written(self):
+        # was: TypeError after the skin's files were written ({"chimera": []} and the like: the number was not
+        # reserved), a RiftError only after them (5, null), RecursionError in write and in a neighbour's check_free
+        fam = skins.FAMILIES["chimera"]
+        res = skins.resources(self.game, self.idx, fam, 7, {})
+        ws = self.base / "hand-edited"
+        good = mod.Mod.create(ws / "Good", "Good").root
+        deep = "[" * 100_000 + "]" * 100_000
+        for i, bad in enumerate(('{"chimera": []}', '{"chimera": "x"}', '{"chimera": 5}', '{"chimera": null}', "5",
+                                 "null", "[]", deep, '{"chimera": ' + deep + "}")):
+            with self.subTest(bad=bad[:30]):
+                root = mod.Mod.create(ws / f"Broken {i}", f"Broken {i}").root
+                (root / skins.MANIFEST).write_text(bad, encoding="utf-8")
+                with self.assertRaisesRegex(RiftError, "skins.json"):
+                    skins.read_manifest(root)
+                with self.assertRaisesRegex(RiftError, "skins.json"):
+                    skins.write(root, fam, 7, res, "t", "t")
+                self.assertFalse((root / "archives" / "rom" / "enemy").exists())     # no resource was written
+                self.assertEqual((root / skins.MANIFEST).read_text(encoding="utf-8"), bad)
+                skins.check_free(good, fam, 7)                              # a neighbour's broken manifest is passed over
+        # a family this Riftstone does not know stays as it was, and the manifest still takes a skin
+        root = mod.Mod.create(ws / "Other family", "Other family").root
+        (root / skins.MANIFEST).write_text('{"wolf": [], "chimera": {"3": "text"}}', encoding="utf-8")
+        skins.write(root, fam, 7, res, "t", "t")
+        man = skins.read_manifest(root)
+        self.assertEqual((man["wolf"], man["chimera"]["3"], man["chimera"]["7"]["title"]), ([], "text", "t"))
+
+    def test_export_checks_before_it_creates_anything(self):
+        # was: FileExistsError when --out was a file, and a refused export (no such skin) still made the folder
+        fam = skins.FAMILIES["chimera"]
+        root = self._mod("Export")
+        skins.write(root, fam, 8, skins.resources(self.game, self.idx, fam, 8, {}), "t", "t")
+        afile = self.base / "export-file.png"
+        afile.write_bytes(b"keep")
+        with self.assertRaises(RiftError):
+            skins.export(root, fam, 8, afile)
+        self.assertEqual(afile.read_bytes(), b"keep")
+        for n in (9, 0, 100):                                               # no such skin; not a skin number
+            out = self.base / f"export-{n}"
+            with self.assertRaises(RiftError):
+                skins.export(root, fam, n, out)
+            self.assertFalse(out.exists(), n)
+        out = self.base / "export-8" / "deeper"
+        files = skins.export(root, fam, 8, out)
+        self.assertEqual(sorted(p.name for p in files), sorted(f"{b}.png" for b in fam.textures))
+        self.assertEqual(skins.textures_from_folder(out, fam).keys(), set(fam.textures))
+
 
 def _game_exe() -> Path | None:
     try:

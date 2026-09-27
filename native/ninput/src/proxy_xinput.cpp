@@ -44,10 +44,20 @@ __declspec(naked) void t_missing() {
 // XInputGetState is a real wrapper (not a blind forwarder): it calls the real function, then hands
 // the pad to the input engine so hotkeys fire and transforms can rewrite what the game reads. This
 // is what makes Ninput the input layer for the game, not just a passthrough.
+//
+// It sources the poll from the real XInputGetStateEx (ordinal 100) when present, so the pad carries
+// the Guide (Xbox) button -- which the plain XInputGetState masks out -- and a plugin can bind it as
+// a hotkey. The Guide bit is cleared again before the game reads the pad, so the game sees exactly
+// what vanilla XInputGetState returns (it does not handle Guide anyway).
+constexpr unsigned short GAMEPAD_GUIDE = 0x0400;
+
 extern "C" DWORD WINAPI nx_XInputGetState(DWORD index, ninput::RawXInputState* state) {
-    auto real = reinterpret_cast<DWORD(WINAPI*)(DWORD, ninput::RawXInputState*)>(r_XInputGetState);
+    void* src = (r_XInputGetStateEx && r_XInputGetStateEx != (void*)&t_missing) ? r_XInputGetStateEx
+                                                                                : r_XInputGetState;
+    auto real = reinterpret_cast<DWORD(WINAPI*)(DWORD, ninput::RawXInputState*)>(src);
     DWORD r = real(index, state);
-    ninput::input_feed_state((int)index, r, state);
+    ninput::input_feed_state((int)index, r, state);   // hotkeys (Guide included) + transforms
+    if (r == 0 && state) state->pad.buttons &= (unsigned short)~GAMEPAD_GUIDE;
     return r;
 }
 

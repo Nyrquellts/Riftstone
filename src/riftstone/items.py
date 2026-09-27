@@ -133,8 +133,8 @@ def new(game, idx, mod_root: Path, name: str, like: str, description: str = "", 
         from .params import to_f32
         try:
             struct.pack_into("<f", rec, 0x44, to_f32(float(weight)))
-        except ValueError:
-            raise RiftError(f"weight {weight} is not a usable number") from None
+        except (ValueError, OverflowError):              # OverflowError: an integer past a float's range
+            raise RiftError(f"weight {str(weight)[:40]} is not a usable number") from None
     if buy is not None:
         struct.pack_into("<I", rec, 0x48, buy)
         if sell is None:

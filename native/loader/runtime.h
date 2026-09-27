@@ -17,7 +17,7 @@
 #include <windows.h>
 #include <stdint.h>
 
-#define RIFTSTONE_VERSION_A "1.0.0"
+#define RIFTSTONE_VERSION_A "1.0.1"             // the one version: the log, reports, the live page, the panel
 #define RIFTSTONE_LOADER_VERSION L"" RIFTSTONE_VERSION_A
 
 // ---- loader.cpp -------------------------------------------------------------------------------
@@ -127,7 +127,8 @@ BOOL EnemySlots(int* active, int* usable, int* slots);
 // The current stage number, and sResource's table use (DDDA build 2364871 only); FALSE when unknown.
 BOOL CurrentStage(int* stage);
 BOOL ResourceTable(int* used, int* size);
-// Missing-texture guard, asked when a read-only open under nativePC finds no file.
+// The guard, asked when a read-only open under nativePC finds no file: the resource's own bytes from its
+// archive (resources.cpp), else a stand-in for a texture.
 HANDLE GuardOpen(const wchar_t* fullPath, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
                  DWORD disposition, DWORD flags, HANDLE templ);
 BOOL InGameImage(DWORD_PTR v);                  // inside the game's executable image
@@ -135,6 +136,15 @@ BOOL InGameImage(DWORD_PTR v);                  // inside the game's executable 
 BOOL ExitSitesVerified();
 int GameQuitFlag();                             // sApp+0x266C: the game's own exit (or its loop ending)
 int GameExitRequested();                        // sMain+0x34: its exit request ran
+
+// ---- resources.cpp ----------------------------------------------------------------------------
+void ResourcesInit();                           // [guard] from_archives (Dark Arisen)
+// A resource the game asks for loose under nativePC (fullPath, normalised) before its archive was read:
+// a read-only handle to its own bytes, taken from that archive; INVALID_HANDLE_VALUE when none has it.
+HANDLE ArchiveOpen(const wchar_t* fullPath, LPSECURITY_ATTRIBUTES sa, DWORD flags);
+// loader.cpp, for it: <root>\nativePC\, and <root>\riftstone\overlay\ while the overlay serves files (else NULL).
+const wchar_t* NativePrefix();
+const wchar_t* OverlayRootIfOn();
 
 // ---- session.cpp ------------------------------------------------------------------------------
 void SessionStart();                            // [loader] exit_reason

@@ -656,8 +656,8 @@ def to_yaml(cl: CameraList, name: str | None = None) -> str:
     from .yamlish import Map, Scalar, Seq
 
     ddo = cl.version == VERSION_DDO
-    head = ["Riftstone camera list (.lcm, rCameraList" + (", Dragon's Dogma Online)" if ddo else ")")
-            + (f" -- {name}" if name else ""),
+    shown = " -- " + "".join(c if c.isprintable() else " " for c in name) if name else ""   # stays in its comment
+    head = ["Riftstone camera list (.lcm, rCameraList" + (", Dragon's Dogma Online)" if ddo else ")") + shown,
             f"{len(cl.cameras)} camera(s) by slot (0..{cl.camera_num - 1}). fovtype: 0 FOV_V, 1 FOV_H; fov in degrees."]
     if ddo:
         head += ["Each camera is four tracks of keys (codecs in camera.py): packed keys are whole numbers,",
@@ -692,6 +692,12 @@ def to_yaml(cl: CameraList, name: str | None = None) -> str:
     return yamlish.emit(Map(items), head)
 
 
+def _num(v: int, text: str) -> str:
+    """A number for a message: in decimal, or its text cut short past 64 bits (int -> str refuses over
+    4,300 digits, and a hex number has no such limit)."""
+    return str(v) if v.bit_length() <= 64 else repr(text.strip()[:16] + "...")
+
+
 class _Y:
     """Typed reads from yamlish nodes with line-numbered errors."""
 
@@ -719,7 +725,7 @@ class _Y:
         except ValueError:
             raise self.err(f"{what}: {node.text!r} is not a whole number", node) from None
         if not lo <= v <= hi:
-            raise self.err(f"{what}: {v} is outside {lo}..{hi}", node)
+            raise self.err(f"{what}: {_num(v, node.text)} is outside {lo}..{hi}", node)
         return v
 
     def f32(self, node, what):

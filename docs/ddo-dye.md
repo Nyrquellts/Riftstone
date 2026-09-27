@@ -173,6 +173,11 @@ lacks may be looked up as a loose file, which is fatal in Dark Arisen). The undy
 of the same model made, are removed when no material of the mod uses them any more. Materials without a mask
 keep theirs.
 
+A dyed port is shared the way every port is (`docs/legal.md`): the mod's `riftstone-sources.json` records the
+port's recipe with its colour (`"dye": "red"`), never the textures. `package install` replays it on the
+player's own copy of Online. That makes the same dyed maps byte for byte, which the unit tests check by
+replaying a dyed port's recipe. A port without `--dye` records no colour, as before.
+
 ## What stays UNKNOWN or approximate
 
 - **In game**: how a dyed map looks in Dark Arisen, under its lighting and the Dark Arisen material the port

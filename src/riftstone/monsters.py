@@ -649,7 +649,7 @@ def load(games: dict, idxs: dict, rebuild: bool = False, textures: bool = False,
     if not rebuild and path.is_file():
         try:
             c = normalise(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError, AttributeError, RiftError):
+        except (OSError, ValueError, AttributeError, TypeError, KeyError, RecursionError, RiftError):
             c = None
         if c is not None and c.get("signature") == sig and c.get("lang") == lang and c.get("tolerance") == TOLERANCE:
             if textures and not c.get("textures"):
@@ -862,12 +862,13 @@ def _write_skin(p: dict, mod_root: Path, game: Game, idx) -> dict:
     fam = skins.FAMILIES["chimera"]
     tool = studiofiles.ddo_tool()
     if tool is None or p["variant"] not in getattr(tool, "VARIANTS", {}):
-        raise RiftError("a Dragon's Dogma Online skin needs tools/ddo_skins.py (the Riftstone checkout's)")
+        raise RiftError(f"no Dragon's Dogma Online chimera variant {p['variant']!r}")
     skins.check_free(mod_root, fam, p["skin"])
     textures = tool.build(p["variant"])
     title_, source = tool.VARIANTS[p["variant"]][1].split(" (")[0], tool.VARIANTS[p["variant"]][1]
     res = skins.resources(game, idx, fam, p["skin"], textures)
     written = skins.write(mod_root, fam, p["skin"], res, title_, source)
+    skins.record_ddo(mod_root, fam, p["skin"], p["variant"], res)
     return {"written": written, "notes": [f"{fam.key} skin {p['skin']}: {source}",
                                           f"place it: riftstone encounter <stage> {fam.enemy} --count 1 --at x,y,z "
                                           f"--skin {p['skin']} --mod <this mod> (needs the enemy_skins plugin)"]}

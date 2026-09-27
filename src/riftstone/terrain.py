@@ -19,7 +19,8 @@ scale.  Measured on build 2364871 (``tools/terrain_proof.py`` repeats every numb
 That is why importing Gransys into a 3D tool stacks its ~420 cells at the origin at their true height
 (the owner's "all pieces at origin, in the sky"): a cell's place is its name, not its model.  Editing
 a cell in world coordinates and saving the model without taking the corner off makes the engine add
-the corner a second time.  ``localize``/``worldize`` move a cell model between the two frames exactly
+the corner a second time.  ``localize``/``worldize`` move a cell model between the two frames by exactly
+the corner, each value rounded to float32 (moved there and back: within 0.0078 cm, ``docs/terrain.md``)
 (positions, bounds, group spheres, envelope volumes), for the float-position vertex formats every one
 of the 417 vanilla cell models uses, and the cell's merged collision meshes too
 (``scr\\st100\\collision\\m<M>0\\marge\\st100{h,e}_<m>m<n>n_mrg00``, the same archive and frame: boxes,
@@ -37,6 +38,7 @@ stand on its 99 field-terrain models with no transform (median 34 cm; moved 100 
 """
 from __future__ import annotations
 
+import math
 import re
 import struct
 from dataclasses import dataclass
@@ -122,6 +124,8 @@ def cell_of_collision(name: bytes | str) -> Cell | None:
 
 def cell_at(x: float, z: float) -> Cell:
     """The cell a world position lies in."""
+    if not (math.isfinite(x) and math.isfinite(z)):
+        raise ParamError(f"({x}, {z}) is not a position: x and z must be finite numbers")
     return Cell(int((z - ORIGIN) // CELL), int((x - ORIGIN) // CELL))
 
 

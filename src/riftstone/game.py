@@ -85,6 +85,14 @@ class Game:
         out.sort(key=lambda p: str(p).lower())
         return out
 
+    def archive_names(self) -> list[tuple[str, Path]]:
+        """Every .arc under nativePC as ('rom/enemy/em0100', its path), in archives() order.  The names are what
+        arc_name gives (the same for all 8,536 of the game's), read off the walk: arc_name resolves each path on
+        disk, about 0.2 ms apiece, which made the whole-install passes (index check, index refresh, a mod plan)
+        take seconds each."""
+        base = str(self.native)
+        return [(os.path.relpath(p, base)[:-4].replace("\\", "/"), p) for p in self.archives()]
+
     # -- Riftstone's own folder inside the install ---------------------------
     @property
     def state_dir(self) -> Path:
@@ -135,12 +143,8 @@ def detect_kind(path: Path) -> str | None:
     return None
 
 
-def _looks_like_game(path: Path) -> bool:
-    return detect_kind(path) is not None
-
-
 def _ddo_candidates() -> list[Path]:
-    """$RIFTSTONE_DDO, then client folders under C:\\Dev\\DDO (the ddon toolkit's home)."""
+    """$RIFTSTONE_DDO, then client folders under <path> (the ddon toolkit's home)."""
     out: list[Path] = []
     if os.environ.get("RIFTSTONE_DDO"):
         out.append(Path(os.environ["RIFTSTONE_DDO"]))
@@ -192,15 +196,23 @@ def _steam_libraries() -> list[Path]:
     return unique
 
 
+KEYWORDS = {"ddda": "ddda", "dd": "ddda", "da": "ddda", "ddo": "ddo", "online": "ddo"}
+
+
 def find_game(explicit: str | os.PathLike | None = None) -> Game:
     """The install to use. `explicit` (or $RIFTSTONE_GAME) is a folder, or a game keyword:
-    'ddda' (default; found through Steam) or 'ddo' ($RIFTSTONE_DDO, else C:\\Dev\\DDO\\*)."""
-    want = str(explicit if explicit else os.environ.get("RIFTSTONE_GAME", "") or "ddda")
+    'ddda' (default; found through Steam) or 'ddo' ($RIFTSTONE_DDO, else <path>*).  A keyword takes the
+    folder $RIFTSTONE_GAME names first when that folder is that game: a copy outside Steam, or the one of two
+    copies meant (it was passed over whenever a keyword, e.g. a mod's game, was given)."""
+    env = os.environ.get("RIFTSTONE_GAME", "")
+    want = str(explicit if explicit else env or "ddda")
+    named = [Path(env)] if env and env.lower() not in KEYWORDS else []
     candidates: list[Path] = []
     if want.lower() in ("ddo", "online"):
-        candidates = _ddo_candidates()
+        candidates = [p for p in named if detect_kind(p) == "ddo"] + _ddo_candidates()
         title = "Dragon's Dogma Online"
     elif want.lower() in ("ddda", "dd", "da"):
+        candidates = [p for p in named if detect_kind(p) == "ddda"]
         for lib in _steam_libraries():
             candidates.append(lib / "steamapps" / "common" / "DDDA")
         title = "Dragon's Dogma: Dark Arisen"

@@ -13,7 +13,7 @@ from unittest import mock
 
 from helpers import SRC  # noqa: F401 -- puts src on sys.path
 
-from riftstone import cli, saves
+from riftstone import cli, install, saves
 from riftstone.errors import FormatError, RiftError
 from riftstone.game import Game
 
@@ -132,6 +132,8 @@ class CopiesTest(unittest.TestCase):
             saves.pick(every, "4")
         with self.assertRaises(RiftError):
             saves.pick(every, "DDDA_nope.sav")
+        with self.assertRaisesRegex(RiftError, "pick 1"):          # was ValueError: int() refuses 4,300+ digits
+            saves.pick(every, "9" * 5000)
 
     def test_both_kinds_listed_newest_first_and_each_restored(self):
         folders = Path(self.tmp.name) / "folder-copies"
@@ -202,6 +204,21 @@ class CopiesTest(unittest.TestCase):
             saves.restore(bad, self.save, self.root, "111", game_running=lambda: False)
         self.assertEqual(self.save.read_bytes(), before)
 
+    def test_restore_looks_for_the_game_by_its_exe(self):
+        """`riftstone save restore` passes no game_running: restore asked install.game_running(None), which read
+        None.exe and crashed before anything was written."""
+        self.write_save(save_bytes(b"a"))
+        copy, _ = saves.backup(self.save, self.root, "111")
+        self.write_save(save_bytes(b"b"))
+        before = self.save.read_bytes()
+        with mock.patch.object(install, "_process_names", lambda: ["explorer.exe", "ddda.EXE"]):
+            with self.assertRaisesRegex(RiftError, "running"):
+                saves.restore(copy, self.save, self.root, "111")
+        self.assertEqual(self.save.read_bytes(), before)
+        with mock.patch.object(install, "_process_names", lambda: ["explorer.exe", "DDO.exe"]):
+            kept = saves.restore(copy, self.save, self.root, "111")
+        self.assertEqual((self.save.read_bytes(), kept.read_bytes()), (copy.read_bytes(), before))
+
     def test_a_damaged_current_save_is_kept_aside_before_a_restore(self):
         self.write_save(save_bytes(b"a"))
         copy, _ = saves.backup(self.save, self.root, "111")
@@ -218,6 +235,11 @@ class CopiesTest(unittest.TestCase):
         (plugins / "save_backup.ini").write_text("; settings\n[backup]\nFolder = D:\\Saves\\DDDA\n", encoding="utf-8")
         self.assertEqual(saves.backup_root(game), Path("D:\\Saves\\DDDA"))
         (plugins / "save_backup.ini").write_text("[backup]\nFolder = auto\n", encoding="utf-8")
+        self.assertEqual(saves.backup_root(game).name, "saves")
+        # a path in quotes: GetPrivateProfileStringW drops them for the plugin, so save list does too
+        (plugins / "save_backup.ini").write_text('[backup]\nFolder = "D:\\My Saves"\n', encoding="utf-8")
+        self.assertEqual(saves.backup_root(game), Path("D:\\My Saves"))
+        (plugins / "save_backup.ini").write_text("[backup]\nFolder = ''\n", encoding="utf-8")
         self.assertEqual(saves.backup_root(game).name, "saves")
 
 
@@ -270,7 +292,13 @@ class CliTest(unittest.TestCase):
         second = self.save.read_bytes()
         self.assertEqual(self.run_cli("restore", "2")[0], 1)  # --yes is required
         self.assertEqual(self.save.read_bytes(), second)
-        code, text = self.run_cli("restore", "2", "--yes")
+        # no game folder here: the game is looked for as DDDA.exe (game_running(None) raised AttributeError)
+        with mock.patch.object(install, "_process_names", lambda: ["DDDA.exe"]):   # the game runs: refused
+            code, text = self.run_cli("restore", "2", "--yes")
+        self.assertEqual(code, 2, text)
+        self.assertEqual(self.save.read_bytes(), second)
+        with mock.patch.object(install, "_process_names", lambda: ["explorer.exe"]):
+            code, text = self.run_cli("restore", "2", "--yes")
         self.assertEqual(code, 0, text)
         self.assertEqual(self.save.read_bytes(), first)
         self.assertIn("3 copies", self.run_cli("list")[1])  # the save it replaced is a copy too
@@ -287,7 +315,9 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([(c["number"], c["account"], c["kind"], c["complete"]) for c in doc["copies"]],
                          [(1, "other", saves.IN_PLAY, True), (2, "other", saves.FOLDER, True)])
-        code, text = self.run_cli("restore", "2", "--yes", command="save")
+        # the processes are the test's own: a game open on this PC made the restore refuse, rightly
+        with mock.patch.object(install, "_process_names", lambda: ["explorer.exe"]):
+            code, text = self.run_cli("restore", "2", "--yes", command="save")
         self.assertEqual(code, 0, text)
         self.assertEqual(saves.unpack(self.save.read_bytes()), XML + b"one")
 

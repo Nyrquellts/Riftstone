@@ -30,6 +30,12 @@ sys.path.insert(0, str(HERE.parent / "tests"))
 SEEDS = HERE / ".seeds" / "seeds.pkl"
 FINDINGS = HERE / "findings"
 REPORTS = HERE / "reports"
+# The encodings of the cached seeds, where a target's changed: a cache made before gets that target's seeds anew.
+SEED_FORMATS_KEY = "_formats"
+SEED_FORMATS = {"fsmap": 2}      # 2 (2026-09-26): a two-byte type selector; one byte reached 256 of the types
+# A run's scratch folder in --tmp: this prefix and this marker file inside, so sweep_stale removes only its own.
+SCRATCH_PREFIX = "riftstone-fuzz-run-"
+SCRATCH_MARK = "riftstone-fuzz-scratch.txt"
 
 
 def _synthetic() -> dict[str, list[bytes]]:
@@ -153,7 +159,7 @@ def _synthetic() -> dict[str, list[bytes]]:
             "arc": [a], "xfs": [xraw, ddo_xfs], "params": [text, ddo_yaml], "yaml": [text],
             "xfs_ddo_text": [b"\x83\x5c\x83\x6c\x83\x8b\0C:\\\x95\x5c\\\x94\x5c\x8d\x5c\0\x87\x90\0\x81\0plain\\text",
                              "待機 ソネル \\ \u2015".encode("cp932"), "a \u2014 b ¥ \\".encode("utf-8")],
-            "fsmap": [b"\x05model\\em\\e01 "],
+            "fsmap": _fsmap_seeds(),
             "pack": [manifest], "mod": [mod_case], "cli": [b"\x00" + a, b"\x01" + xraw, b"\x02" + text, b"\x05" + manifest],
             "studio": studio_cases,
             "ocl": [struct.pack("<5I", 0x20121225, 0, 0, 0, 0)],
@@ -228,6 +234,32 @@ def _synthetic() -> dict[str, list[bytes]]:
                 # next to, and like, the stand-in's DLC-list group 1 (as Everfall's groups 20-22 are)
                 {"stage": "424", "enemy": "goblin", "count": 3, "at": "300,-350,-8800"},
                 {"stage": "424", "enemy": "goblin", "count": 3, "at": "0,-350,-8800", "like": 1})],
+            # mods (byte 0: 2 + n % 3), then (mod, op, arg) triples; ops: 0 add group arg % 9 with a layout,
+            # 1 count, 2 remove, 3 flip an mSetBit bit, 4 share a wander area with arg % 9, 5 story start
+            "gpl_merge": [bytes(s) for s in (
+                [0, 0, 0, 2, 1, 0, 11],                   # two mods add group 2 differently: one moves
+                [1, 0, 0, 2, 1, 0, 2, 2, 0, 11],          # three: two alike (one group), one moves
+                [0, 0, 0, 2, 1, 0, 11, 1, 4, 2],          # a group of the second shares the new one's area
+                [0, 0, 0, 2, 1, 0, 11, 1, 3, 5],          # the second flips an mSetBit bit
+                [0, 0, 2, 0, 1, 1, 40, 1, 0, 11, 0, 5, 7],  # a removal, a count, an addition, a story start
+                [2, 0, 0, 2, 1, 0, 2, 2, 0, 5, 3, 0, 14, 2, 4, 5])],
+            # mods (byte 0: 2 + n % 3), then (mod, op, arg) triples on the goblin layout; ops: 0 copy a record
+            # (next id), 1 copy under id arg % 8, 2 move, 3 order, 4 remove
+            "lot_merge": [bytes(s) for s in (
+                [0, 0, 0, 1, 1, 0, 2],                   # a copy in each: both take id 3, one moves
+                [1, 0, 0, 1, 1, 0, 1, 2, 0, 5],          # three: two alike, one moves
+                [0, 0, 2, 7, 1, 3, 7, 0, 4, 0, 1, 2, 9],  # one record moved and ordered, another removed
+                [0, 0, 1, 11, 1, 1, 19, 1, 1, 27])],     # the same id chosen by both, differently
+            # byte 0: bit 0 shops (else the spawn table), bits 1-2 mods - 2, bit 7 a hostile last copy (the tail
+            # after 90 bytes); then (mod, op, arg) triples
+            "server_merge": [bytes(s) for s in (
+                [0, 0, 0, 3, 1, 0, 200, 0, 3, 1, 1, 3, 2],     # rows and drop items from two mods
+                [0, 0, 2, 4, 1, 2, 4],                          # one row's level two ways
+                [2, 0, 0, 3, 1, 0, 3, 2, 1, 1, 0, 5, 1],        # three mods: one place, a removal, a new table
+                [3, 0, 0, 1, 1, 0, 2, 2, 2, 5, 0, 3, 9],        # shops: goods added, a price, a wallet
+                [1, 0, 1, 0, 1, 2, 2, 1, 4, 0, 0, 5, 1],        # shops: a removal each, a new shop, a gone shop
+            )] + [bytes([0x80] + [0] * 90) + b'{"schemas": {"enemies": []}, "enemies": [[1]]}',
+                  bytes([0x81] + [0] * 90) + b'[{"ShopId": 1, "Data": {"GoodsParamList": [{"ItemId": 1}]}}]'],
             "encounter_plan": [json.dumps({"format": "riftstone-encounters/1", "game": "ddda", "encounters": es}).encode()
                                for es in (
                 [{"stage": 330, "enemy": "em0100", "total": 100, "at": "group:35", "points": 10, "spread": None,
@@ -288,6 +320,21 @@ def _synthetic() -> dict[str, list[bytes]]:
                         test_runtime.STATE_KILLED.encode(),
                         (test_runtime.STATE_CLOSING + "\n#note\nkind=crash\nuptime_ms=2590000\n"
                          "report=C:\\g\\riftstone\\logs\\crash-20260925-214511.txt\n").encode()],
+            "package_install": __import__("targets").package_seeds(),
+            "package_plugins": [json.dumps(c).encode() for c in (
+                {"plugins": ["enemy_cap.asi"], "inis": {"enemy_cap.asi": "; enemy_cap -- more enemies\n[x]\n"},
+                 "out": "Riftstone-Player.zip", "name": "Riftstone plugins"},
+                {"plugins": ["twin.asi", "twin.dll"], "inis": {"twin.asi": "[a]\n", "twin.dll": "[b]\n"}, "out": "t.zip"},
+                {"plugins": ["a.asi", "a.asi"], "out": "dup.zip"},
+                {"plugins": [], "out": "none.zip"},
+                {"plugins": ["dinput8.dll"], "out": "loader.zip"},
+                {"plugins": ["x.asi"], "inis": {"x.asi": "\u00a9 CAPCOM"}, "out": "c.zip", "name": "t\u0000itle"},
+                {"plugins": ["y.asi"], "out": "y.rar"},
+                {"plugins": ["enemy_cap.asi"], "ninput": "PE:XInputGetState,XInputSetState", "out": "n.zip"},
+                {"plugins": ["x.asi"], "ninput": "MZ but not a DLL", "out": "bad.zip"},
+                {"plugins": ["x.asi"], "ninput": "PE:Direct3DCreate9", "out": "d3d.zip"})],
+            "sources": __import__("targets").sources_seeds(),
+            "delta": __import__("targets").delta_seeds(),
             "playtest": [(test_playtest.LOADER_LOG + "\n#cap\n" + test_playtest.CAP_LOG + "\n#sprint\n"
                           + test_playtest.SPRINT_LOG + "\n#state\n" + test_playtest.STATE).encode(),
                          test_playtest.LOADER_LOG.encode(), b"#cap\n\n#sprint\n\n#state\n"],
@@ -296,7 +343,30 @@ def _synthetic() -> dict[str, list[bytes]]:
                            b"[fps]\nmax_fps = 165\n[overlay]\nkey = F10\n#set\nloader\0overlay\0key\0f7",
                            b"[draw]\n; on\nEnabled = 1\nObjects = 3\nGrass = 3\nHumanEnemies = 0\n#set\ndraw_distance\0draw\0Objects\x002.5",
                            b"[draw]\nGrass = 3\nHumanEnemies = 0\n#set\ndraw_distance\0draw\0HumanEnemies\x00250",
-                           b"[a]\nk=1\n[a]\nk=2\n#set\nx\0a\0k\0v"]}
+                           b"[a]\nk=1\n[a]\nk=2\n#set\nx\0a\0k\0v",
+                           # an ini as Windows reads it (runtime.ini_text): a value in the code page, a UTF-8
+                           # mark hiding the first section, a CR CR, a form feed inside a line, a UTF-16 file
+                           b"[backup]\r\nFolder = auto\r\n\n#set\nsave_backup\0backup\0Folder\0D:\\Spielst\xc3\xa4nde",
+                           b"\xef\xbb\xbf; mark\r\n[backup]\r\nKeep = 20\r\n\n#set\nsave_backup\0backup\0Keep\x0025",
+                           b"[backup]\r\r\nKeep = 20\r\n\n#set\nsave_backup\0backup\0Keep\x0025",
+                           b"[backup]\r\nKeep = 20\x0cjunk\nFolder = auto\x0b\r\n\n#set\nsave_backup\0backup\0Keep\x0025",
+                           b"\xff\xfe" + "; save_backup\r\n[backup]\r\nFolder = D:\\Spielst\u00e4nde \u65e5\u672c\r\nKeep = 20\r\n"
+                           .encode("utf-16-le") + b"\n#set\nsave_backup\0backup\0Folder\0D:\\\xe6\x97\xa5\xe6\x9c\xac"]}
+
+
+def _fsmap_seeds(game=None) -> list[bytes]:
+    """The fsmap target's inputs (targets.fsmap_seed: a two-byte type selector, then a name): a synthetic one,
+    and with a game the names and types of the first entries of its 200 smallest archives."""
+    import targets
+    from riftstone import corpus, typemap
+
+    out = [targets.fsmap_seed(sorted(typemap.BY_ID)[5], b"model\\em\\e01 ")]
+    if game is not None:
+        names = []
+        for p in sorted(game.archives(), key=lambda p: p.stat().st_size)[:200]:
+            names += [targets.fsmap_seed(t, n) for n, t, *_ in corpus.directory(p)[:5] if t in typemap.BY_ID]
+        out += names[:400]
+    return out
 
 
 def _monster_seeds() -> list[bytes]:
@@ -585,6 +655,14 @@ def _level_seeds() -> dict[str, list[bytes]]:
             {"seed": 7, "enemies": ["goblin"], "grammar": small},
             {"seed": 2, "exclude": ["goblin"]},
             {"seed": 0})],
+        # the corridor's floor (-350), beside the hole, by the wall, a flyer, flat rings, a tight spot's tiny spread
+        "ground": [json.dumps(c).encode() for c in (
+            {"at": [2500, -350, -9600], "count": 6},
+            {"at": [2000, -350, -9250], "count": 12, "points": 8, "spread": 180.5},
+            {"at": [0, -350, -9990], "count": 10, "spread": 0.001},
+            {"at": [2500, 0, -9750], "enemy": "harpies", "count": 3, "ground": True},
+            {"at": "group:7", "count": 31, "points": 31, "spread": 60, "ground": False},
+            {"at": [8500, 650, 8500], "count": 4, "spread": 400})],
     }
 
 
@@ -600,6 +678,8 @@ def _knowledge_seeds() -> list[bytes]:
 
 def build_seeds() -> dict[str, list[bytes]]:
     seeds = _synthetic()
+    from riftstone import cipher
+    cipher._key = cipher._default = None    # tests/helpers set a stand-in key; the games' seeds need the client's own
     try:
         from riftstone import arc, arcfolder, corpus, params, typemap
         from riftstone.game import find_game
@@ -760,11 +840,7 @@ def build_seeds() -> dict[str, list[bytes]]:
         if len(cell_models) >= 12:
             break
     seeds["terrain"] = seeds.get("terrain", []) + cell_models
-    names = []
-    for p in arcs[:200]:
-        for n, t, *_ in corpus.directory(p)[:5]:
-            names.append(bytes([sorted(typemap.BY_ID).index(t) % 256 if t in typemap.BY_ID else 0]) + n)
-    seeds["fsmap"] += names[:400]
+    seeds["fsmap"] = _fsmap_seeds(game)
     seeds["cli"] += [b"\x00" + d for d in small[:10] if len(d) < 200_000] + [b"\x02" + y for y in ymls[:10]] \
         + [b"\x01" + d for d in xfs_seeds[:10]]
     import tempfile
@@ -777,11 +853,29 @@ def build_seeds() -> dict[str, list[bytes]]:
     return seeds
 
 
+def _seed_game():
+    """The installed game the seeds come from, or None."""
+    try:
+        from riftstone.game import find_game
+
+        return find_game()
+    except Exception:  # noqa: BLE001 - no game: synthetic seeds only
+        return None
+
+
 def load_seeds(refresh: bool) -> dict[str, list[bytes]]:
     if SEEDS.is_file() and not refresh:
         seeds = pickle.loads(SEEDS.read_bytes())
-        # built-in seeds added since the cache was made (new targets, new cases) join it
         grew = False
+        # a target whose input encoding changed since the cache was made gets its seeds anew (an old fsmap seed's
+        # one-byte selector would pick another type now)
+        formats = seeds.get(SEED_FORMATS_KEY, {})
+        for name, version in SEED_FORMATS.items():
+            if formats.get(name) != version:
+                seeds[name] = {"fsmap": _fsmap_seeds}[name](_seed_game())
+                grew = True
+        seeds[SEED_FORMATS_KEY] = dict(SEED_FORMATS)
+        # built-in seeds added since the cache was made (new targets, new cases) join it
         for name, extra in _synthetic().items():
             have = seeds.setdefault(name, [])
             new = [s for s in extra if s not in have]
@@ -792,6 +886,7 @@ def load_seeds(refresh: bool) -> dict[str, list[bytes]]:
             SEEDS.write_bytes(pickle.dumps(seeds))
         return seeds
     seeds = build_seeds()
+    seeds[SEED_FORMATS_KEY] = dict(SEED_FORMATS)
     SEEDS.parent.mkdir(parents=True, exist_ok=True)
     SEEDS.write_bytes(pickle.dumps(seeds))
     return seeds
@@ -815,26 +910,60 @@ def worker(job):
 
 def _rmtree(path: str) -> None:
     """rmtree through the \\\\?\\ prefix, which skips Win32 name normalisation: an input that once
-    slipped an NTFS stream name past a check left files called 'name.' that plain paths cannot remove."""
+    slipped an NTFS stream name past a check left files called 'name.' that plain paths cannot remove.
+    A scratch folder's marker (SCRATCH_MARK) goes last, with the folder: one that cannot be emptied yet keeps
+    it, so a later run's sweep_stale still knows the folder as the fuzzer's own."""
     p = os.path.abspath(path)
     if os.name == "nt" and not p.startswith("\\\\?\\"):
         p = "\\\\?\\" + p
     # A killed worker's index database can stay open a while longer (seen: over 5 s, likely an antivirus
     # scan of the just-closed file).  Keep trying for about 15 s; sweep_stale() catches what is still left.
     for attempt in range(10):
-        shutil.rmtree(p, ignore_errors=True)
+        try:
+            names = [n for n in os.listdir(p) if n != SCRATCH_MARK]
+        except OSError:
+            names = []
+        for n in names:
+            child = os.path.join(p, n)
+            if os.path.isdir(child) and not os.path.islink(child):
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                try:
+                    os.remove(child)
+                except OSError:
+                    pass
+        try:
+            left = [n for n in os.listdir(p) if n != SCRATCH_MARK]
+        except OSError:
+            left = []
+        if not left:
+            shutil.rmtree(p, ignore_errors=True)
         if not os.path.exists(p):
             return
         time.sleep(0.3 * (attempt + 1))
 
 
+def scratch(root: Path) -> str:
+    """A new scratch folder for one run or replay in ``root`` (--tmp): the fuzzer's own prefix and a marker file
+    inside, so sweep_stale tells its leftovers from anything else there (--tmp may be a shared folder)."""
+    tmp = tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=root)
+    Path(tmp, SCRATCH_MARK).write_text("Scratch of Riftstone's fuzz/run.py; removed when its run ends, or by the "
+                                       "next run once idle for an hour.\n", encoding="utf-8")
+    return tmp
+
+
 def sweep_stale(root: Path, idle: float = 3600) -> None:
-    """Remove earlier runs' scratch folders that nothing has touched for an hour.  A running campaign's
-    folder changes all the time (filesystem targets make one per case), so only leftovers are this old."""
+    """Remove earlier runs' scratch folders that nothing has touched for an hour: only folders this fuzzer made
+    (SCRATCH_PREFIX, with SCRATCH_MARK inside), whatever else ``root`` holds.  In the fuzzer's own folder
+    (fuzz/.tmp), where nothing else lives, the prefix alone is enough, and the run-* folders earlier versions
+    left go too.  A running campaign's folder changes all the time (filesystem targets make one per case), so
+    only leftovers are this old."""
     now = time.time()
+    own = os.path.normcase(os.path.abspath(root)) == os.path.normcase(os.path.abspath(HERE / ".tmp"))
     for d in root.iterdir():
         try:
-            if d.is_dir() and d.name.startswith("run-") and now - d.stat().st_mtime > idle:
+            ours = d.name.startswith(SCRATCH_PREFIX) and (own or (d / SCRATCH_MARK).is_file())
+            if d.is_dir() and (ours or own and d.name.startswith("run-")) and now - d.stat().st_mtime > idle:
                 _rmtree(str(d))
         except OSError:
             pass
@@ -842,7 +971,7 @@ def sweep_stale(root: Path, idle: float = 3600) -> None:
 
 def replay(root: Path, slow: float = 3.0) -> int:
     """Run every input in fuzz/findings again. A fixed defect no longer reproduces; exit 1 if any does."""
-    tmp = tempfile.mkdtemp(prefix="run-", dir=root)
+    tmp = scratch(root)
     os.environ.update(RIFTSTONE_FUZZ_TMP=tmp, RIFTSTONE_HOME=tmp, NO_COLOR="1", RIFTSTONE_SKIP_GAME="1")
     import targets
 
@@ -886,6 +1015,7 @@ def replay(root: Path, slow: float = 3.0) -> int:
                 still.append(f.name)
                 print(f"  STILL {f.name}: {r[0]} {type(r[1]).__name__}: {str(r[1])[:160]}")
     finally:
+        targets.close_caches()      # the targets ran in this process: their index databases are open in the scratch
         _rmtree(tmp)
     print(f"\nreplayed {total} saved findings: {total - len(still)} fixed, {len(still)} still reproduce")
     return 1 if still else 0
@@ -898,7 +1028,8 @@ def main() -> int:
     # Every target by default: a fixed list here once left each target added later out of the release gate.
     ap.add_argument("--targets", default="", help="comma-separated (default: every target in targets.TARGETS)")
     ap.add_argument("--refresh-seeds", action="store_true")
-    ap.add_argument("--tmp", default=None, help="scratch folder for filesystem targets")
+    ap.add_argument("--tmp", default=None, help="where the run's scratch folder goes (default fuzz/.tmp); only the "
+                                                "fuzzer's own idle scratch folders there are ever removed")
     ap.add_argument("--replay", action="store_true", help="re-run every saved finding instead of fuzzing")
     a = ap.parse_args()
     root = Path(a.tmp or HERE / ".tmp")
@@ -913,7 +1044,7 @@ def main() -> int:
         raise SystemExit(f"unknown target(s): {', '.join(unknown)} (known: {', '.join(targets.TARGETS)})")
     seeds = load_seeds(a.refresh_seeds)
     print("seeds:", {n: len(seeds.get(n, [])) for n in names}, flush=True)
-    tmp = tempfile.mkdtemp(prefix="run-", dir=root)
+    tmp = scratch(root)
     jobs = [(names[i % len(names)], a.seconds, 1000 + i, tmp) for i in range(max(a.workers, len(names)))]
     t0 = time.time()
     try:

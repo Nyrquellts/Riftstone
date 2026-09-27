@@ -69,7 +69,12 @@ LOCAL_ROTATION, LOCAL_POSITION, LOCAL_SCALE = 0, 1, 2
 ABSOLUTE = (3, 4)
 ROTATION_CODEC = 6
 POSITION_CODEC = 3
-MAX_FRAMES = 0xFFFF        # the longest vanilla motion: 1,544 frames (DDDA), 1,850 (DDO)
+MAX_FRAMES = 1 << 12       # the longest vanilla motion: 1,544 frames (DDDA), 1,850 (DDO)
+# What one rebake may compute (``plan``): joint transforms, samples and decoded keys, 1.2-1.5 us each;
+# MIN_WORK, or WORK_PER_BYTE per byte of the motion list when that is more. Rebaked between the player
+# bodies, every list of both games needs at most 0.73 of that (the most, 2,053,950, a 2.4 MB list: 2.9 s).
+MIN_WORK = 1 << 20
+WORK_PER_BYTE = 2
 IDENTITY = (0.0, 0.0, 0.0, 1.0)
 ZERO = (0.0, 0.0, 0.0)
 ONE = (1.0, 1.0, 1.0)
@@ -349,16 +354,26 @@ ROTATION_CODECS = (2, 6, 7, 11, 12, 13, 14, 15)     # what the games' rotation t
 VECTOR_CODECS = (1, 3, 4, 5)                         # ... and their position and scale tracks
 
 
-def curves(tracks, times, mode: str = "nlerp") -> dict[int, dict[int, list]]:
-    """joint -> usage -> value at each time, for the local tracks (usages 0, 1, 2) of a track list."""
-    out: dict[int, dict[int, list]] = {}
+def local_tracks(tracks, joints=None) -> dict[tuple[int, int], lmt.Track]:
+    """(joint, usage) -> the local track (usage 0, 1 or 2) that drives it -- of two for one joint and usage,
+    the later -- for ``joints`` (every joint when None); the root track is left out."""
+    out: dict[tuple[int, int], lmt.Track] = {}
     for t in tracks:
-        if t.bone == ROOT_TRACK or t.usage not in (LOCAL_ROTATION, LOCAL_POSITION, LOCAL_SCALE):
-            continue
-        if t.buffer is not None and t.codec not in (ROTATION_CODECS if t.usage == LOCAL_ROTATION else VECTOR_CODECS):
-            raise RiftError(f"joint {t.bone}: a {lmt.USAGES[t.usage]} track in codec {t.codec}, which no game file "
+        if t.bone != ROOT_TRACK and t.usage in (LOCAL_ROTATION, LOCAL_POSITION, LOCAL_SCALE) \
+                and (joints is None or t.bone in joints):
+            out[(t.bone, t.usage)] = t
+    return out
+
+
+def curves(tracks, times, mode: str = "nlerp", joints=None) -> dict[int, dict[int, list]]:
+    """joint -> usage -> value at each time, for the local tracks (usages 0, 1, 2) of a track list that
+    drive ``joints`` (every joint when None; local_tracks)."""
+    out: dict[int, dict[int, list]] = {}
+    for (bone, usage), t in local_tracks(tracks, joints).items():
+        if t.buffer is not None and t.codec not in (ROTATION_CODECS if usage == LOCAL_ROTATION else VECTOR_CODECS):
+            raise RiftError(f"joint {bone}: a {lmt.USAGES[usage]} track in codec {t.codec}, which no game file "
                             "uses for that; not guessing its values")
-        out.setdefault(t.bone, {})[t.usage] = sample(keys_of(t), times, t.usage == LOCAL_ROTATION, mode)
+        out.setdefault(bone, {})[usage] = sample(keys_of(t), times, usage == LOCAL_ROTATION, mode)
     return out
 
 
@@ -366,10 +381,11 @@ def pose(b: Body, tracks, times, joints, mode: str = "nlerp") -> dict:
     """World transforms of ``joints`` (and their ancestors) at each time: joint -> list of
     (rotation, translation, own scale). Tracks drive the joints they key, the rest pose the others; the
     root track is left out and parents' scale does not reach children (module notes)."""
-    cv = curves(tracks, times, mode)
+    chain = b.chain(joints)
+    cv = curves(tracks, times, mode, set(chain))
     n = len(times)
     out: dict[int, list] = {}
-    for j in b.chain(joints):
+    for j in chain:
         jt = b.joints[j]
         c = cv.get(j, {})
         rots = c.get(LOCAL_ROTATION) or [jt.rotation] * n
@@ -448,6 +464,47 @@ def _r(v):
     return tuple(round(x, 2) + 0.0 for x in v)
 
 
+def plan(m: lmt.Lmt, conv: lmt.Lmt, src: Body, dst: Body, size: int, joints=None, res: "Rebaked | None" = None):
+    """The track lists a rebake of ``m`` (a motion list of ``size`` bytes) changes -- [(first motion slot,
+    motion, joints to rebake, the destination chain)] -- and the work that takes: each joint of both
+    chains at every frame, and each track those joints read (``conv``'s on the destination side), sampled
+    at every frame and decoded key by key. Refused (RiftError) past MAX_FRAMES frames in a motion or past
+    the work budget in all (MIN_WORK, else WORK_PER_BYTE per byte), before any of it is done."""
+    res = res if res is not None else Rebaked(b"")
+    budget = max(MIN_WORK, WORK_PER_BYTE * size)
+    moved = set(reparented(src, dst))
+    frames_of: dict[int, set[int]] = {}
+    for mo in m.motions:
+        if mo is not None:
+            frames_of.setdefault(id(mo.tracks), set()).add(mo.frames)
+    out, work = [], 0
+    seen: set[int] = set()
+    for slot, mo in enumerate(m.motions):
+        if mo is None or id(mo.tracks) in seen:
+            continue
+        seen.add(id(mo.tracks))
+        targets = _targets(mo.tracks, src, dst, moved, joints, res)
+        if not targets:
+            continue
+        if len(frames_of[id(mo.tracks)]) != 1:
+            raise RiftError(f"motion {slot} shares its tracks with a motion of another length; not rebaking it")
+        frames = mo.frames
+        if not 1 <= frames <= MAX_FRAMES:
+            raise RiftError(f"motion {slot} claims {frames:,} frames (the games' longest motions have 1,544 / "
+                            f"1,850; a rebake takes up to {MAX_FRAMES:,}); not rebaking it one key per frame")
+        schain, dchain = set(src.chain(targets)), set(dst.chain(targets))
+        work += frames * (len(schain) + len(dchain))
+        for tracks, chain in ((mo.tracks.tracks, schain), (conv.motions[slot].tracks.tracks, dchain)):
+            for t in local_tracks(tracks, chain).values():
+                work += frames + (len(t.buffer.data) // lmtcodec.KEY_SIZE.get(t.codec, 1) if t.buffer else 1)
+        if work > budget:
+            raise RiftError(f"rebaking these motions one key per frame means over {budget:,} joint values and "
+                            f"samples for a list of {size:,} bytes (at least {MIN_WORK:,}, else {WORK_PER_BYTE} per "
+                            "byte; the games' own lists need at most 0.73 of that); not rebaking it")
+        out.append((slot, mo, targets, dchain))
+    return out, work
+
+
 def rebake(data: bytes, game: str, src_model: bytes, dst_model: bytes, joints=None, *,
            dst_game: str | None = None, mode: str = "nlerp", notes: list | None = None) -> bytes:
     """``data`` (a motion list of ``game``) with every joint whose parent differs between the source
@@ -461,6 +518,8 @@ def rebake(data: bytes, game: str, src_model: bytes, dst_model: bytes, joints=No
     destination hierarchy, each child using its parent's rebaked and quantised values); its local
     rotation and position tracks become one key per frame (codecs 6 and 3, in the tracks' places).
     Scale tracks are kept (a joint's scale works in its own frame, which keeps its world orientation).
+    A motion longer than MAX_FRAMES frames, or more work in all than the list's budget (``plan``), is
+    refused before any of it is done.
 
     ``joints``: the joint ids to rebake (default: those whose parent differs and whose local position a
     motion keys -- the motion places them, so their place carries over; a missing rotation track is
@@ -502,7 +561,6 @@ def rebake_ex(data: bytes, game: str, src_model: bytes, dst_model: bytes, joints
     m = lmt.parse(data)
     if m.version != port.LMT_VERSION[game]:
         raise RiftError(f"motion list version {m.version} is not {game.upper()}'s ({port.LMT_VERSION[game]})")
-    moved = set(reparented(src, dst))
     if joints is not None:
         joints = set(joints)
         missing = sorted(j for j in joints if j not in src.joints or j not in dst.joints)
@@ -511,29 +569,13 @@ def rebake_ex(data: bytes, game: str, src_model: bytes, dst_model: bytes, joints
     # what the destination game will decode from the tracks the rebake leaves alone
     conv = lmt.parse(port.convert_lmt(data, game, dst_game).data) if dst_game not in (None, game) else m
     res = Rebaked(b"")
-    frames_of: dict[int, set[int]] = {}
-    for mo in m.motions:
-        if mo is not None:
-            frames_of.setdefault(id(mo.tracks), set()).add(mo.frames)
-    seen: set[int] = set()
     kept_scale: dict[int, int] = {}
-    for slot, mo in enumerate(m.motions):
-        if mo is None or id(mo.tracks) in seen:
-            continue
-        seen.add(id(mo.tracks))
+    for slot, mo, targets, dchain in plan(m, conv, src, dst, len(data), joints, res)[0]:
         tl = mo.tracks
-        targets = _targets(tl, src, dst, moved, joints, res)
-        if not targets:
-            continue
-        if len(frames_of[id(tl)]) != 1:
-            raise RiftError(f"motion {slot} shares its tracks with a motion of another length; not rebaking it")
         frames = mo.frames
-        if not 1 <= frames <= MAX_FRAMES:
-            raise RiftError(f"motion {slot} claims {frames} frames (the games' longest motions have 1,544 / 1,850); "
-                            "not rebaking it one key per frame")
         times = list(range(frames))
         swld = pose(src, tl.tracks, times, targets, mode)
-        dcv = curves(conv.motions[slot].tracks.tracks, times, mode)
+        dcv = curves(conv.motions[slot].tracks.tracks, times, mode, dchain)
         new: dict[int, tuple] = {}
         dwld: dict[int, list] = {}
 
@@ -579,17 +621,20 @@ def rebake_ex(data: bytes, game: str, src_model: bytes, dst_model: bytes, joints
             a = p          # the nearest destination ancestor this motion scales, if any
             while a is not None:
                 sc = dcv.get(a, {}).get(LOCAL_SCALE)
-                if sc and any(abs(c - 1.0) > 1e-4 for s in sc for c in s):
+                if sc and any(not abs(c - 1.0) <= 1e-4 for s in sc for c in s):      # NaN: not 1 either
                     res.scaled_parents[a] = res.scaled_parents.get(a, 0) + 1
                     break
                 a = dst.joints[a].parent
+        usages: dict[int, set[int]] = {}
+        for t in tl.tracks:
+            usages.setdefault(t.bone, set()).add(t.usage)
         rebuilt: list[lmt.Track] = []
         for t in tl.tracks:
             pair = made.get(t.bone)
             if pair is None or t.usage not in (LOCAL_ROTATION, LOCAL_POSITION):
                 rebuilt.append(t)
                 continue
-            has = {u.usage for u in tl.tracks if u.bone == t.bone}
+            has = usages[t.bone]
             if t.usage == LOCAL_ROTATION:
                 rebuilt.append(pair[0])
                 if LOCAL_POSITION not in has:

@@ -48,10 +48,10 @@ def _parameters(game, idx) -> dict:
         m = _CMN.match(name.decode("latin-1"))
         if not m:
             continue
-        data = nav.game_resource(game, idx, name, tid)
-        if data is None:
-            continue
-        try:
+        try:                                # a damaged entry (FormatError) is passed over like one that does not parse
+            data = nav.game_resource(game, idx, name, tid)
+            if data is None:
+                continue
             doc = prp.parse(data)
         except RiftError:
             continue
@@ -78,7 +78,10 @@ def build(game, idx, w: world.World) -> dict:
                                   "stages": set()})
     meshes = {}
     for st in sorted(w.stages):
-        meshes[st] = nav.stage_mesh(game, idx, st)
+        try:                                # one stage's damaged mesh does not stop every other stage's measure
+            meshes[st] = nav.stage_mesh(game, idx, st)
+        except RiftError:
+            meshes[st] = None
     for row in w.placements:
         em = row[4]
         if not em.startswith("em") or not lot.KINDS[row[3]][0].startswith(("cSetInfoEnemy", "cSetInfoNpc")):
@@ -168,10 +171,11 @@ def load(game, idx, w: world.World | None = None, rebuild: bool = False) -> Best
     if not rebuild and path.is_file():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            if data.get("schema") == SCHEMA and data.get("signature") == sig:
+            # a cache that is not this module's object (JSON null, a list: data.get raised AttributeError) is rebuilt
+            if isinstance(data, dict) and data.get("schema") == SCHEMA and data.get("signature") == sig:
                 return Bestiary(data)
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
+            pass                                            # ...and so is one whose fields are not what build wrote
     data = build(game, idx, w if w is not None else world.load(game, idx))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")

@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.metadata:
                 try:
                     metadata = json.loads(_read(args.metadata, 1 << 20))
-                except ValueError:
+                except (ValueError, RecursionError):
                     raise RiftError("metadata must be an extraction JSON sidecar") from None
                 if not isinstance(metadata, dict) or metadata.get("format") != "ddda-sngw/1" or metadata.get("export_order") not in ("standard", "mtframework-native"):
                     raise RiftError("metadata is not a Riftstone audio extraction sidecar")

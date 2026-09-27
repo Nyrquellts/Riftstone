@@ -144,12 +144,20 @@ def _place_of(places, p) -> str:
     return best[1] if best else ""
 
 
-def space(game, idx, w, stage: int, spacing: float = SPACING, door_clear: float = DOOR_CLEAR,
-          max_sites: int = MAX_SITES) -> Space:
-    """The stage's walkable ground as the director uses it (see the module's text)."""
-    if not (math.isfinite(spacing) and 5.0 <= spacing <= 100.0):
+def _spacing(spacing) -> float:
+    """5..100 metres, checked without turning it into a float first (float(10 ** 400) overflows; nan fails both
+    comparisons)."""
+    if isinstance(spacing, bool) or not isinstance(spacing, (int, float)) or not 5.0 <= spacing <= 100.0:
         raise RiftError("spacing is 5..100 metres between places")
-    mesh = nav.stage_mesh(game, idx, stage)
+    return float(spacing)
+
+
+def space(game, idx, w, stage: int, spacing: float = SPACING, door_clear: float = DOOR_CLEAR,
+          max_sites: int = MAX_SITES, mod_root=None) -> Space:
+    """The stage's walkable ground as the director uses it (see the module's text): the navigation mesh the game
+    loads with the mod (its own copy of the mesh when it has one, as encounter.plan and the check read it)."""
+    spacing = _spacing(spacing)
+    mesh = nav.stage_mesh(game, idx, stage, mod_root)
     if mesh is None:
         raise RiftError(f"stage {stage} has no navigation mesh, so there is no walkable ground to lay a dungeon on "
                         "(every stage has one but the open field, 100, and stages 501 and 703)")
@@ -231,7 +239,9 @@ def space(game, idx, w, stage: int, spacing: float = SPACING, door_clear: float 
         if room(pick) >= floor and anchored(pick) and pick not in taken:
             add(pick)
         mark = depth[t] + spacing / 2
-    if target not in taken:
+    # the path's end is a place like any other: 12 m from the doors and 1.5 m of room (it was added regardless,
+    # 5.8 m from a door in stage 601, 6.1 in 250, 7.7 in 400)
+    if target not in taken and depth[target] >= door_clear and room(target) >= floor:
         if sites and depth[target] - sites[-1].depth < spacing * 0.5:
             taken.discard(sites[-1].triangle)
             sites.pop()
@@ -360,14 +370,17 @@ def _frequencies(w, stage: int) -> dict:
 
 def direct(game, idx, w, stage: int, seed: int = 0, grammar: mission.Grammar | None = None, which: str = "stage",
            only=None, exclude=(), spacing: float = SPACING, max_points: int = POOL_MAX_POINTS,
-           b: _bestiary.Bestiary | None = None, sp: Space | None = None, keep_lots: bool = False) -> Dungeon:
+           b: _bestiary.Bestiary | None = None, sp: Space | None = None, keep_lots: bool = False,
+           mod_root=None) -> Dungeon:
     """A whole dungeon for the stage (nothing is written): its mission, where each beat stands, which enemy.
     Each encounter copies the nearest of the stage's groups with no lot flag (within 60 m), else the nearest;
-    a copied lot-flag load condition is cleared unless ``keep_lots`` (encounter.plan's ``always``)."""
+    a copied lot-flag load condition is cleared unless ``keep_lots`` (encounter.plan's ``always``).
+    ``mod_root``: the mod the dungeon goes into, whose own navigation mesh (if it has one) is the ground."""
     if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2 ** 32:
         raise RiftError("the seed is a whole number 0..4294967295")
-    if not isinstance(max_points, int) or not 1 <= max_points <= encounter.MAX_POINTS:
+    if not isinstance(max_points, int) or isinstance(max_points, bool) or not 1 <= max_points <= encounter.MAX_POINTS:
         raise RiftError(f"at most 1..{encounter.MAX_POINTS} spawn points per encounter")
+    spacing = _spacing(spacing)             # before spacing * 0.75 below, which overflowed for a huge whole number
     if not (sp.groups if sp is not None else _groups(game, idx, w, stage)):
         raise RiftError(f"stage {stage} places no enemy group of its own, so a new group would have none to copy its "
                         "areas and conditions from (encounter.py); the director needs a stage the game puts enemies in")
@@ -381,8 +394,13 @@ def direct(game, idx, w, stage: int, seed: int = 0, grammar: mission.Grammar | N
     last, fitted = None, None
     spacings = [spacing] if sp is not None else [spacing] + [s for s in (spacing * 0.75, spacing * 0.55) if s >= 5.0]
     for gap in spacings:
-        here = sp or space(game, idx, w, stage, gap)
+        here = sp or space(game, idx, w, stage, gap, mod_root=mod_root)
         notes = list(here.notes)
+        if not here.sites:
+            last = RiftError(f"stage {stage} has no place {DOOR_CLEAR:.0f} m on foot from its doors with "
+                             f"{_bestiary.ROOM_FLOOR / 100:.1f} m of room near the enemies it places: too small for a "
+                             "dungeon")
+            continue
         for attempt in range(MISSION_TRIES):
             mseed = (seed + attempt * 7919) % 2 ** 32
             beats = mission.expand(grammar or mission.DEFAULT_GRAMMAR, mseed)

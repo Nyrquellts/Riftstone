@@ -213,6 +213,11 @@ def _merge_archive(base_bytes, variants, path):
     return data, conflicts
 
 
+class MissingFile(RiftError, FileNotFoundError):
+    """A path the snapshot does not hold: refused like any RiftError, still a FileNotFoundError to callers
+    reading the snapshot as a file system."""
+
+
 @dataclass(frozen=True)
 class Layer:
     name: str
@@ -262,7 +267,7 @@ class Snapshot:
 
     def open(self, path):
         try: return io.BytesIO(self.files[path_key(path)])
-        except KeyError: raise FileNotFoundError(path) from None
+        except KeyError: raise MissingFile(f"{path}: no such file in the VFS snapshot") from None
 
     def list(self, directory=""):
         prefix = path_key(directory) + "/" if directory else ""
@@ -295,6 +300,13 @@ def _read_tree(root: Path):
 
 def mount_manifest(folder: Path):
     """Load folder/vfs.json into memory. No persistent/live game mount occurs."""
+    try:
+        return _mount(folder)
+    except OSError as exc:   # a missing folder, vfs.json or layer path, an unreadable file: a refusal naming it
+        raise RiftError(f"vfs: cannot read {exc.filename or folder}: {exc.strerror or exc}") from None
+
+
+def _mount(folder: Path):
     folder = Path(folder).resolve(strict=True)
     config = _json((folder / "vfs.json").read_bytes())
     if not isinstance(config, dict) or set(config) - {"schema", "base", "layers", "semantic_merge"}:

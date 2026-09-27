@@ -458,6 +458,9 @@ def build(efl: Efl) -> bytes:
             raise FormatError("efl", f"{what} names region {i!r}; there are {len(efl.regions)}")
         if not efl.regions[i].data:
             raise FormatError("efl", f"{what} names region {i}, which is empty")
+        if not offsets[i]:          # no units and no joints: the tables take no bytes
+            raise FormatError("efl", f"{what} names region {i}, which starts at offset 0: the format reads that "
+                                     "as none (put another region first)")
         return offsets[i]
 
     def word(low: int, i, what) -> int:
@@ -677,7 +680,8 @@ def to_yaml(efl: Efl, name: str | None = None) -> str:
     from .yamlish import Map, Scalar, Seq
 
     game = "Dark Arisen" if efl.version == VERSION_DDDA else "Online"
-    head = ["Riftstone effect list (.efl)" + (f" -- {name}" if name else ""),
+    shown = " -- " + "".join(c if c.isprintable() else " " for c in name) if name else ""   # stays in its comment
+    head = ["Riftstone effect list (.efl)" + shown,
             f"version 0x{efl.version:08x} ({game}). units: one emitter each -- its joint, and the structures",
             "(regions, by number) holding its generator, particle, life and move. Regions keep their bytes;",
             "generator and particle heads are shown as named fields (textures: TexturePath / AnimPath /",
@@ -734,6 +738,12 @@ def _w(node, source):
     return (getattr(node, "line", None), getattr(node, "col", None), source)
 
 
+def _num(v: int, text: str) -> str:
+    """A number for a message: in decimal, or its text cut short past 64 bits (int -> str refuses over
+    4,300 digits, and a hex number has no such limit)."""
+    return str(v) if v.bit_length() <= 64 else repr(text.strip()[:16] + "...")
+
+
 def _yint(node, what, source, lo=0, hi=0xFFFFFFFF, allow_null=False):
     from .yamlish import Scalar
 
@@ -747,7 +757,7 @@ def _yint(node, what, source, lo=0, hi=0xFFFFFFFF, allow_null=False):
     except ValueError:
         raise ParamError(f"'{what}': {node.text!r} is not a whole number", *_w(node, source)) from None
     if not lo <= v <= hi:
-        raise ParamError(f"'{what}': {v} is out of range ({lo}..{hi})", *_w(node, source))
+        raise ParamError(f"'{what}': {_num(v, t)} is out of range ({lo}..{hi})", *_w(node, source))
     return v
 
 
@@ -761,6 +771,33 @@ def _yf32(node, what, source) -> int:
         return f32_bits(node.text)
     except (ValueError, OverflowError):
         raise ParamError(f"'{what}': {node.text!r} is not a 32-bit float", *_w(node, source)) from None
+
+
+def _ykeys(m, known, what, source) -> None:
+    """Refuse a field this block does not have (a typo would otherwise be ignored)."""
+    for k, _ in m.items:
+        if k.text not in known:
+            raise ParamError(f"{what}: unknown field '{k.text}'", k.line, k.col, source)
+
+
+def _ylist(m, key, source) -> list:
+    """The list the file must hold under `key` (missing or not a list is refused, not taken as empty)."""
+    from .yamlish import Seq
+
+    v = m.get(key)
+    if v is None:
+        raise ParamError(f"'{key}' is missing", *_w(m, source))
+    if not isinstance(v, Seq):
+        raise ParamError(f"'{key}' must be a list", *_w(v, source))
+    return v.items
+
+
+def _yregion(rn, i, source) -> None:
+    """A region's keys, and its number (optional) in order."""
+    _ykeys(rn, ("region", "fields", "tail"), f"region {i}", source)
+    num = rn.get("region")
+    if num is not None and _yint(num, "region", source) != i:
+        raise ParamError(f"region {i}: regions are numbered in order (this one is {i})", *_w(num, source))
 
 
 def _yhex(node, what, source) -> bytes:
@@ -794,6 +831,7 @@ def _yval(t, node, what, source):
                 "point": ("x", "y")}[t]
         if not isinstance(node, Map):
             raise ParamError(f"'{what}' is {{{keys[0]}: .., {keys[1]}: ..}}", *_w(node, source))
+        _ykeys(node, keys, f"'{what}'", source)
         out = {}
         for k in keys:
             sub = node.get(k)
@@ -810,6 +848,7 @@ def _yval(t, node, what, source):
         return out
     if t == "char64":
         if isinstance(node, Map):
+            _ykeys(node, ("hex",), f"'{what}'", source)
             return _yhex(node.get("hex"), what, source)
         if not isinstance(node, Scalar):
             raise ParamError(f"'{what}' is a path", *_w(node, source))
@@ -824,6 +863,8 @@ def _yfields(node, schema, what, source) -> dict:
 
     if not isinstance(node, Map):
         raise ParamError(f"{what}: 'fields' is a mapping", *_w(node, source))
+    _ykeys(node, {f for item in schema for f in ([n for n, _ in item[2]] if item[1] == "bits" else [item[0]])},
+           what, source)
     out = {}
     for item in schema:
         name, t = item[0], item[1]
@@ -846,6 +887,12 @@ def _yfields(node, schema, what, source) -> dict:
     return out
 
 
+_TOP = ("riftstone", "resource", "version", "mBaseFps", "flags", "reserved", "joint_pad", "unit", "units", "joints",
+        "regions")
+_UNIT_KEYS = ("joint", "generator", "particle_type", "particle", "life_type", "life_unk", "life", "move_type",
+              "move_unk", "move")
+
+
 def from_yaml(text: str, source: str | None = None) -> Efl:
     from . import yamlish
     from .yamlish import Map, Scalar, Seq
@@ -853,6 +900,7 @@ def from_yaml(text: str, source: str | None = None) -> Efl:
     doc = yamlish.parse(text, source)
     if not isinstance(doc, Map) or not isinstance(doc.get("riftstone"), Scalar) or doc.get("riftstone").text != TAG:
         raise ParamError(f"not a Riftstone effect list (expected 'riftstone: {TAG}')", 1, 1, source)
+    _ykeys(doc, _TOP, "the file", source)
     version = _yint(doc.get("version") or doc, "version", source)
     if version not in VERSIONS:
         raise ParamError(f"version must be 0x{VERSION_DDDA:08x} or 0x{VERSION_DDO:08x}",
@@ -869,12 +917,14 @@ def from_yaml(text: str, source: str | None = None) -> Efl:
     if unit is not None:
         if not isinstance(unit, Map):
             raise ParamError("'unit' is {generator, move, joint, param}", *_w(unit, source))
+        _ykeys(unit, ("generator", "move", "joint", "param"), "unit", source)
         efl.unit = [_yint(unit.get(k) or unit, f"unit {k}", source, allow_null=True)
                     for k in ("generator", "move", "joint", "param")]
-    units = doc.get("units")
-    for n, u in enumerate(units.items if isinstance(units, Seq) else []):
+    units = _ylist(doc, "units", source)
+    for n, u in enumerate(units):
         if not isinstance(u, Map):
             raise ParamError("each unit is a mapping", *_w(u, source))
+        _ykeys(u, _UNIT_KEYS, f"unit {n}", source)
 
         def g(k, hi=0xFF, null=False):
             v = u.get(k)
@@ -885,18 +935,16 @@ def from_yaml(text: str, source: str | None = None) -> Efl:
                                  g("particle", 0xFFFFFF, True), g("life_type", 0xF), g("life_unk", 0xF),
                                  g("life", 0xFFFFFF, True), g("move_type", 0xF), g("move_unk", 0xF),
                                  g("move", 0xFFFFFF, True)))
-    joints = doc.get("joints")
-    efl.joints = [_yint(j, "joint", source, 0, 0xFFFFFF, allow_null=True)
-                  for j in (joints.items if isinstance(joints, Seq) else [])]
+    efl.joints = [_yint(j, "joint", source, 0, 0xFFFFFF, allow_null=True) for j in _ylist(doc, "joints", source)]
     need = _tables_size(len(efl.entries), len(efl.joints)) - len(efl.entries) * 16 - len(efl.joints) * 4
     efl.joint_pad = _yhex(pad, "joint_pad", source) if pad is not None else bytes(need)
     regs = doc.get("regions")
-    nodes = regs.items if isinstance(regs, Seq) else []
+    nodes = _ylist(doc, "regions", source)
     for n, e in enumerate(efl.entries):
         for what, i in (("generator", e.generator), ("particle", e.particle), ("life", e.life), ("move", e.move)):
             if i is not None and i >= len(nodes):
                 raise ParamError(f"unit {n}: {what} names region {i}; there are {len(nodes)}",
-                                 *_w(units.items[n], source))
+                                 *_w(units[n], source))
     for what, i in [(f"joint {k}", j) for k, j in enumerate(efl.joints)] + list(zip(UNIT_ROLES, efl.unit)):
         if i is not None and i >= len(nodes):
             raise ParamError(f"{what} names region {i}; there are {len(nodes)}", *_w(regs, source))
@@ -917,6 +965,7 @@ def from_yaml(text: str, source: str | None = None) -> Efl:
     for i, rn in enumerate(nodes):
         if not isinstance(rn, Map):
             raise ParamError("each region is a mapping", *_w(rn, source))
+        _yregion(rn, i, source)
         tail = _yhex(rn.get("tail"), "tail", source) if rn.get("tail") is not None else b""
         fn = rn.get("fields")
         if fn is None:

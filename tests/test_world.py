@@ -10,6 +10,10 @@ from riftstone import arc, encounter, gpl, lot, mod, typemap, world
 from riftstone.errors import RiftError
 from riftstone.index import Index
 
+# the environment this module's classes set (a stand-in RIFTSTONE_HOME) is put back when it ends: a later
+# module that reads the real game (test_compat) otherwise found an empty stand-in index
+setUpModule, tearDownModule = helpers.module_env("RIFTSTONE_HOME", "RIFTSTONE_GAME", "RIFTSTONE_DDO", "RIFTSTONE_DDO_ASSETS", "RIFTSTONE_MODS", "RIFTSTONE_WORKSPACE")
+
 
 class WorldTest(unittest.TestCase):
     @classmethod
@@ -139,6 +143,18 @@ class WorldTest(unittest.TestCase):
         again = world.load(self.game, self.idx)
         self.assertEqual(again.data["signature"], self.w.data["signature"])
 
+    def test_a_cache_that_is_not_the_map_is_rebuilt(self):
+        """world.load read its cache with data.get(...): JSON that is not an object (null, a list) raised
+        AttributeError, and nesting deeper than the decoder RecursionError, in every command that maps the world."""
+        path = world.cache_path(self.game)
+        keep = path.read_bytes()
+        try:
+            for text in ("[]", "null", "7", "[" * 100_000):
+                path.write_text(text, encoding="utf-8")
+                self.assertEqual(world.load(self.game, self.idx).data["signature"], self.w.data["signature"], text[:8])
+        finally:
+            path.write_bytes(keep)
+
     def test_atlas(self):
         rows = {r["ext"]: r for r in world.atlas(self.idx)}
         self.assertEqual(rows["lot"]["count"], 4)
@@ -227,6 +243,72 @@ class WorldTest(unittest.TestCase):
                 encounter.plan(self.game, self.idx, self.w, root, a.pop("stage"), a.pop("enemy"), a.pop("total"),
                                a.pop("at"), **a)
         self.assertEqual(list((root / "files").rglob("*.yaml")), [])       # nothing written
+
+
+class DlcGroupTest(unittest.TestCase):
+    """A stage with a DLC enemy group list (world_fixture extras: st424_e_dlc01's group 1, as Everfall's st443/st444
+    _e_dlc01 hold groups 20-22)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        base = Path(cls.tmp.name)
+        cls.old_home = os.environ.get("RIFTSTONE_HOME")
+        os.environ["RIFTSTONE_HOME"] = str(base / "home")
+        cls.game = world_fixture.make(base / "game", extras=True, cells=True)
+        cls.idx = Index(cls.game)
+        cls.idx.refresh()
+        cls.w = world.load(cls.game, cls.idx)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.idx.close()
+        if cls.old_home is None:
+            os.environ.pop("RIFTSTONE_HOME", None)
+        else:
+            os.environ["RIFTSTONE_HOME"] = cls.old_home
+        cls.tmp.cleanup()
+
+    def test_a_dlc_group_is_found_by_its_number(self):
+        # was: World.group skipped every DLC group, so `world group 424 e 1` said "no enemies group 1" and
+        # `world enemy` showed that group's placements as "no group", while `world stage` lists it
+        g = self.w.group(424, "e", 1)
+        self.assertIsNotNone(g)
+        self.assertEqual((g["dlc"], g["list"], g["units"]), (True, "scr\\st424\\etc\\st424_e_dlc01", ["em0100"]))
+        self.assertEqual(self.w.group(424, "e", 0)["list"], "scr\\st424\\etc\\st424_e")
+        self.assertIsNone(self.w.group(424, "e", 2))
+        spawns = {s["layout"]: s["group"] for s in self.w.spawns_of("em0100")}
+        self.assertEqual(spawns["scr\\st424\\etc\\st424_00m00n_e01"], g)
+        self.assertTrue(all(spawns.values()))
+
+    def test_the_base_list_wins_a_number_both_lists_use(self):
+        def grp(dlc, units):
+            return {"stage": 443, "type": "e", "dlc": dlc, "number": 20, "list": "l", "units": units}
+        for order in ((grp(True, ["dlc"]), grp(False, ["base"])), (grp(False, ["base"]), grp(True, ["dlc"]))):
+            w = world.World({"stages": {}, "groups": list(order), "layouts": {}, "placements": [], "enemies": {}})
+            self.assertEqual(w.group(443, "e", 20)["units"], ["base"])
+
+    def test_world_group_and_enemy_show_it(self):
+        import contextlib
+        import gc
+        import io
+
+        from riftstone import cli
+
+        def run(*args):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                code = cli.main([*args, "--game", str(self.game.root)])
+            gc.collect()                            # the CLI's index connection (a cycle) closes here
+            return code, out.getvalue()
+
+        code, out = run("world", "group", "424", "e", "1")
+        self.assertEqual(code, 0, out)
+        self.assertIn("st424_e_dlc01", out)
+        self.assertIn("st424_00m00n_e01", out)
+        code, out = run("world", "enemy", "em0100")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("no group", out)
 
 
 if __name__ == "__main__":

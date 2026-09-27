@@ -1,4 +1,5 @@
 """Dragon's Dogma Online support: cipher, ARCC, GMD 1.3.2, XFS 0x000F, tex 0x9D, cross-game ports."""
+import contextlib
 import json
 import struct
 import tempfile
@@ -7,16 +8,144 @@ import zlib
 from pathlib import Path
 
 import helpers
-from riftstone import arc, arcfolder, gmd, install, mrl, port, tex, typemap, xfs
+from riftstone import arc, arcfolder, cipher, gmd, install, mrl, port, tex, typemap, xfs
 from riftstone.cipher import Blowfish
 from riftstone.errors import BuildError, FormatError, ParamError, RiftError
 from riftstone.game import Game, detect_kind
 from riftstone.mod import Mod, plan
 
+KEY = helpers.TEST_ARC_KEY
+
+
+@contextlib.contextmanager
+def _env(**values):
+    """Environment variables set (None: unset) for a block, then put back."""
+    import os
+    saved = {k: os.environ.get(k) for k in values}
+    for k, v in values.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = str(v)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _run(*args) -> tuple[int, str]:
+    """cli.main's exit code and everything it printed."""
+    import gc
+    import io
+
+    from riftstone import cli
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        code = cli.main(list(args))
+    gc.collect()            # an index a command leaves open (a cycle with its statement cache) closes here
+    return code, out.getvalue()
+
 
 class CipherTest(unittest.TestCase):
-    # The real-key vector (8 zero bytes -> 8CA5B93345E705DB) is not checked here: the DDO key is not
-    # committed.  The standard Blowfish vectors below prove the implementation without it.
+    def test_no_key_in_the_source(self):
+        # Riftstone ships only the key's SHA-256 and its value on one block, never the key
+        import riftstone
+        for f in Path(riftstone.__file__).parent.rglob("*.py"):
+            text = f.read_bytes()
+            self.assertNotIn(b"ARC_KEY =", text, f)
+            self.assertIsNone(cipher.key_in(text), f)
+
+    def test_the_players_key_when_this_pc_has_online(self):
+        # read from the client (launcher or the bundled server's library), recognised, and it gives the
+        # measured value on one zero block (DDO's little-endian words)
+        saved = cipher._key, cipher._default, list(cipher._noted)
+        try:
+            cipher._key = cipher._default = None
+            try:
+                key = cipher.find_arc_key()
+            except RiftError:
+                self.skipTest("no Dragon's Dogma Online client on this PC")
+            self.assertEqual(Blowfish(key, pure=True).encrypt(bytes(8)), cipher.KEY_CHECK)
+            self.assertEqual(cipher.KEY_CHECK.hex().upper(), "8CA5B93345E705DB")
+        finally:
+            cipher._key, cipher._default, cipher._noted[:] = saved
+
+    def test_the_key_is_found_as_text_and_as_a_net_string(self):
+        # a stand-in key recognised the same way as the real one (its hash and its value on one block)
+        import hashlib
+        from unittest import mock
+        fake = b"a stand-in 55-byte key that plays Online's in this test"
+        self.assertEqual(len(fake), cipher.KEY_LEN)
+        check = Blowfish(fake, pure=True).encrypt(bytes(8))
+        saved = cipher._key, cipher._default, list(cipher._noted)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cipher, "KEY_SHA256", hashlib.sha256(fake).hexdigest()), \
+                mock.patch.object(cipher, "KEY_CHECK", check), \
+                mock.patch("riftstone.game._ddo_candidates", lambda: []), \
+                mock.patch.dict("os.environ", {"RIFTSTONE_DDO_KEY_FROM": "", "RIFTSTONE_DDO_KEY": "",
+                                              "LOCALAPPDATA": tmp}):
+            root = Path(tmp) / "Online"
+            (root / "nativePC" / "Server").mkdir(parents=True)
+            (root / "nativePC" / "rom").mkdir()
+            (root / "DDO.exe").write_bytes(b"MZ packed")
+            try:
+                cipher._key = cipher._default = None
+                cipher._noted.clear()
+                with self.assertRaises(RiftError) as e:
+                    cipher.find_arc_key()
+                self.assertIn("ships no key", str(e.exception))
+                # a .NET library holds it as UTF-16, between other strings
+                lib = root / "nativePC" / "Server" / "Arrowgene.Ddon.Client.dll"
+                lib.write_bytes(b"MZ\0\0" + "junk text ".encode("utf-16-le") + b"\x6f"
+                                + fake.decode().encode("utf-16-le") + b"\x00\x21" + "more".encode("utf-16-le"))
+                cipher.note_path(root / "nativePC" / "rom" / "x.arc")     # an ARCC archive of this client
+                self.assertEqual(cipher.find_arc_key(), fake)
+                self.assertEqual(cipher.arc_cipher().encrypt(bytes(8)), check)
+                lib.unlink()
+                cipher._key = cipher._default = None
+                # a launcher holds it as plain text inside a longer run
+                (root / "ddo_launcher.exe").write_bytes(b"MZ\x90" + b"prefix-" + fake + b"-suffix\0")
+                self.assertEqual(cipher.find_arc_key(), fake)
+                # one character off: not the key
+                (root / "ddo_launcher.exe").write_bytes(b"MZ\x90" + fake[:-1] + b"?\0")
+                self.assertIsNone(cipher.key_in((root / "ddo_launcher.exe").read_bytes()))
+                with self.assertRaises(RiftError):
+                    cipher.use_key(fake[:-1] + b"?")
+            finally:
+                cipher._key, cipher._default, cipher._noted[:] = saved
+
+    def test_a_supplied_key_comes_first_and_must_be_onlines(self):
+        # RIFTSTONE_DDO_KEY (else %LOCALAPPDATA%\Riftstone\ddo.key, as Notepad may save it) is used before any
+        # install is searched; a key that is not Online's is refused by where it came from
+        import hashlib
+        from unittest import mock
+        fake = b"a stand-in 55-byte key that plays Online's in this test"
+        check = Blowfish(fake, pure=True).encrypt(bytes(8))
+        saved = cipher._key, cipher._default, list(cipher._noted)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cipher, "KEY_SHA256", hashlib.sha256(fake).hexdigest()), \
+                mock.patch.object(cipher, "KEY_CHECK", check), \
+                mock.patch.object(cipher, "_search_places", lambda: self.fail("an install was searched")):
+            try:
+                cipher._key = cipher._default = None
+                with mock.patch.dict("os.environ", {"RIFTSTONE_DDO_KEY": fake.decode() + "\n", "LOCALAPPDATA": tmp}):
+                    self.assertEqual(cipher.find_arc_key(), fake)
+                    self.assertEqual(cipher.arc_cipher().encrypt(bytes(8)), check)
+                    self.assertEqual(Blowfish().encrypt(bytes(8)), check)          # 1.0.0's default key
+                (Path(tmp) / "Riftstone").mkdir()
+                (Path(tmp) / "Riftstone" / "ddo.key").write_bytes(
+                    b"\xff\xfe" + (fake.decode() + "\r\n").encode("utf-16-le"))
+                with mock.patch.dict("os.environ", {"RIFTSTONE_DDO_KEY": "", "LOCALAPPDATA": tmp}):
+                    self.assertEqual(cipher.find_arc_key(), fake)
+                with mock.patch.dict("os.environ", {"RIFTSTONE_DDO_KEY": fake.decode()[:-1] + "?", "LOCALAPPDATA": tmp}):
+                    with self.assertRaisesRegex(RiftError, "RIFTSTONE_DDO_KEY"):
+                        cipher.find_arc_key()
+            finally:
+                cipher._key, cipher._default, cipher._noted[:] = saved
 
     def test_standard_vector_in_ddo_byte_order(self):
         # Schneier's TESTKEY vector; DDO reads each half little-endian: DDO(b) == bswap32(std(bswap32(b)))
@@ -60,12 +189,12 @@ class CipherTest(unittest.TestCase):
 
     def test_roundtrip_and_backends_agree(self):
         data = bytes(range(256)) * 3
-        pure = Blowfish(pure=True)
+        pure = Blowfish(KEY, pure=True)
         self.assertEqual(pure.decrypt(pure.encrypt(data)), data)
-        self.assertEqual(Blowfish().encrypt(data), pure.encrypt(data))
+        self.assertEqual(Blowfish(KEY).encrypt(data), pure.encrypt(data))
 
     def test_encrypt_pads_decrypt_requires_blocks(self):
-        bf = Blowfish(pure=True)
+        bf = Blowfish(KEY, pure=True)
         self.assertEqual(len(bf.encrypt(b"abc")), 8)
         with self.assertRaises(ValueError):
             bf.decrypt(b"abc")
@@ -481,6 +610,29 @@ class GameKindTest(unittest.TestCase):
             with self.assertRaises(RiftError):
                 Mod.create(Path(d) / "m", "M", game="dd2")
 
+    def test_a_keyword_takes_the_game_riftstone_game_names(self):
+        # was: a keyword ('ddda', a mod's game, Studio's --game ddda, Game.other()) looked only through Steam
+        # (or RIFTSTONE_DDO), passing over a copy RIFTSTONE_GAME names outside Steam
+        import os
+        from unittest import mock
+        from riftstone.game import find_game
+        with tempfile.TemporaryDirectory() as d:
+            dd, on = Path(d) / "DDDA", Path(d) / "Online"
+            for root, exe in ((dd, "DDDA.exe"), (on, "DDO.exe")):
+                (root / "nativePC" / "rom").mkdir(parents=True)
+                (root / exe).write_bytes(b"")
+            with mock.patch("riftstone.game._steam_libraries", return_value=[]), \
+                    mock.patch("riftstone.game._ddo_candidates", return_value=[]):
+                for env, want, found in ((str(dd), "ddda", dd), (str(dd), None, dd), (str(on), "ddo", on),
+                                         (str(on), None, on)):
+                    with mock.patch.dict(os.environ, {"RIFTSTONE_GAME": env}):
+                        self.assertEqual(find_game(want).root, found, (env, want))
+                        self.assertEqual(find_game(want).kind, "ddo" if found == on else "ddda")
+                with mock.patch.dict(os.environ, {"RIFTSTONE_GAME": str(on)}):
+                    with self.assertRaises(RiftError):             # that folder is the other game
+                        find_game("ddda")
+                    self.assertEqual(Game(dd, "ddda").other().root, on)
+
     def test_vanilla_tables(self):
         ddo = install.known_vanilla(Game(Path("."), "ddo"))
         self.assertIsNotNone(ddo)
@@ -729,6 +881,84 @@ class DdoServerTest(unittest.TestCase):
             with self.assertRaises(BuildError):
                 plan(Game(root, "ddda"), None, [Mod.load(m.root)])
 
+    def test_a_spawn_table_of_the_wrong_shape_is_refused(self):
+        """ddo.load checked only that the schema could be iterated: `world` and `encounter --game ddo` crashed on a
+        table without "enemies" (KeyError), "enemies": null (TypeError), rows as objects (KeyError), a schema
+        without StageId or EnemyId (ValueError), a short row (IndexError), an EnemyId that is no id (ValueError,
+        TypeError), and read a schema that is one string as a list of its letters."""
+        from riftstone import ddo
+
+        S, row = self.SCHEMA, [5, 0, 1, 0, 0, "0x010100", 3, 10, 2]
+
+        def table(rows=(row,), schema=S, **top):
+            doc = {"schemas": {"enemies": schema}, "dropsTables": [], "enemies": [list(r) for r in rows]}
+            doc.update(top)
+            return json.dumps(doc)
+
+        def swap(i, v):
+            return row[:i] + [v] + row[i + 1:]
+
+        deep = 100_000
+        bad = {"no enemies": json.dumps({"schemas": {"enemies": S}}), "enemies null": table(enemies=None),
+               "rows as objects": table(enemies=[dict(zip(S, row))]),
+               "no StageId": table([row[1:]], S[1:]), "no EnemyId": table([row[:5] + row[6:]], S[:5] + S[6:]),
+               "short row": table([row[:4]]), "long row": table([row + [0]]),
+               "EnemyId goblin": table([swap(5, "goblin")]), "EnemyId null": table([swap(5, None)]),
+               "EnemyId true": table([swap(5, True)]), "StageId a list": table([swap(0, [5])]),
+               "Lv text": table([swap(6, "3")]), "schema a string": table([], "StageId"),
+               "schema of numbers": table([], [1, 2]), "no schemas": json.dumps({"enemies": []}),
+               "drop tables null": table(dropsTables=None), "a list": "[1, 2]", "deep": "[" * deep + "]" * deep}
+
+        class Idx:
+            def archives_with(self, name, tid):
+                return []
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "ddo"
+            (root / "nativePC" / "rom").mkdir(parents=True)
+            (root / "DDO.exe").write_bytes(b"")
+            assets = Path(d) / "assets"
+            assets.mkdir()
+            game = Game(root, "ddo")
+            spawn = assets / "EnemySpawn.json"
+            for why, text in bad.items():
+                spawn.write_text(text, encoding="utf-8")
+                with self.assertRaisesRegex(RiftError, "EnemySpawn.json", msg=why):
+                    ddo.load(game, Idx(), assets)
+            spawn.write_text(table([row, swap(5, 0x010200)]), encoding="utf-8")
+            w = ddo.load(game, Idx(), assets)
+            self.assertEqual([ddo.enemy_id(r[w.col("EnemyId")]) for r in w.rows], [0x010100, 0x010200])
+            # the commands that crashed: world (the server's table) and encounter (the mod's copy)
+            m = Mod.create(Path(d) / "mod", "Night", game="ddo")
+            (m.root / "server").mkdir(exist_ok=True)
+            with _env(RIFTSTONE_DDO_ASSETS=assets, RIFTSTONE_HOME=Path(d) / "home"):
+                for why in ("no enemies", "rows as objects", "EnemyId goblin", "schema a string"):
+                    spawn.write_text(bad[why], encoding="utf-8")
+                    code, out = _run("world", "stages", "--game", str(root))
+                    self.assertEqual(code, 2, (why, out))
+                    self.assertIn("EnemySpawn.json", out)
+                spawn.write_text(table(), encoding="utf-8")
+                self.assertEqual(_run("world", "stages", "--game", str(root))[0], 0)
+                (m.root / "server" / "EnemySpawn.json").write_text(bad["short row"], encoding="utf-8")
+                code, out = _run("encounter", "5", "0x010100", "--game", str(root), "--mod", str(m.root),
+                                 "--count", "1")
+                self.assertEqual(code, 2, out)
+                self.assertIn(str(m.root / "server" / "EnemySpawn.json"), out)
+
+    def test_server_settings_nested_too_deep_are_passed_over(self):
+        # was: RecursionError out of server_assets (it caught OSError, ValueError, KeyError and TypeError)
+        from riftstone import ddo
+        deep = "[" * 100_000 + "]" * 100_000
+        with tempfile.TemporaryDirectory() as d, _env(RIFTSTONE_DDO_ASSETS=None):
+            root = Path(d) / "ddo"
+            bundled = root / "nativePC" / "Server" / "Files" / "Assets"
+            bundled.mkdir(parents=True)
+            (root / "DDO.exe").write_bytes(b"")
+            (Path(d) / "server.json").write_text(deep, encoding="utf-8")
+            (Path(d) / "server").mkdir()
+            (Path(d) / "server" / "Arrowgene.Ddon.config.json").write_text(deep, encoding="utf-8")
+            self.assertEqual(ddo.server_assets(Game(root, "ddo")), bundled)
+
 
 class DdoItemsTest(unittest.TestCase):
     def test_json_style_kept(self):
@@ -761,12 +991,108 @@ class DdoItemsTest(unittest.TestCase):
                           "Unk7": []})
         with self.assertRaises(RiftError):
             ddo.shop_add(shops, 7, 35, 1, 1)
+        # was: written as given; the server reads Price as UInt32 and Stock as a byte (CDataGoodsParam)
+        for price, stock in ((-5, 20), (2 ** 32, 20), (50, -1), (50, 256)):
+            with self.assertRaises(RiftError, msg=(price, stock)):
+                ddo.shop_add(shops, 7, 36, price, stock)
+        self.assertEqual(len(shops[0]["Data"]["GoodsParamList"]), 2)
+        ddo.shop_add(shops, 7, 36, 0xFFFFFFFF, 255)
         spawn = {"schemas": {"enemies": ["StageId", "DropsTableId"]}, "enemies": [[1, 2], [1, 2]],
                  "dropsTables": [{"id": 2, "name": "Goblin", "items": [[7750, 1, 1, 0, False, 0.8]]}]}
         self.assertIn("2 spawn row(s)", ddo.drop_add(spawn, 2, 35, 0.25))
         self.assertEqual(ddo.drop_tables_with(spawn, 35), [(2, "Goblin", 0.25)])
         with self.assertRaises(RiftError):
             ddo.drop_add(spawn, 9, 35, 0.5)
+
+    def test_server_files_of_the_wrong_shape_are_refused(self):
+        """Shop.json [{"ShopId": 7}] gave KeyError 'Data' (items shop), an item priced "abc" ValueError from int()
+        (items shop <item>), a drop table item [34] IndexError (items sets), an empty itemlist.csv IndexError (items
+        list); items list --limit 5 showed 5 items and said "showing 60"."""
+        from riftstone import ddo
+
+        good_shop = {"ShopId": 7, "Data": {"GoodsParamList": [{"Index": 0, "ItemId": 34, "Price": 7, "Stock": 5,
+                                                              "Unk4": False, "Unk5": 0, "Unk6": 0, "Unk7": []}]}}
+        for bad in ({"ShopId": 7}, [{"ShopId": 7}], [{"ShopId": "7", "Data": {"GoodsParamList": []}}],
+                    [{"ShopId": 7, "Data": {"GoodsParamList": 5}}], [{"ShopId": 7, "Data": {"GoodsParamList": [5]}}],
+                    [{"ShopId": 7, "Data": {"GoodsParamList": [{"ItemId": None}]}}],
+                    [dict(good_shop, Data={"GoodsParamList": [dict(good_shop["Data"]["GoodsParamList"][0], Unk7=5)]})]):
+            with self.assertRaisesRegex(RiftError, "Shop.json", msg=bad):
+                ddo.check_shops(bad, "Shop.json")
+        self.assertEqual(ddo.check_shops([good_shop], "Shop.json"), [good_shop])
+        drop = {"id": 2, "name": "Goblin", "items": [[7750, 1, 1, 0, False, 0.8]]}
+        for bad in (None, [5], [{"name": "x", "items": []}], [dict(drop, id="2")], [dict(drop, items=5)],
+                    [dict(drop, items=[[34]])], [dict(drop, items=[["34", 1, 1, 0, False, 0.5]])],
+                    [dict(drop, items=[[34, 1, 1, 0, False, "0.5"]])], [dict(drop, name=["x"])]):
+            with self.assertRaisesRegex(RiftError, "EnemySpawn.json", msg=bad):
+                ddo.check_drop_tables({"dropsTables": bad}, "EnemySpawn.json")
+        self.assertEqual(ddo.check_drop_tables({"dropsTables": [drop]}, "EnemySpawn.json"), [drop])
+        self.assertEqual(ddo.check_drop_tables({}, "EnemySpawn.json"), [])
+        with tempfile.TemporaryDirectory() as d:
+            for text in ("", "﻿", "\n\n"):
+                (Path(d) / "itemlist.csv").write_text(text, encoding="utf-8")
+                with self.assertRaisesRegex(RiftError, "itemlist.csv"):
+                    ddo.load_items(Path(d))
+            # was: ValueError from int() on an id str.isdigit() took ('²', 5,000 digits)
+            (Path(d) / "itemlist.csv").write_text("#ItemId,Category,Price,Name\n²,1,7,Odd\n" + "9" * 5000
+                                                  + ",1,7,Long\n34,1,7,Healing Potion\n", encoding="utf-8")
+            self.assertEqual(list(ddo.load_items(Path(d))), [34])
+
+    def test_items_commands_refuse_server_files_of_the_wrong_shape(self):
+        """The commands of test_server_files_of_the_wrong_shape_are_refused, on a stand-in client and server."""
+        good_shop = {"ShopId": 7, "Data": {"GoodsParamList": []}}
+        drop = {"id": 2, "name": "Goblin", "items": [[34]]}
+        spawn = {"schemas": {"enemies": DdoServerTest.SCHEMA}, "dropsTables": [drop],
+                 "enemies": [[5, 0, 1, 0, 0, "0x010100", 3, 10, 2]]}
+        items = "#ItemId,Category,Price,Name\n34,1,7,Healing Potion\n35,1,abc,Odd Potion\n" + "".join(
+            f"{100 + i},1,5,Stone {i}\n" for i in range(78))
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "ddo"
+            (root / "nativePC" / "rom").mkdir(parents=True)
+            (root / "DDO.exe").write_bytes(b"")
+            assets = Path(d) / "assets"
+            assets.mkdir()
+            (assets / "EnemySpawn.json").write_text(json.dumps(spawn), encoding="utf-8")
+            (assets / "Shop.json").write_text(json.dumps([{"ShopId": 7}]), encoding="utf-8")
+            (assets / "itemlist.csv").write_text(items, encoding="utf-8")
+            m = Mod.create(Path(d) / "mod", "Shop", game="ddo")
+            g = ["--game", str(root)]
+            with _env(RIFTSTONE_DDO_ASSETS=assets, RIFTSTONE_HOME=Path(d) / "home"):
+                for args in (["items", "shop"], ["items", "shop", "Healing Potion", "--shop", "7", "--mod", str(m.root)],
+                             ["items", "sets", "Healing Potion"]):
+                    code, out = _run(*args, *g)
+                    self.assertEqual(code, 2, (args, out))
+                    self.assertIn("Shop.json" if args[1] == "shop" else "EnemySpawn.json", out)
+                (assets / "Shop.json").write_text(json.dumps([good_shop]), encoding="utf-8")
+                code, out = _run("items", "shop", "Odd Potion", "--shop", "7", "--mod", str(m.root), *g)
+                self.assertEqual(code, 2, out)
+                self.assertIn("--buy", out)
+                code, out = _run("items", "shop", "Odd Potion", "--shop", "7", "--buy", "40", "--mod", str(m.root), *g)
+                self.assertEqual(code, 0, out)
+                sold = json.loads((m.root / "server" / "Shop.json").read_text(encoding="utf-8"))
+                self.assertEqual([(x["ItemId"], x["Price"]) for x in sold[0]["Data"]["GoodsParamList"]], [(35, 40)])
+                code, out = _run("items", "list", "--limit", "5", *g)
+                self.assertEqual(code, 0, out)
+                self.assertIn("80 item(s); showing 5", out)
+                self.assertEqual(out.count("Stone"), 3)                    # Healing Potion, Odd Potion, Stones 0-2
+                code, out = _run("items", "list", "stone", *g)
+                self.assertIn("78 item(s); showing 60", out)
+                # drop: the table it counts rows in and writes back is checked as world reads it
+                drop["items"] = [[7750, 1, 1, 0, False, 0.8]]
+                (assets / "EnemySpawn.json").write_text(json.dumps(dict(spawn, enemies=None)), encoding="utf-8")
+                args = ["items", "drop", "Healing Potion", "--set", "2", "--percent", "25", "--mod", str(m.root), *g]
+                code, out = _run(*args)
+                self.assertEqual(code, 2, out)
+                self.assertIn("EnemySpawn.json", out)
+                (assets / "EnemySpawn.json").write_text(json.dumps(spawn), encoding="utf-8")
+                code, out = _run(*args)
+                self.assertEqual(code, 0, out)
+                self.assertIn("1 spawn row(s) use it", out)
+                saved = json.loads((m.root / "server" / "EnemySpawn.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["dropsTables"][0]["items"][-1], [34, 1, 1, 0, False, 0.25])
+                (assets / "itemlist.csv").write_text("", encoding="utf-8")
+                code, out = _run("items", "list", *g)
+                self.assertEqual(code, 2, out)
+                self.assertIn("itemlist.csv", out)
 
 
 class LotDdoTest(unittest.TestCase):
@@ -849,6 +1175,25 @@ class LotDdoTest(unittest.TestCase):
         struct.pack_into("<I", bad, 8 + lot_ddo.BLOCK + 4 + 4, 999)   # an unknown kind
         with self.assertRaises(FormatError):
             lot_ddo.parse(bytes(bad))
+
+    def test_huge_numbers_are_refused_in_a_short_message(self):
+        # base 16 has no digit limit, but the messages wrote the id, kind or value in decimal: ValueError
+        # ("Exceeds the limit (4300 digits)") instead of a refusal
+        from riftstone import lot_ddo
+        big = "0x" + "f" * 3572
+        text = lot_ddo.to_yaml(lot_ddo.LotDdo(records=[self.enemy()]), "x")
+        for old, new in (("- id: 0", f"- id: {big}"), ("kind: 1", f"kind: {big}"),
+                         ("mUnitID: 65792", f"mUnitID: {big}"), ("mUnitID: 65792", f"mUnitID: -{big}")):
+            self.assertIn(old, text)
+            with self.assertRaises(ParamError) as e:
+                lot_ddo.yaml_to_bytes(text.replace(old, new, 1), "l.yaml")
+            self.assertLess(len(str(e.exception)), 200)
+        for rid, kind in ((int(big, 16), 1), (0, int(big, 16))):
+            rec = self.enemy(rid)
+            rec.kind = kind
+            with self.assertRaises(FormatError) as e:
+                lot_ddo.build(lot_ddo.LotDdo(records=[rec]))
+            self.assertLess(len(str(e.exception)), 200)
 
 
 class ImportTest(unittest.TestCase):

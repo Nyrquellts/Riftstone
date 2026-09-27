@@ -4,13 +4,17 @@
 
 Builds throwaway "games": harness.exe copied in as DDDA.exe (or DDO.exe, or a launcher), the loader,
 nativePC\\ and riftstone\\overlay\\ with marker files, and checks every rule the loader promises:
-overlay redirection and write pass-through, missing files and the texture stand-in, the import table
-put back after start-up, plugins, crash / fatal-error / hang reports, report rotation, plugin
-quarantine and safe mode, live stats in shared memory (with real Direct3D 9 frames when the machine
-can draw), the window fixes, save backups, why the game closed (each close path, and the next start's
-account of it), the in-game diagnostics panel (drawn over real frames and read back: where it is, what it
-shows, that the game's drawing state survives it and a Reset, and when it must draw nothing), the Direct3D 9
-side (the textures and buffers the game holds, by pool; [d3d9] chain with a stand-in DLL and every way it is
+overlay redirection and write pass-through, missing files and the texture stand-in (also asked for by
+32 threads at once), the import table put back after start-up and a plugin's own import hook left in
+place, a chained dinput8 that leads back to the loader refused, plugins, crash / fatal-error / hang
+reports (a stack overflow's too, and one crash through a module's chaining filter), crash reports
+switched off, report rotation, plugin quarantine (a file name with '=' too) and safe mode, the last
+session's record after a clean exit, live stats in shared memory (with real Direct3D 9 frames when the
+machine can draw; enemy_cap under another name), the window fixes, save backups (next to folders the
+loader did not make), why the game closed (each close path, and the next start's account of it), the
+in-game diagnostics panel (drawn over real frames and read back: where it is, what it shows, that the
+game's drawing state survives it and a Reset, and when it must draw nothing), the Direct3D 9 side (the
+textures and buffers the game holds, by pool; [d3d9] chain with a stand-in DLL and every way it is
 refused; with DXVK when a copy is at hand, what managed textures cost the address space under each), the
 large-address flag and the memory pressure watch, and pass-through in programs that are not the game. The
 panel's frames are saved as native\\loader\\out\\overlay-proof*.png.
@@ -98,14 +102,22 @@ def game(root: Path, exe: str = "DDDA.exe", proxy: bool = True, ini: str = "", p
     return root
 
 
+TIMED_OUT = -999                            # run(): the stand-in did not end within 90 s (killed)
+
+
 def run(root: Path, *args: str, exe: str = "DDDA.exe") -> tuple[int, dict[str, str], str]:
-    p = subprocess.run([str(root / exe), *args], cwd=root, capture_output=True, text=True, timeout=90,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        p = subprocess.run([str(root / exe), *args], cwd=root, capture_output=True, text=True, timeout=90,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        code, out = p.returncode, p.stdout
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        code = TIMED_OUT
     lines = {}
-    for line in p.stdout.splitlines():
+    for line in out.splitlines():
         key, _, value = line.partition(" ")
         lines[key] = value
-    return p.returncode, lines, p.stdout
+    return code, lines, out
 
 
 def log_of(root: Path) -> str:
@@ -119,6 +131,14 @@ def reports(root: Path, kind: str) -> list[Path]:
 
 def is_crash_code(code: int) -> bool:
     return code in (0xC0000005, -1073741819)
+
+
+def ntstatus(code: int) -> int:
+    """A process exit code as the unsigned NTSTATUS it carries (0xC00000FD, not -1073741571)."""
+    return code & 0xFFFFFFFF
+
+
+STACK_OVERFLOW = 0xC00000FD
 
 
 def test_files(work: Path) -> None:
@@ -249,6 +269,197 @@ def test_crash(work: Path) -> None:
         check("what it means" in text, "the report explains what the message means")
     check("fatal    the game showed" in log_of(root), "loader.log records the fatal error")
     check(_session(root).get("end") == "fatal-error", "runtime-state.ini: the session ended with the fatal error")
+
+
+def test_stack_overflow(work: Path) -> None:
+    print("a stack overflow (almost no stack is left on the crashing thread; the report is written from another)")
+    root = game(work / "overflow")
+    code, r, raw = run(root, "stackoverflow")
+    check(ntstatus(code) == STACK_OVERFLOW,
+          f"the process ends with the stack overflow itself, not a second fault in the report writer (got {ntstatus(code):#x})")
+    check("game-filter-called" in raw, "the game's own crash filter still runs after the report")
+    found = reports(root, "crash")
+    text = found[0].read_text(encoding="utf-8", errors="replace") if found else ""
+    rep = runtime.parse_report(text)
+    check(len(found) == 1 and rep["kind"] == "crash" and bool(rep["exception"])
+          and rep["exception"]["name"] == "STACK_OVERFLOW" and "DDDA.exe+0x" in rep["exception"]["where"]
+          and "EIP=" in text, f"one crash report ({len(found)}), not empty: STACK_OVERFLOW in DDDA.exe, the registers")
+    words = text.split("stack words")[-1].split("\nmemory")[0]
+    check(bool(rep["stack"]) and rep["stack"][0]["where"].startswith("DDDA.exe+0x") and words.count("DDDA.exe+0x") >= 2
+          and "(start-up)" in text and "address space used" in text and "\nmodules" in text,
+          "the report has the stack (the faulting frame; the recursion's return addresses among the stack words), "
+          "start-up, the memory headroom and the modules")
+    dumps = sorted((root / "riftstone/logs").glob("crash-*.dmp"))
+    check(len(dumps) == 1 and dumps[0].stat().st_size > 4096, "its minidump is written")
+    note = root / "riftstone/logs/last-crash.txt"
+    body = note.read_text(encoding="utf-8", errors="replace") if note.is_file() else ""
+    check("kind=crash" in body and "uptime_ms=" in body and "report=" in body and "crash-" in body,
+          "the crash note for the next start is complete: kind, uptime, report")
+    run(root, "files")
+    # the uptime is the crashing run's, in whole seconds: 0 on an idle machine, 2 seen under load
+    check(re.search(r"last run ended in a crash after \d+ s \(during start-up\)", log_of(root)) is not None,
+          "the next start reads the note and counts a start-up crash")
+    print("two start-up stack overflows in a row: safe mode")
+    root = game(work / "overflow-safe", plugins=("marker_plugin.asi",))
+    run(root, "stackoverflow")
+    run(root, "stackoverflow")
+    (root / "riftstone/plugins/marker_plugin.loaded").unlink(missing_ok=True)
+    code, r, _ = run(root, "files")
+    check("SAFE MODE" in log_of(root) and runtime.runtime_state(root)["safe_mode"]
+          and not (root / "riftstone/plugins/marker_plugin.loaded").exists(),
+          "the third start is in safe mode: no plugins, no overlay")
+    print("a stack overflow inside a plugin, twice: quarantine")
+    root = game(work / "overflow-plugin", plugins=("crash_plugin.asi",))
+    code, r, _ = run(root, "plugindeep")
+    found = reports(root, "crash")
+    text = found[0].read_text(encoding="utf-8", errors="replace") if found else ""
+    check(ntstatus(code) == STACK_OVERFLOW and "fault in    plugin crash_plugin.asi" in text,
+          "the report says the stack ran out inside crash_plugin.asi")
+    run(root, "plugindeep")
+    code, r, _ = run(root, "plugindeep")
+    check("crash_plugin.asi QUARANTINED" in log_of(root) and r.get("crash-plugin") == "absent" and code == 4,
+          "two start-up stack overflows in the plugin quarantine it, and the game runs")
+
+
+def test_filter_chain(work: Path) -> None:
+    print("a module that sets its own crash filter after the loader's and passes crashes on to it")
+    root = game(work / "filter-chain")
+    code, r, raw = run(root, "chainfilter")
+    found = reports(root, "crash")
+    dumps = list((root / "riftstone/logs").glob("crash-*.dmp"))
+    check(r.get("module-filter-set") == "over-another" and r.get("adopted") == "yes",
+          "the module's filter replaced the loader's, and the loader took it in to call after its report")
+    check(len(found) == 1 and len(dumps) == 1, f"one crash: one report and one minidump (got {len(found)} and {len(dumps)})")
+    check("module-filter 1" in raw and "module-filter 2" not in raw, "the module's filter ran once")
+    check(ntstatus(code) == 0xC0000005,
+          f"the process ends with the access violation, not a stack overflow of two filters calling each other "
+          f"(got {ntstatus(code):#x})")
+
+
+def test_crash_reports_off(work: Path) -> None:
+    print("crash reports switched off ([loader] crash_reports = 0)")
+    root = game(work / "crash-off", ini="[loader]\ncrash_reports = 0\n")
+    code, r, raw = run(root, "crash")
+    check("game-filter-called" in raw, "the game's own crash filter still runs: its call reaches Windows")
+    check(is_crash_code(code) and not reports(root, "crash") and "hook     KERNEL32.dll!SetUnhandledExceptionFilter" not in log_of(root),
+          "no report, and SetUnhandledExceptionFilter is left unhooked")
+
+
+def test_foreign_hooks(work: Path) -> None:
+    print("a plugin that hooks one of the game's imports itself (CreateFileW, passing calls on to the loader's hook)")
+    root = game(work / "foreign-hook", plugins=("chain_plugin.asi",))
+    code, r, raw = run(root, "files")
+    log = log_of(root)
+    calls = int(r.get("chain-calls", "0") or 0)
+    check(code == 0 and r.get("relative-W") == "OVERLAY-EM0100" and calls >= 2,
+          f"the game's CreateFileW goes through the plugin's hook, then the loader's: the overlay serves it ({calls} "
+          f"calls through the plugin), and the game runs (exit {ntstatus(code):#x})")
+    check("CreateFileW was reset" not in log and any("CreateFileW" in s and "left in place" in s for s in log.splitlines()),
+          "loader.log: the plugin's hook is left in place, not taken for the DRM restoring the table")
+    check(r.get("relative-A") == "OVERLAY-EM0100" and r.get("missing-tex") == "size=52 magic=TEX word1=20000099",
+          "CreateFileA and the texture stand-in still work")
+
+
+def test_chain_self(work: Path) -> None:
+    print("[loader] chain naming the loader itself, or a DLL that forwards back to it")
+    root = game(work / "chain-self", ini="[loader]\nchain = dinput8.dll\n")
+    code, r, _ = run(root, "files")
+    log = log_of(root)
+    check(code == 0 and r.get("dinput") == "ok",
+          f"chain = dinput8.dll: DirectInput8Create does not call itself; the system dinput8 answers (exit {ntstatus(code):#x})")
+    check("chain    " in log and "the Riftstone loader itself" in log, "loader.log says the chain was refused, and why")
+    root = game(work / "chain-forward", ini="[loader]\nchain = fwd_chain.dll\n")
+    shutil.copy(OUT / "fwd_chain.dll", root / "fwd_chain.dll")
+    code, r, _ = run(root, "files")
+    check(code == 0 and r.get("dinput") == "ok" and "the Riftstone loader itself" in log_of(root),
+          f"a chained DLL whose DirectInput8Create forwards back to the loader is refused too (exit {ntstatus(code):#x})")
+
+
+def test_plugin_names(work: Path) -> None:
+    odd = "crash=plugin.asi"
+    print(f"a plugin whose file name is no ini key as it stands ({odd}): quarantine still counts")
+    root = game(work / "quarantine-eq", plugins=("marker_plugin.asi",))
+    shutil.copy(OUT / "crash_plugin.asi", root / "riftstone/plugins" / odd)
+    # What an older loader left: the name as its own key, which the ini reader splits at the first '='.
+    (root / "riftstone/runtime-state.ini").write_bytes(
+        b"[strikes]\r\ncrash=plugin.asi=1\r\ncrash=plugin.asi=1\r\n[strikes_file]\r\ncrash=plugin.asi=52-0000000000000000\r\n")
+    code, r, _ = run(root, "plugincrash", odd)
+    check(r.get("crash-plugin") == "loaded" and is_crash_code(code), f"{odd} crashed the stand-in game")
+    code, r, _ = run(root, "plugincrash", odd)
+    code, r, _ = run(root, "plugincrash", odd)
+    log = log_of(root)
+    check(f"plugin   {odd} was at fault in a start-up crash (2 in a row)" in log,
+          "its second start-up crash is counted as the second in a row")
+    check(f"{odd} QUARANTINED" in log and r.get("crash-plugin") == "absent" and code == 4,
+          f"{odd} is quarantined after two start-up crashes and skipped; the game runs")
+    state = (root / "riftstone/runtime-state.ini").read_text(encoding="cp1252", errors="replace")
+    check(not any(line.startswith("crash=") for line in state.splitlines()) and "~" + odd.encode().hex() in state,
+          "runtime-state.ini keeps it under the name's own key (~ and its hex); no line under the part before '=' is "
+          "added each run, and an older loader's such lines are gone")
+    run(root, "files")
+    check(f"plugin   {odd} skipped: quarantined" in log_of(root), "the next start still skips it")
+
+    legacy = "crash_é.asi"                     # outside printable ASCII: its key is ~ and hex now as well
+    print(f"a quarantine an older loader wrote under a bare name that is not plain ASCII ({ascii(legacy)})")
+    root = game(work / "quarantine-legacy")
+    (root / "riftstone/plugins").mkdir(parents=True, exist_ok=True)
+    plugin = root / "riftstone/plugins" / legacy
+    shutil.copy(OUT / "crash_plugin.asi", plugin)
+    st = plugin.stat()
+    ft = st.st_mtime_ns // 100 + 116444736000000000          # FILETIME, as the loader's file identity has it
+    ident = f"{st.st_size & 0xFFFFFFFF}-{ft >> 32:08x}{ft & 0xFFFFFFFF:08x}"
+    (root / "riftstone/runtime-state.ini").write_bytes(f"[quarantine]\r\n{legacy}={ident}\r\n".encode("cp1252"))
+    code, r, _ = run(root, "plugincrash", legacy)
+    state = (root / "riftstone/runtime-state.ini").read_text(encoding="cp1252", errors="replace")
+    check(r.get("crash-plugin") == "absent" and code == 4 and f"~{legacy.lower().encode().hex()}={ident}" in state
+          and f"{legacy}=" not in state,
+          "it is still honoured (the plugin is skipped), and moved to the name's new key")
+
+
+def test_state_after_clean_exit(work: Path) -> None:
+    print("a clean session, then a start whose stack holds old data ([loader] test_stack_fill, the harness's way in)")
+    root = game(work / "state-clean")
+    run(root, "files")
+    ini = root / "riftstone_loader.ini"
+    ini.write_text(merge_ini(ini.read_text(), "[loader]\ntest_stack_fill = 1\n"))
+    code, r, _ = run(root, "files")
+    last = runtime.runtime_state(root)["last_session"]
+    check(code == 0 and last.get("end") == "unknown" and last.get("clean") == "1" and "report" not in last,
+          f"[last_session] after a clean session names no report (got {ascii(last.get('report', ''))[:40]})")
+
+
+def test_guard_race(work: Path) -> None:
+    print("missing textures asked for by many threads at the same moment")
+    root = game(work / "guard-race")
+    got = []
+    for _ in range(5):
+        shutil.rmtree(root / "riftstone/standin", ignore_errors=True)
+        code, r, _ = run(root, "guardrace")
+        got.append(r.get("race-ok"))
+    check(all(g == "32/32" for g in got),
+          f"32 threads opening missing textures at once all get the stand-in, in each of 5 fresh starts ({got})")
+
+
+def test_enemy_cap_renamed(work: Path) -> None:
+    print("enemy_cap under another file name (01_enemy_cap.asi): found by its export")
+    root = game(work / "cap-renamed", harness="harness_ddda.exe")
+    (root / "riftstone/plugins").mkdir(parents=True, exist_ok=True)
+    shutil.copy(OUT / "cap_plugin.asi", root / "riftstone/plugins/01_enemy_cap.asi")
+    _as_build_2364871(root)
+    p = subprocess.Popen([str(root / "DDDA.exe"), "live", "engine-cap"], cwd=root, stdout=subprocess.PIPE, text=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    live = None
+    try:
+        seen = _wait_line(p, "ready")
+        time.sleep(1.5)
+        live = runtime.read_live(p.pid)
+    finally:
+        (root / "done").write_text("")
+        p.wait(timeout=60)
+    check("engine stand-in" in seen and live is not None and live["enemies_active"] == 17 and live["enemy_slots"] == 30
+          and live["enemies_usable"] == 30,
+          "the live view reads enemy_cap's 30 slots (17 in use), not the vanilla ten "
+          f"(got {live and live['enemies_active']} of {live and live['enemy_slots']})")
 
 
 def test_rotation(work: Path) -> None:
@@ -437,6 +648,53 @@ def test_saves(work: Path) -> None:
     made = sorted(d for d in target.iterdir() if d.is_dir())
     check(len(made) == 2 and (made[-1] / "DDDA.sav").read_bytes() == b"SAVE-3" * 100,
           "a changed save is copied, and only the newest [saves] keep backups stay")
+
+
+def _stamps(target: Path) -> list[str]:
+    """The backup folders the loader makes: <YYYYMMDD-HHMMSS>, or with -<n> (runtime.backup_saves)."""
+    return sorted(d.name for d in target.iterdir() if d.is_dir() and re.fullmatch(r"\d{8}-\d{6}(-\d+)?", d.name))
+
+
+def test_saves_foreign(work: Path) -> None:
+    print("save backups next to folders the loader did not make")
+    remote = work / "steam-remote-foreign"
+    remote.mkdir(parents=True)
+    (remote / "DDDA.sav").write_bytes(b"SAVE-A" * 100)
+    target = work / "save-backups-long"
+    long_name = target / "notes on this character before the Everfall, kept by hand, do not delete"
+    long_name.mkdir(parents=True)
+    ini = f"[saves]\nbackup = 1\nkeep = 20\nsource = {remote}\ntarget = {target}\n"
+    root = game(work / "saves-long", ini=ini)
+    code, r, _ = run(root, "files")
+    check(code == 0 and r.get("relative-A") == "OVERLAY-EM0100" and len(_stamps(target)) == 1 and long_name.is_dir(),
+          f"a {len(long_name.name)}-character folder name in the backup folder: the game starts and the save is "
+          f"backed up (exit {ntstatus(code):#x})")
+
+    # Folders of the user's that sort before the time stamps ('(', '!', '0') and after them ('z').
+    target = work / "save-backups-user"
+    mine, bang, zero, later = (target / n for n in ("(my own copy)", "!keep", "0 old stuff", "zz sorted after"))
+    for d in (mine, bang, zero, later):
+        d.mkdir(parents=True)
+    (mine / "DDDA.sav").write_bytes(b"MINE" * 10)
+    (mine / "notes.txt").write_text("keep me")
+    (later / "DDDA.sav").write_bytes(b"OTHER" * 10)
+    root = game(work / "saves-user", ini=f"[saves]\nbackup = 1\nkeep = 20\nsource = {remote}\ntarget = {target}\n")
+    run(root, "files")
+    time.sleep(1.1)
+    run(root, "files")
+    check(len(_stamps(target)) == 1,
+          f"an unchanged save is not copied again, though a folder of the user's sorts after the backups ({_stamps(target)})")
+    root = game(work / "saves-user-keep1", ini=f"[saves]\nbackup = 1\nkeep = 1\nsource = {remote}\ntarget = {target}\n")
+    for n in (2, 3):
+        time.sleep(1.1)
+        (remote / "DDDA.sav").write_bytes(f"SAVE-{n}".encode() * 100)
+        run(root, "files")
+    left = _stamps(target)
+    check(len(left) == 1 and (target / left[0] / "DDDA.sav").read_bytes() == b"SAVE-3" * 100,
+          f"keep = 1: only the newest backup stays ({left})")
+    check(all(d.is_dir() for d in (mine, bang, zero, later)) and (mine / "DDDA.sav").read_bytes() == b"MINE" * 10
+          and (mine / "notes.txt").read_text() == "keep me" and (later / "DDDA.sav").is_file(),
+          "folders the loader did not make are never counted as backups or deleted, nor their files")
 
 
 _USER32 = None
@@ -1408,27 +1666,179 @@ def test_engine(work: Path) -> None:
         check(p.returncode == 0, f"engine harness exits 0 (got {p.returncode})")
 
 
+def _archive(entries) -> bytes:
+    """A Dark Arisen archive (arc.py's layout) of (name, extension, data) entries compressed as the game's are,
+    or (name, extension, data, stream) with a zlib stream of the test's own."""
+    from riftstone import arc, typemap
+    out = []
+    for e in entries:
+        name, tid = e[0].encode("latin-1"), typemap.type_for_extension(e[1])
+        out.append(arc.Entry(name, tid, len(e[2]), e[3]) if len(e) > 3 else arc.Entry.from_data(name, tid, e[2]))
+    return arc.Archive(out).build()
+
+
+def _fnv(data: bytes) -> str:
+    h = 14695981039346656037
+    for b in data:
+        h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return f"size={len(data)} fnv={h:016x}"
+
+
+def test_from_archives(work: Path) -> None:
+    import random
+    import zlib
+
+    print("the archive guard: a resource asked for loose before its archive was read gets its own bytes")
+    rng = random.Random(2026)
+    credits = "".join(f"CREDIT LINE {i} -- the Arisen and the pawns\n" for i in range(40)).encode()
+    variant = credits.replace(b"CREDIT", b"VARIANT")
+    texture = b"TEX\0" + bytes(rng.randrange(256) for _ in range(3000))
+    noise = bytes(rng.randrange(256) for _ in range(70000))                     # stored blocks: nothing repeats
+    words = (b"the dragon took the heart " * 400)                               # fixed codes
+    big = b"".join(bytes(rng.randrange(256) for _ in range(rng.randrange(1, 40))) * rng.randrange(1, 60)
+                   for _ in range(12000))                                      # dynamic codes, far matches
+    fixed = zlib.compressobj(9, zlib.DEFLATED, 15, 9, zlib.Z_FIXED)
+    fixed_stream = fixed.compress(words) + fixed.flush()
+    damaged = bytearray(zlib.compress(credits, 6))
+    damaged[len(damaged) // 2] ^= 0x55
+    stage802 = _archive([("id\\credit_02\\credit2_01_99", "gmd", credits),
+                         ("rom\\model\\archived_BM", "tex", texture),
+                         ("id\\blob\\stored", "gmd", noise, zlib.compress(noise, 0)),
+                         ("id\\blob\\fixed", "gmd", words, fixed_stream),
+                         ("id\\blob\\big", "gmd", big, zlib.compress(big, 9)),
+                         ("id\\blob\\bad", "gmd", credits, bytes(damaged))])
+    stage803 = _archive([("id\\credit_02\\credit2_01_99", "gmd", variant)])
+
+    def stand_in(name: str, ini: str = "", exe: str = "DDDA.exe", overlay: bytes | None = None) -> Path:
+        root = game(work / name, exe=exe, ini=ini)
+        for rel, data in (("nativePC/rom/stage/stage800/stage802.arc", stage802),
+                          ("nativePC/rom/stage/stage800/stage803.arc", stage803)):
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_bytes(data)
+        if overlay is not None:
+            f = root / "riftstone/overlay/rom/stage/stage800/stage802.arc"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(overlay)
+        return root
+
+    ask = ["credits=nativePC\\id\\credit_02\\credit2_01_99.gmd", "texture=nativePC\\rom\\model\\archived_BM.tex",
+           "stored=nativePC\\id\\blob\\stored.gmd", "fixed=nativePC\\id\\blob\\fixed.gmd",
+           "big=nativePC\\id\\blob\\big.gmd", "bad=nativePC\\id\\blob\\bad.gmd",
+           "absent=nativePC\\id\\nothing\\here.gmd", "wrongtype=nativePC\\id\\credit_02\\credit2_01_99.mrl",
+           "archive=nativePC\\rom\\stage\\stage800\\stage809.arc", "greytex=nativePC\\rom\\model\\missing_BM.tex"]
+    root = stand_in("fromarc")
+    code, r, _ = run(root, "resources", *ask)
+    check(code == 0, f"harness exits 0 (got {code})")
+    check(r.get("credits") == _fnv(credits), "the ending's credits text, never loose, is read from its archive (stage802.arc)")
+    check(r.get("texture") == _fnv(texture), "a texture its archive holds is served as it is, not the grey stand-in")
+    check(r.get("stored") == _fnv(noise), "a payload of stored blocks decodes (70,000 bytes)")
+    check(r.get("fixed") == _fnv(words), "a payload of fixed codes decodes")
+    check(r.get("big") == _fnv(big), f"a payload of dynamic codes and far matches decodes ({len(big):,} bytes)")
+    check(r.get("bad", "").startswith("<cannot open>"), "a damaged payload is not served: the open fails as before")
+    check(r.get("absent", "").startswith("<cannot open>"), "a resource no archive holds still fails")
+    check(r.get("wrongtype", "").startswith("<cannot open>"), "the name with another type's extension still fails")
+    check(r.get("archive", "").startswith("<cannot open>"), "a missing .arc is never answered from inside another")
+    check(r.get("greytex", "").startswith("size=52 "), "a texture no archive holds still gets the 52-byte stand-in")
+    log = log_of(root)
+    check("gets its own bytes from that archive" in log, "loader.log says the guard is on")
+    check("credit2_01_99.gmd was not read in yet" in log and "stage802.arc" in log,
+          "loader.log names the resource and the archive its bytes came from")
+    check("read the directories of" in log, "loader.log says how long reading the archives' directories took")
+    kept = root / "riftstone/standin/nativePC/id/credit_02/credit2_01_99.gmd"
+    check(kept.is_file() and kept.read_bytes() == credits, "the bytes are kept under riftstone\\standin\\nativePC")
+    code, r, _ = run(root, "resources", ask[0])
+    check(r.get("credits") == _fnv(credits), "the next start serves the kept copy again")
+
+    print("the archive the game is reading comes first")
+    code, r, _ = run(root, "resources", "open:nativePC\\rom\\stage\\stage800\\stage803.arc", ask[0])
+    check(r.get("credits") == _fnv(variant), "just after stage803.arc was opened, its copy of the resource is served")
+    code, r, _ = run(root, "resources", "open:nativePC\\rom\\stage\\stage800\\stage802.arc", ask[0])
+    check(r.get("credits") == _fnv(credits), "just after stage802.arc was opened, its copy is served")
+
+    print("a mod's copy of the archive, the switch, Online")
+    modded = _archive([("id\\credit_02\\credit2_01_99", "gmd", credits.upper())])
+    root = stand_in("fromarc-overlay", overlay=modded)
+    code, r, _ = run(root, "resources", ask[0])
+    check(r.get("credits") == _fnv(credits.upper()), "an archive in riftstone\\overlay is read instead of the game's")
+    root = stand_in("fromarc-off", ini="[guard]\nfrom_archives = 0\n")
+    code, r, _ = run(root, "resources", ask[0], ask[1])
+    check(r.get("credits", "").startswith("<cannot open>") and r.get("texture", "").startswith("size=52"),
+          "[guard] from_archives = 0: the open fails as before (a texture still gets the stand-in)")
+    root = stand_in("fromarc-ddo", exe="DDO.exe")
+    code, r, _ = run(root, "resources", ask[0], exe="DDO.exe")
+    check(r.get("credits", "").startswith("<cannot open>") and "Online's archives are encrypted" in log_of(root),
+          "Online (encrypted archives): not answered, and loader.log says why")
+
+    print("16 threads asking at once")
+    root = stand_in("fromarc-race")
+    code, r, _ = run(root, "resourcerace", "nativePC\\id\\blob\\big.gmd")
+    check(r.get("resrace") == f"opened=16 same=16 {_fnv(big)}", f"all 16 get the same bytes ({r.get('resrace')})")
+
+    from riftstone import arc
+    from riftstone.game import find_game
+    try:
+        real = find_game("ddda").native / "rom" / "stage" / "stage800" / "stage802.arc"
+    except Exception:  # noqa: BLE001 -- no game on this PC
+        real = None
+    if real is None or not real.is_file():
+        print("  skip  no Dark Arisen here: the real archive's streams were not decoded")
+        return
+    print("the game's own archive (stage802.arc, copied into a stand-in; nothing kept)")
+    root = game(work / "fromarc-real")
+    (root / "nativePC/rom/stage/stage800").mkdir(parents=True, exist_ok=True)
+    shutil.copy(real, root / "nativePC/rom/stage/stage800/stage802.arc")
+    a = arc.Archive.parse(real.read_bytes())
+    picked, seen = [], set()
+    for e in a.entries:
+        ext = e.label.rsplit(".", 1)[1]
+        if ext.lower() == "arc" or len(e.name) > 60:
+            continue
+        if e.name == b"id\\credit_02\\credit2_01_99" or (ext not in seen and len(picked) < 40):
+            seen.add(ext)
+            picked.append(e)
+    labels = [f"r{i}=nativePC\\{e.name.decode('latin-1')}.{e.label.rsplit('.', 1)[1]}" for i, e in enumerate(picked)]
+    code, r, _ = run(root, "resources", *labels)
+    good = [i for i, e in enumerate(picked) if r.get(f"r{i}") == _fnv(e.data())]
+    types = sorted({e.label.rsplit(".", 1)[1] for e in picked})
+    check(len(good) == len(picked) and any(e.name == b"id\\credit_02\\credit2_01_99" for e in picked),
+          f"{len(good)} of {len(picked)} of its resources ({len(types)} types, the credits text among them) come back "
+          "byte for byte from the game's own zlib streams")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--work")
-    ap.add_argument("--only", help="comma-separated test names (files,reset,crash,rotation,quarantine,safe,live,window,"
-                                   "saves,exit,overlay,d3d9,chain,dxvk,memory,other,engine)")
+    ap.add_argument("--only", help="comma-separated test names (files,reset,hooks,dinputchain,crash,overflow,"
+                                   "filters,crashoff,rotation,quarantine,names,safe,state,live,cap,guard,window,"
+                                   "saves,foreignsaves,exit,overlay,d3d9,chain,dxvk,memory,other,engine,archives)")
     a = ap.parse_args()
+    sys.stdout.reconfigure(errors="backslashreplace")    # a label quoting a damaged value must not stop the run
     need = ["harness.exe", "harness_ddda.exe", "dinput8.dll", "riftstone_loader.dll", "marker_plugin.asi",
-            "crash_plugin.asi", "chain_d3d9.dll"]
+            "crash_plugin.asi", "chain_plugin.asi", "cap_plugin.asi", "fwd_chain.dll", "chain_d3d9.dll"]
     if not all((OUT / n).is_file() for n in need):
         print("the loader is not built; run native\\loader\\build.cmd")
         return 1
+    # Every stand-in game inherits this: a crash never shows Windows' error box.
+    ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)          # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX
     base = Path(a.work) if a.work else Path(tempfile.mkdtemp(prefix="rs-loader-"))
     base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="run-", dir=base))
-    tests = {"files": test_files, "reset": test_reset_plugins_off_addon, "crash": test_crash,
-             "rotation": test_rotation, "quarantine": test_quarantine, "safe": test_safe_mode, "live": test_live,
-             "window": test_window, "saves": test_saves, "exit": test_exit, "overlay": test_overlay,
-             "d3d9": test_d3d9, "chain": test_chain, "dxvk": test_dxvk, "memory": test_memory,
-             "other": test_other_programs, "engine": test_engine}
+    tests = {"files": test_files, "reset": test_reset_plugins_off_addon, "hooks": test_foreign_hooks,
+             "dinputchain": test_chain_self, "crash": test_crash, "overflow": test_stack_overflow,
+             "filters": test_filter_chain, "crashoff": test_crash_reports_off, "rotation": test_rotation,
+             "quarantine": test_quarantine, "names": test_plugin_names, "safe": test_safe_mode,
+             "state": test_state_after_clean_exit, "live": test_live, "cap": test_enemy_cap_renamed,
+             "guard": test_guard_race, "window": test_window, "saves": test_saves, "foreignsaves": test_saves_foreign,
+             "exit": test_exit, "overlay": test_overlay, "d3d9": test_d3d9, "chain": test_chain, "dxvk": test_dxvk,
+             "memory": test_memory, "other": test_other_programs, "engine": test_engine,
+             "archives": test_from_archives}
     wanted = a.only.split(",") if a.only else list(tests)
     check(runtime.loader_version(OUT / "dinput8.dll") == VERSION, f"the built loader carries its version tag ({VERSION})")
+    stray = [f"{p.name}:{i}" for p in sorted(OUT.parent.glob("*.cpp"))
+             for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
+             if re.search(r"(?<![\d.])\d+\.\d+\.\d+(?![\d.])", line)]
+    check(not stray, "the version is written once, in runtime.h: no loader source spells one out (the panel's header "
+                     f"line, the log and the reports take RIFTSTONE_VERSION_A) {stray}")
     for name in wanted:
         tests[name](work)
     print(f"\n{'ALL PASSED' if not FAILS else f'{len(FAILS)} FAILED'}  (work: {work})")

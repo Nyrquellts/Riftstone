@@ -119,8 +119,9 @@ and says why in `riftstone\logs\enemy_skins.log`. Original code, no third-party 
 
 DDO's chimeras (`EM015200`–`EM015204` in its `rom\EM`) are DDDA's chimera model with other maps.
 The UV layouts are identical, checked side by side on the skin, snake/goat and face sheets.
-`tools/ddo_skins.py` reads DDO's client through the `ddon` toolkit (`<path>`) and writes a folder
-of textures for `riftstone skin make`.
+`src/riftstone/ddoskins.py` makes them from the player's own DDO client (Riftstone's ARCC reader, the key
+read from that client; the `ddon` toolkit as a fallback): `riftstone monster convert "White Chimera" --into
+chimera --as-skin N` in one step, or `tools/ddo_skins.py` writes a folder of textures for `riftstone skin make`.
 
 | Variant | DDO archive | How it is made | Faithful? |
 |---|---|---|---|
@@ -129,14 +130,15 @@ of textures for `riftstone skin make`.
 | Blaze Chimera | `EM015204` | the same masks; scorched fur with ember light added where the mask is brightest | approximation, not animated |
 
 The textures are game data from the owner's clients. They stay in the mod folder (`mods/` is
-git-ignored) and in scratch, never in git.
+git-ignored) and in scratch, never in git, and never in a package: making a skin records the `ddo-skin`
+recipe (`sources.py`), a package carries only that, and each player's Riftstone makes the maps from their own
+Online client (`docs/legal.md`; the owner's three skins replay byte for byte).
 
 ## Using it
 
 ```bat
-python tools\ddo_skins.py white C:\temp\white
 riftstone new "mods\DDO Chimeras"
-riftstone skin make chimera 1 --textures C:\temp\white --title "White Chimera" --source "DDO em015202" --mod "mods\DDO Chimeras"
+riftstone monster convert "White Chimera" --into chimera --as-skin 1 --mod "mods\DDO Chimeras"
 riftstone encounter 443 chimera --count 1 --at 1329,-1345,-1271 --like 5 --skin 1 --mod "mods\DDO Chimeras"
 riftstone skin list --mod "mods\DDO Chimeras"
 ```

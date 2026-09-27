@@ -445,6 +445,18 @@ class DdoParamsTest(unittest.TestCase):
             with self.assertRaises(ParamError, msg=i):
                 ddo_params.yaml_to_bytes(t, "bad.yaml")
 
+    def test_yaml_long_hex_number(self):
+        # base 16 has no digit limit, but 3,572 hex digits are over 4,300 decimal ones: the range message
+        # printed the number and leaked int -> str's ValueError
+        big = "0x" + "f" * 3572
+        good = ddo_params.to_yaml(sample("cpe", fly=True))
+        for bad in (good.replace("エンチャントタイプ: 1", "エンチャントタイプ: " + big),
+                    good.replace("エンチャントタイプ: 1", "エンチャントタイプ: -" + big)):
+            self.assertNotEqual(bad, good)
+            with self.assertRaises(ParamError) as cm:
+                ddo_params.from_yaml(bad)
+            self.assertLess(len(str(cm.exception)), 200)
+
     def test_yaml_hostile_text(self):
         rng = random.Random(11)
         for m in (sample("cpe", fly=True), sample("sti"), sample("sal")):

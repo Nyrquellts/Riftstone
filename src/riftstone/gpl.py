@@ -114,7 +114,7 @@ class _Writer:
         self.out += _I.pack(v)
 
     def u32(self, v):
-        self.out += _U.pack(v & 0xFFFFFFFF)
+        self.out += _U.pack(v)            # out of range: struct.error, which build() reports (no silent wrap)
 
     def i16(self, v):
         self.out += _H.pack(v)
@@ -376,6 +376,44 @@ def _num(node, source, signed=True):
         raise ParamError(f"expected a whole number, not {node.text!r}", node.line, node.col, source) from None
 
 
+def _u32(node, source):
+    """An unsigned 32-bit field (mGroupList, mSetBit, pad): the writer would otherwise keep the low 32 bits."""
+    v = _num(node, source)
+    if not 0 <= v <= 0xFFFFFFFF:
+        raise ParamError(f"{v} does not fit an unsigned 32-bit field (0..4294967295)", node.line, node.col, source)
+    return v
+
+
+_TOP_KEYS = ("riftstone", "resource", "version", "mGroupList", "mSetBit", "mDLCNo", "groups")
+_LISTS = ("mUnitKindList", "mLayoutIDArray", "mAreaHitShapeList", "mLifeAreaArray", "mKillAreaList")
+_GROUP_KEYS = frozenset(("mGroupClass", "mGroup", "mPriority", "mIsDisableSplit", "mDLCNoBits", "mKillAreaType", *_LISTS,
+                         *(name for name, _tc in _COND_A + _COND_B + _COND_C)))
+_UNIT_KEYS = ("name", "isBelong")
+_LAYOUT_KEYS = ("mLayoutID", "mGroup", "mSplitX", "mSplitZ")
+_SHAPE_KEYS = ("mName", "mCheckAngle", "mCheckRange", "mCheckToward", "mAngleFlag", "mTowardFlag", "type", "mDecay",
+               "mIsNativeData")
+_SHAPE_TYPE_KEYS = {1: ("mHeight", "mBottom", "mVertex", "mConcaveCrossPos", "mFlgConvex", "mConcaveStatus"),
+                    2: ("mVertex",), 3: ("Position0", "Position1", "Radius", "pad")}
+
+
+def _only(node, known, what, source):
+    """Refuse a key the format does not have: a misspelled one was dropped without a word."""
+    for k, _v in node.items:
+        if k.text not in known:
+            raise ParamError(f"{what} has no field {k.text!r}", k.line, k.col, source)
+
+
+def _items(parent, key, source) -> list:
+    """The items of a list every group holds (to_yaml writes each one, [] when empty)."""
+    from .yamlish import Seq
+    node = parent.get(key)
+    if node is None:
+        raise ParamError(f"{key} is missing (a list; [] when empty)", parent.line, parent.col, source)
+    if not isinstance(node, Seq):
+        raise ParamError(f"{key} is a list", getattr(node, "line", None), getattr(node, "col", None), source)
+    return node.items
+
+
 def _f32(node, source):
     from .params import f32_bits
     from .yamlish import Scalar
@@ -404,6 +442,8 @@ def _shape_from(node, source):
          "type": _num(node.get("type"), source), "mDecay": _f32(node.get("mDecay"), source),
          "mIsNativeData": _num(node.get("mIsNativeData"), source)}
     t = s["type"]
+    if t in _SHAPE_TYPE_KEYS:
+        _only(node, _SHAPE_KEYS + _SHAPE_TYPE_KEYS[t], f"a type {t} area shape", source)
     if t == 1:
         s["mHeight"] = _f32(node.get("mHeight"), source)
         s["mBottom"] = _f32(node.get("mBottom"), source)
@@ -425,7 +465,7 @@ def _shape_from(node, source):
         from .yamlish import Seq
         if not isinstance(pad, Seq) or len(pad.items) != 3:
             raise ParamError("pad is 3 numbers", getattr(pad, "line", None), None, source)
-        s["pad"] = [_num(x, source) for x in pad.items]
+        s["pad"] = [_u32(x, source) for x in pad.items]
     else:
         raise ParamError(f"unknown area-shape type {t}", getattr(node, "line", None), None, source)
     return s
@@ -437,20 +477,23 @@ def _str(node, source):
         raise ParamError("expected a string", getattr(node, "line", None), None, source)
     if "\0" in node.text:
         raise ParamError("a name cannot contain a NUL", node.line, node.col, source)
+    try:
+        node.text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:        # a lone surrogate outside \udc80-\udcff (the escapes of stored bytes)
+        raise ParamError("a name holds a character that is not valid text (a lone surrogate)", node.line, node.col,
+                         source) from None
     return node.text
 
 
-def _maps(node, what, source):
-    """The items of a Seq, each required to be a Map (block); [] when node is missing."""
-    from .yamlish import Map, Seq
-    if node is None:
-        return []
-    if not isinstance(node, Seq):
-        raise ParamError(f"{what} list must be a list", getattr(node, "line", None), None, source)
-    for it in node.items:
+def _maps(parent, key, what, known, source):
+    """The items of one of a group's lists, each a block of exactly the fields ``known``."""
+    from .yamlish import Map
+    items = _items(parent, key, source)
+    for it in items:
         if not isinstance(it, Map):
             raise ParamError(f"{what} must be a block of fields", getattr(it, "line", None), None, source)
-    return node.items
+        _only(it, known, what, source)
+    return items
 
 
 def from_yaml(text: str, source: str | None = None) -> Gpl:
@@ -461,12 +504,13 @@ def from_yaml(text: str, source: str | None = None) -> Gpl:
     tag = doc.get("riftstone") if isinstance(doc, Map) else None
     if not isinstance(tag, Scalar) or tag.text != TAG:
         raise ParamError(f"not a Riftstone gpl file (expected 'riftstone: {TAG}')", 1, 1, source)
+    _only(doc, _TOP_KEYS, "a group list", source)
 
     def uints(key):
         node = doc.get(key)
         if not isinstance(node, Seq):
             raise ParamError(f"{key} is a list", getattr(node, "line", None), None, source)
-        return [_num(x, source) for x in node.items]
+        return [_u32(x, source) for x in node.items]
 
     gpl = Gpl(_num(doc.get("version"), source), uints("mGroupList"), uints("mSetBit"),
               _num(doc.get("mDLCNo"), source), [])
@@ -476,27 +520,28 @@ def from_yaml(text: str, source: str | None = None) -> Gpl:
     for gn in groups.items:
         if not isinstance(gn, Map):
             raise ParamError("each group is a block", getattr(gn, "line", None), None, source)
+        _only(gn, _GROUP_KEYS, "a group", source)
         g = {"mGroupClass": _num(gn.get("mGroupClass"), source),
              "mGroup": _num(gn.get("mGroup"), source), "mPriority": _num(gn.get("mPriority"), source),
              "mIsDisableSplit": _num(gn.get("mIsDisableSplit"), source), "mDLCNoBits": _num(gn.get("mDLCNoBits"), source)}
-        units = gn.get("mUnitKindList")
         g["mUnitKindList"] = [{"name": _str(u.get("name"), source), "isBelong": _num(u.get("isBelong"), source)}
-                              for u in _maps(units, "a unit kind", source)]
-        lays = gn.get("mLayoutIDArray")
-        g["mLayoutIDArray"] = [{k: _num(la.get(k), source) for k in ("mLayoutID", "mGroup", "mSplitX", "mSplitZ")}
-                               for la in _maps(lays, "a layout entry", source)]
+                              for u in _maps(gn, "mUnitKindList", "a unit kind", _UNIT_KEYS, source)]
+        g["mLayoutIDArray"] = [{k: _num(la.get(k), source) for k in _LAYOUT_KEYS}
+                               for la in _maps(gn, "mLayoutIDArray", "a layout entry", _LAYOUT_KEYS, source)]
         for name, _tc in _COND_A:
             g[name] = _num(gn.get(name), source)
-        ah = gn.get("mAreaHitShapeList")
-        g["mAreaHitShapeList"] = [_shape_from(s, source) for s in (ah.items if isinstance(ah, Seq) else [])]
+        g["mAreaHitShapeList"] = [_shape_from(s, source) for s in _items(gn, "mAreaHitShapeList", source)]
         for name, _tc in _COND_B:
             g[name] = _num(gn.get(name), source)
-        life = gn.get("mLifeAreaArray")
-        g["mLifeAreaArray"] = [[_shape_from(s, source) for s in (inner.items if isinstance(inner, Seq) else [])]
-                               for inner in (life.items if isinstance(life, Seq) else [])]
+        life = []
+        for inner in _items(gn, "mLifeAreaArray", source):
+            if not isinstance(inner, Seq):
+                raise ParamError("each entry of mLifeAreaArray is a list of shapes ([] when empty)",
+                                 getattr(inner, "line", None), getattr(inner, "col", None), source)
+            life.append([_shape_from(s, source) for s in inner.items])
+        g["mLifeAreaArray"] = life
         g["mKillAreaType"] = _num(gn.get("mKillAreaType"), source)
-        kill = gn.get("mKillAreaList")
-        g["mKillAreaList"] = [_shape_from(s, source) for s in (kill.items if isinstance(kill, Seq) else [])]
+        g["mKillAreaList"] = [_shape_from(s, source) for s in _items(gn, "mKillAreaList", source)]
         for name, _tc in _COND_C:
             g[name] = _num(gn.get(name), source)
         gpl.groups.append(g)

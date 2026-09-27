@@ -163,6 +163,9 @@ def from_yaml(text: str, source: str | None = None) -> Table:
     if not isinstance(tag, Scalar) or tag.text not in (IST_TAG, IMX_TAG):
         raise ParamError(f"not a Riftstone item table (expected 'riftstone: {IST_TAG}' or '{IMX_TAG}')", 1, 1, source)
     is_set = tag.text == IST_TAG
+    for k, _ in doc.items:                        # a misspelled key was passed over (version 0, silently)
+        if k.text not in ("riftstone", "resource", "version", "sets" if is_set else "recipes"):
+            raise ParamError(f"unknown top-level key {k.text!r}", k.line, k.col, source)
     t = Table(b"ist\0" if is_set else b"imx\0", 0)
     if doc.get("version") is not None:
         t.version = _num(doc.get("version"), "version", 0xFFFFFFFF, source)

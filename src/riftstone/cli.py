@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -11,7 +12,7 @@ from pathlib import Path
 
 from . import __version__, arc, arcfolder, fsmap, params, typemap, ui, xfs
 from .errors import RiftError
-from .game import KINDS, Game, detect_kind, find_game
+from .game import KEYWORDS, KINDS, Game, detect_kind, find_game
 
 QUICK = """\
 Start here
@@ -84,7 +85,7 @@ def _mod_game(folder) -> str | None:
     try:
         meta = json.loads((Path(folder) / "riftstone-mod.json").read_text(encoding="utf-8-sig"))
         return str(meta.get("game", "ddda"))
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, RecursionError):
         return None
 
 
@@ -148,11 +149,56 @@ def _inside_game(path: Path) -> Game | None:
 
 
 def _default_unpack_dir(arc_path: Path) -> tuple[Path, str | None]:
-    g = _inside_game(arc_path.resolve())
+    """An archive of a game -- in nativePC, or the originals and the overlay Riftstone keeps in the same
+    layout -- unpacks by its archive name under Documents\\Riftstone\\unpacked, not into the game folder;
+    anything else next to itself."""
+    p = arc_path.resolve()
+    g = _inside_game(p)
     if g is not None:
-        name = g.arc_name(arc_path)
-        return Path.home() / "Documents" / "Riftstone" / "unpacked" / name, name
+        for base in (g.native, g.vanilla_dir, g.overlay_dir):
+            if base.resolve() in p.parents:
+                name = p.relative_to(base.resolve()).with_suffix("").as_posix()
+                return Path.home() / "Documents" / "Riftstone" / "unpacked" / name, name
     return arc_path.with_suffix(""), None
+
+
+def _os_error(e: OSError) -> str:
+    """An OSError as one plain line: the file(s), then what the system said."""
+    if e.filename is not None and e.strerror:
+        return f"{e.filename}" + (f" -> {e.filename2}" if e.filename2 is not None else "") + f": {e.strerror}"
+    return str(e) or type(e).__name__
+
+
+def _keep_edits(out: Path, body: bytes, force: bool, instead: str) -> None:
+    """Before an editable form (a parameter file's YAML, a texture's DDS, a cell model in world space) is
+    written over `out`: an `out` that differs may hold edits, so it is kept as <out>.bak, as the other
+    direction keeps the binary it replaces; with that .bak taken too it is refused (`instead` says what else
+    to do).  force: overwritten, no .bak kept."""
+    if force or not out.is_file() or out.read_bytes() == body:
+        return
+    bak = out.with_name(out.name + ".bak")
+    if bak.exists():
+        raise RiftError(f"{out} differs from what would be written (edited?) and {bak.name} is taken; move one of "
+                        f"them aside, or {instead}")
+    os.replace(out, bak)
+    ui.info(f"previous {out.name} kept as {bak.name}")
+
+
+def _outputs(out: str | None, inputs: list[Path], default) -> list[Path]:
+    """Where each input's result goes: its default place, or -o; with several inputs -o is a folder that
+    gets each result under its default name (as unpack does), since one file cannot hold them all."""
+    if not out:
+        return [default(p) for p in inputs]
+    if len(inputs) == 1:
+        return [Path(out)]
+    if Path(out).is_file():
+        raise RiftError(f"-o {out}: with several inputs -o is the folder that gets each result, and {out} is a file")
+    targets = [Path(out) / default(p).name for p in inputs]
+    names = [t.name.lower() for t in targets]
+    twice = next((n for n in names if names.count(n) > 1), None)
+    if twice:
+        raise RiftError(f"two inputs would both become {Path(out) / twice}; convert them one at a time")
+    return targets
 
 
 def _resource_type_from_filename(path: Path) -> int | None:
@@ -215,10 +261,9 @@ def cmd_unpack(args) -> int:
 
 
 def cmd_pack(args) -> int:
-    for folder in args.folders:
-        folder = Path(folder)
+    folders = [Path(f).resolve() for f in args.folders]     # 'pack .' inside the folder: its real name
+    for folder, out in zip(folders, _outputs(args.out, folders, lambda f: f.with_suffix(".arc"))):
         r = arcfolder.pack(folder)
-        out = Path(args.out) if args.out else folder.with_suffix(".arc")
         g = _inside_game(out.resolve())
         if g is not None and g.native.resolve() in out.resolve().parents:
             raise RiftError("Riftstone does not overwrite the game's archives by hand. Put the folder's changes "
@@ -244,12 +289,18 @@ def cmd_pack(args) -> int:
     return 0
 
 
+def _param_default(f: Path) -> Path:
+    return f.with_name(f.name[:-5]) if f.name.lower().endswith(".yaml") else f.with_name(f.name + ".yaml")
+
+
 def cmd_param(args) -> int:
-    for f in args.files:
-        f = Path(f)
+    files = [Path(f) for f in args.files]
+    for f in files:
+        if not f.is_file():
+            raise RiftError(f"{f} is a folder, not a parameter file" if f.is_dir() else f"{f} does not exist")
+    for f, out in zip(files, _outputs(args.out, files, _param_default)):
         if f.name.lower().endswith(".yaml"):
             data = params.yaml_to_resource(params.decode_text(f.read_bytes(), f.name), source=f.name)
-            out = Path(args.out) if args.out else f.with_name(f.name[:-5])
             if out.exists() and not args.force:
                 bak = out.with_name(out.name + ".bak")
                 if not bak.exists():
@@ -265,29 +316,48 @@ def cmd_param(args) -> int:
             text = params.resource_to_yaml(raw, f.stem if tid else f.name, tid)
             if text is None or params.yaml_to_resource(text) != raw:
                 raise RiftError(f"{f.name}: YAML would not rebuild it exactly; not written")
-            out = Path(args.out) if args.out else f.with_name(f.name + ".yaml")
-            arcfolder.write_file(out, text.encode("utf-8"))
+            body = text.encode("utf-8")
+            _keep_edits(out, body, args.force, f"add --force to overwrite {out.name}")   # was: overwritten, no .bak
+            arcfolder.write_file(out, body)
             ui.ok(f"{f.name} -> {out.name} ({text.count(chr(10))} lines, checked to rebuild exactly)")
     return 0
 
 
+def _find_rows(game: Game, args, idx=None) -> list[dict]:
+    tid = typemap.type_for_extension(args.type) if args.type else None
+    if args.type and tid is None:                   # was: an unknown type searched every type
+        raise RiftError(f"no resource type {args.type!r} (riftstone world types lists the game's types)")
+    return (idx or _index(game, args.json)).search(args.text, tid, args.limit)   # closed when the command ends
+
+
+def _rows_json(rows: list[dict]) -> list[dict]:
+    return [{**r, "name": r["name"].decode("latin-1")} for r in rows]
+
+
 def cmd_find(args) -> int:
     if (args.game or "").lower() in ("both", "all"):
-        code = 1
+        games = []
         for kind in KINDS:
             try:
-                g = find_game(kind)
+                games.append(find_game(kind))
             except RiftError:
                 continue
+        if not games:
+            raise RiftError("--game both: neither game was found (set RIFTSTONE_GAME to a game folder, or "
+                            "RIFTSTONE_DDO to Online's)")
+        if args.json:                               # one document, {game: rows}; no headings in it
+            print(json.dumps({g.kind: _rows_json(_find_rows(g, args)) for g in games}, indent=1))
+            return 0
+        code = 1
+        for g in games:
             ui.step(g.title)
-            code = min(code, cmd_find(argparse.Namespace(**{**vars(args), "game": kind})))
+            code = min(code, cmd_find(argparse.Namespace(**{**vars(args), "game": str(g.root)})))
         return code
     game = _game(args)
     idx = _index(game, args.json)
-    tid = typemap.type_for_extension(args.type) if args.type else None
-    rows = idx.search(args.text, tid, args.limit)
+    rows = _find_rows(game, args, idx)
     if args.json:
-        print(json.dumps([{**r, "name": r["name"].decode("latin-1")} for r in rows], indent=1))
+        print(json.dumps(_rows_json(rows), indent=1))
         return 0
     nm = _names(game, idx)
     meant = False if args.type else _find_by_name(nm, idx, args.text)
@@ -307,6 +377,17 @@ def cmd_find(args) -> int:
     if len(rows) == args.limit:
         ui.info(f"first {args.limit} shown; narrow the search or use --limit")
     return 0
+
+
+def _arc_named(game: Game, text: str) -> str:
+    """--arc as the name of an archive the game has: 'rom\\enemy\\em0100.arc' -> rom/enemy/em0100, the name a
+    mod keeps it under (archives/<name>.arc; with the suffix kept it became em0100.arc.arc, which build
+    refuses).  One the game lacks is refused here, not by a FileNotFoundError."""
+    name = game.arc_path(text).relative_to(game.native).with_suffix("").as_posix()
+    if not game.vanilla_arc(name).is_file():
+        raise RiftError(f"{game.title} has no archive {name} (riftstone find <name> says which archives hold a "
+                        "resource)")
+    return name
 
 
 def _names(game: Game, idx):
@@ -358,7 +439,7 @@ def _locate(idx, game: Game, resource: str, arc_hint: str | None):
     if rel.lower().endswith(".yaml"):
         rel = rel[:-5]
     name, tid = fsmap.decode_path(rel)
-    arcs = [arc_hint] if arc_hint else idx.archives_with(name, tid)
+    arcs = [_arc_named(game, arc_hint)] if arc_hint else idx.archives_with(name, tid)
     if not arcs:
         near = idx.search(name.decode("latin-1").rsplit("\\", 1)[-1], tid, 5)
         hint = "; similar: " + ", ".join(fsmap.encode_name(r["name"], r["type"]) for r in near) if near else ""
@@ -412,29 +493,26 @@ def cmd_port(args) -> int:
     src_game, dst_game = find_game(src_kind), find_game(args.game or dst_kind)
     if dst_game.kind != dst_kind:
         raise RiftError(f"--game points at {dst_game.title}, but '{m.name}' is a {KINDS[dst_kind]['title']} mod")
+    into = _arc_named(dst_game, args.arc) if args.arc else None
+    from_arc = _arc_named(src_game, args.from_arc) if args.from_arc else None
     src_idx, dst_idx = _index(src_game), _index(dst_game)
     ui.step(f"{args.resource}  {KINDS[src_kind]['title']} -> {KINDS[dst_kind]['title']}")
     rebake = getattr(args, "retarget", None)
     if rebake is None:                                  # player motion lists rebake by default, like Studio's Port
         rebake = port.is_player_motion(args.resource)
-    dye = None
-    if getattr(args, "dye", None):                      # Online's equipment colours baked in (ddodye.py)
-        from . import ddodye
-        dye = ddodye.port_plan(args.resource, args.dye, src_game, src_idx, dst_kind, args.model_only)
-        before = ddodye.snapshot(m.root)
+    # --dye: Online's equipment colours baked in (ddodye.py); the port's recipe records the colour
     res = port.into_mod(m.root, src_game, dst_game, src_idx, dst_idx, args.resource, args.as_, args.like,
-                        args.arc, args.from_arc, args.model_only, rebake=rebake)
+                        into, from_arc, args.model_only, rebake=rebake, dye=getattr(args, "dye", None))
     for w in res.written:
         ui.ok(f"-> {w}")
     for n in res.notes:
         ui.info(n)
-    if dye is not None:
-        done = ddodye.dye_port(m.root, dye[1], dye[0], ddodye.changed_since(m.root, before), src_game, src_idx)
-        for w in done.written:
-            ui.ok(f"-> {w} (dyed: {dye[0].label})")
-        for w in done.removed:
+    if res.dyed is not None:
+        for w in res.dyed.written:
+            ui.ok(f"-> {w} (dyed: {res.dye_label})")
+        for w in res.dyed.removed:
             ui.info(f"removed the undyed copy {w} (no material uses it now)")
-        for n in done.notes:
+        for n in res.dyed.notes:
             ui.info(n)
     ui.info("structure checked; how it looks in game is UNKNOWN until you play it")
     return 0
@@ -539,6 +617,8 @@ def cmd_import(args) -> int:
 
     root = Path(args.mod)
     game = _game(args)
+    paths = [Path(x) for x in args.paths]
+    files = importer._inputs(paths)             # a missing input is refused before a new mod is made
     if (root / MOD_FILE).is_file():
         m = Mod.load(root)
         if m.game != game.kind:
@@ -549,10 +629,8 @@ def cmd_import(args) -> int:
         ui.ok(f"Created {game.title} mod '{m.name}' at {m.root}")
     idx = _index(game)
     try:
-        files = importer._inputs([Path(x) for x in args.paths])
         bar = ui.Progress(len(files), "comparing with the originals")
-        rep = importer.import_archives(game, idx, [Path(x) for x in args.paths], m.root, not args.binary,
-                                       args.per_archive, bar)
+        rep = importer.import_archives(game, idx, paths, m.root, not args.binary, args.per_archive, bar)
         bar.done(f"{rep.archives} archive(s) compared")
     finally:
         idx.close()
@@ -572,8 +650,9 @@ def cmd_import(args) -> int:
 def cmd_new(args) -> int:
     from .mod import Mod, check_name, find_mod, is_bare_name, mods_folders
 
-    kind = args.game or ("ddo" if os.environ.get("RIFTSTONE_GAME", "").lower() in ("ddo", "online") else "ddda")
-    kind = "ddo" if kind in ("ddo", "online") else kind
+    # --game, else $RIFTSTONE_GAME's game: a keyword, or a game folder (an Online folder made a DDDA mod)
+    env = os.environ.get("RIFTSTONE_GAME", "")
+    kind = args.game or KEYWORDS.get(env.lower()) or (env and detect_kind(Path(env))) or "ddda"
     folder = Path(args.folder)
     shared = is_bare_name(args.folder) and not args.here     # a plain name goes to the mods folder, where Studio
     if shared:                                               # and every --mod "<name>" find it
@@ -658,7 +737,31 @@ def _mod_line(root: Path, installed: set[Path], at: bool = False) -> str:
 
 def _print_plan_conflicts(conflicts) -> None:
     for c in conflicts[:10]:
-        ui.warn(f"{c['resource']} in {c['archive']}: '{c['winner']}' overrides '{c['loser']}'")
+        what = f" ({c['detail']})" if c.get("detail") else ""
+        ui.warn(f"{c['resource']} in {c['archive']}{what}: '{c['winner']}' overrides '{c['loser']}'")
+    if len(conflicts) > 10:
+        ui.warn(f"... and {len(conflicts) - 10} more")
+
+
+def _print_merges(p) -> None:
+    """Files merged from several mods (a Plan or an install report), and the groups and records they renumbered."""
+    from .merging import kept
+
+    for m in p.merged:
+        ui.ok(f"{m['resource']} in {m['archive']}: merged from " + " and ".join(f"'{n}'" for n in m["mods"])
+              + f", every mod's {kept(m)} kept")
+    for r in p.renumbered:
+        if "record" in r:
+            ui.info(f"'{r['mod']}' record {r['record']} of {r['layout']} is record {r['as']} in the game (another mod "
+                    f"adds a record {r['record']} there)")
+        else:
+            ui.info(f"'{r['mod']}' group {r['group']} of stage {r['stage']} ({r['type']}) is group {r['as']} in the "
+                    f"game (another mod adds a group {r['group']} there); its layouts are renamed with it")
+    for r in p.unmoved:
+        what = (f"record {r['record']} of {r['layout']}" if "record" in r
+                else f"group {r['group']} of stage {r['stage']} ({r['type']})")
+        ui.warn(f"'{r['mod']}' {what} keeps its number: {r['why']}"
+                + (f"; '{r['winner']}' has that number too" if r.get("winner") else ""))
 
 
 def cmd_build(args) -> int:
@@ -669,6 +772,7 @@ def cmd_build(args) -> int:
     mods = [modlib.Mod.load(Path(m)) for m in args.mods]
     p = modlib.plan(game, idx, mods)
     modlib.check_plan(p)
+    _print_merges(p)
     _print_plan_conflicts(p.conflicts)
     out = Path(args.out) if args.out else mods[0].root / "build"
     bar = ui.Progress(len(p.archives), "building")
@@ -684,46 +788,119 @@ def cmd_build(args) -> int:
     return 0
 
 
-def cmd_package(args) -> int:
-    from . import mod as modlib
+def _legal_lines() -> str:
+    from . import legal
+    return legal.DISCLAIMER + "\n" + legal.FREE
+
+
+def _package_plugins(args, items: list[str]) -> int:
+    """riftstone package --plugins-only: the loader and plugins, to unzip into the game folder."""
     from . import package
     from . import plugins as pluginmod
 
-    game = _game(args)
-    if game.is_ddo:   # the zip ships the DDDA loader (dinput8.dll + overlay) and DDDA plugins
-        raise RiftError("package makes a zip for Dark Arisen players (it ships the DDDA loader); share an Online "
-                        "mod as its folder, and install it with riftstone install --game ddo")
+    if items:
+        raise RiftError("--plugins-only makes a loader + plugins zip (no mods, no game data); do not also name mods")
+    if not args.out:
+        raise RiftError("give the zip's file: --out dist\\Riftstone-Player.zip")
     out = Path(args.out)
     if out.exists() and not args.force:
         raise RiftError(f"{out} already exists; pick another name or add --force to replace it")
-    plugin_paths = [Path(x) for x in (args.plugin or [])]
-    if args.plugins_only:
-        if args.mods:
-            raise RiftError("--plugins-only makes a loader + plugins zip (no game data); do not also name mods")
-        if not plugin_paths:                                   # default: every plugin built here
-            plugin_paths = [p for _, p in sorted(pluginmod.built().items())]
-        if not plugin_paths:
-            raise RiftError("no plugins are built; run native\\plugins\\<name>\\build.cmd, or pass --plugin")
-        r = package.build(game, None, [], plugin_paths, out, args.name or "Riftstone plugins")
-        ui.ok(f"Packaged the loader and {len(r['plugins'])} plugin{'s' if len(r['plugins']) != 1 else ''} "
-              f"(no game data): {ui.human(r['bytes'])}")
-    else:
-        if not args.mods:
-            raise RiftError("name at least one mod to package, or use --plugins-only for a loader + plugins zip")
-        idx = _index(game)
-        try:
-            mods = [modlib.Mod.load(Path(m)) for m in args.mods]
-            p = modlib.plan(game, idx, mods)
-            _print_plan_conflicts(p.conflicts)
-            bar = ui.Progress(len(p.archives), "building")
-            r = package.build(game, idx, [m.root for m in mods], plugin_paths, out, args.name, progress=bar)
-        finally:
-            idx.close()
-        bar.done(f"Packaged {len(r['archives'])} archive{'s' if len(r['archives']) != 1 else ''}, the loader"
-                 + (f" and {len(r['plugins'])} plugin{'s' if len(r['plugins']) != 1 else ''}" if r["plugins"] else "")
-                 + f": {ui.human(r['bytes'])}")
+    # Riftstone's stable plugins by default; an experimental one (compat) only when --plugin names it
+    plugin_paths = [Path(x) for x in args.plugin or []] or [p for stem, p in sorted(pluginmod.built().items())
+                                                             if stem in package.OWN_PLUGINS]
+    if not plugin_paths:
+        raise RiftError("no plugins are built; run native\\plugins\\<name>\\build.cmd, or pass --plugin")
+    ninput = None
+    if args.ninput:
+        ninput = (Path(__file__).resolve().parents[2] / "native" / "ninput" / "out-msvc" / "RelWithDebInfo" /
+                  "xinput1_3.dll") if args.ninput == "built" else Path(args.ninput)
+    r = package.build_plugins(plugin_paths, out, args.name or "Riftstone plugins", ninput=ninput)
+    n = len(r["plugins"])
+    ui.ok(f"Packaged the loader and {n} plugin{'s' if n != 1 else ''} (no game data)"
+          + (", with Ninput under optional\\ninput (off until a player copies it)" if r["ninput"] else "")
+          + f": {ui.human(r['bytes'])}")
     ui.info(f"-> {r['out']}")
     ui.info(f"a player unzips it into the game folder (the one with DDDA.exe); \"{r['readme']}\" inside says how")
+    return 0
+
+
+def cmd_package(args) -> int:
+    """make (the default): a package of mods, with no game data; install: make its mods here from this PC's
+    games; check: what a package holds, read without a game; --plugins-only: the loader and plugins in a zip
+    for players without Riftstone (no mods, no game data)."""
+    from . import mod as modlib
+    from . import package, sources
+
+    items = list(args.items)
+    if args.plugins_only:
+        return _package_plugins(args, items)
+    action = items.pop(0) if items and items[0] in ("make", "install", "check") else "make"
+    if action in ("install", "check"):
+        if len(items) != 1:
+            raise RiftError(f"riftstone package {action} <package.zip>")
+        zp = Path(items[0])
+        if not zp.is_file():
+            raise RiftError(f"{zp} is not a file")
+        if action == "check":
+            r = package.check(zp)
+            if args.json:
+                print(json.dumps(r, indent=1))
+                return 0
+            ui.ok(f"{zp.name}: \"{r['name']}\", a {KINDS[r['game']]['title']} package ({r['made_with']}) with no "
+                  "game files")
+            for m in r["mods"]:
+                ui.info(f"{m['folder']}: {m['files']} file(s), {m['new_bytes']:,} bytes of the author's own; the rest "
+                        "is made from the player's game")
+            if r["plugins"]:
+                ui.info("plugins: " + ", ".join(r["plugins"]))
+            ui.info("needs: " + ", ".join(KINDS[k]["title"] for k in r["needs"]))
+            return 0
+        games = sources.Games()
+        try:
+            from .studio import default_workspace
+            into = Path(args.into) if args.into else default_workspace(None)
+            ui.step(f"Making the mods of {zp.name} in {into} from this PC's games")
+            r = package.install(zp, into, games)
+        finally:
+            games.close()
+        for m in r["mods"]:
+            ui.ok(f"-> {m}")
+        for p in r["plugins"]:
+            ui.info(f"plugin {Path(p).name}: add it with  Riftstone.cmd loader plugin add \"{p}\"")
+        ui.info("every file was checked against the author's; turn the mods on in Studio, or: riftstone install "
+                + " ".join(f'"{m}"' for m in r["mods"]))
+        return 0
+    if not items:
+        raise RiftError("riftstone package <mod folder> ... --out <file.zip>")
+    if not args.out:
+        raise RiftError("give the package's file: --out dist\\my-mods.zip")
+    out = Path(args.out)
+    if out.exists() and not args.force:
+        raise RiftError(f"{out} already exists; pick another name or add --force to replace it")
+    mods = [modlib.Mod.load(Path(m)) for m in items]
+    kinds = {m.game for m in mods}
+    if len(kinds) != 1:
+        raise RiftError("a package is for one game: package the Dark Arisen and the Online mods apart")
+    game = find_game(args.game or kinds.pop())
+    idx = _index(game)
+    games = sources.Games({game.kind: game}, {game.kind: idx})
+    try:
+        p = modlib.plan(game, idx, mods)
+        _print_merges(p)
+        _print_plan_conflicts(p.conflicts)
+        bar = ui.Progress(sum(len(modlib.collect(m)) for m in mods), "making deltas")
+        r = package.build(games, [m.root for m in mods], [Path(x) for x in args.plugin or []], out, args.name,
+                          progress=bar, note=ui.info)
+    finally:
+        games.close()
+        idx.close()
+    bar.done(f"Packaged {r['files']} file{'s' if r['files'] != 1 else ''} of {len(r['mods'])} mod(s)"
+             + (f" and {len(r['plugins'])} plugin{'s' if len(r['plugins']) != 1 else ''}" if r["plugins"] else "")
+             + f": {ui.human(r['bytes'])}, of which {r['new_bytes']:,} bytes are the authors' own and no game data")
+    ui.info(f"-> {r['out']}")
+    ui.info("a player makes the mods from their own game with: Riftstone.cmd package install \"<zip>\" "
+            f"(\"{r['readme']}\" inside says how)"
+            + ("; it needs " + " and ".join(KINDS[k]["title"] for k in r["needs"]) if len(r["needs"]) > 1 else ""))
     return 0
 
 
@@ -739,6 +916,7 @@ def _apply(game: Game, roots: list[Path], dry_run: bool) -> int:
     idx = _index(game)
     ui.step(f"{'Planning' if dry_run else 'Installing'} {len(roots)} mod(s)")
     rep = install.apply(game, idx, roots, dry_run=dry_run, known_vanilla=_known_vanilla(game))
+    _print_merges(rep)
     _print_plan_conflicts(rep.conflicts)
     verb = "Would write" if dry_run else "Wrote"
     for w in rep.written:
@@ -827,8 +1005,15 @@ def cmd_install(args) -> int:
 
 def cmd_uninstall(args) -> int:
     game = _game(args)
+    enabled = _enabled(game)
     drop = {Path(m).resolve() for m in args.mods}
-    roots = [r for r in _enabled(game) if r.resolve() not in drop]
+    known = {r.resolve() for r in enabled}
+    for m in args.mods:
+        if Path(m).resolve() not in known:          # was: "Nothing to do", as if it had been taken out
+            ui.warn(f"{m} is not installed in {game.title} (riftstone status lists the installed mods)")
+    if not drop & known:
+        return 1
+    roots = [r for r in enabled if r.resolve() not in drop]
     return _apply(game, roots, args.dry_run)
 
 
@@ -950,7 +1135,13 @@ def cmd_info(args) -> int:
         if f.is_dir():
             m = f / arcfolder.MANIFEST
             if m.is_file():
-                man = json.loads(m.read_text(encoding="utf-8"))
+                try:        # read as pack reads it: a damaged manifest is refused, not a traceback
+                    man = json.loads(m.read_text(encoding="utf-8"))
+                except (ValueError, UnicodeDecodeError, RecursionError) as e:
+                    raise RiftError(f"{m} is damaged: {e}") from None
+                if not (isinstance(man, dict) and isinstance(man.get("archive"), str)
+                        and isinstance(man.get("entries"), list)):
+                    raise RiftError(f"{m} is not a Riftstone archive manifest (no archive name and entry list)")
                 ui.ok(f"{f.name}: unpacked archive '{man['archive']}' with {len(man['entries'])} resources")
             else:
                 from .mod import MOD_FILE, Mod, collect
@@ -961,6 +1152,8 @@ def cmd_info(args) -> int:
                 else:
                     ui.warn(f"{f}: not a Riftstone folder")
             continue
+        if not f.exists():
+            raise RiftError(f"{f} does not exist")
         data = f.read_bytes()
         if data[:4] == b"ARC\0":
             a = arc.Archive.parse(data)
@@ -1183,7 +1376,7 @@ def cmd_fsm(args) -> int:
                                      (json.dumps(doc, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
                 ui.ok(f"wrote {args.model}: machine {args.level} of {name}, {len(m.levels[args.level].states)} "
                       f"states, {len(doc['transitions']) - 1} transitions; check it with "
-                      f"C:\\Dev\\NyrLang\\nyrc.cmd formal fsm {args.model}")
+                      f"<path> formal fsm {args.model}")
                 return 0
             found = fsmcheck.check(m)
             problems += sum(1 for f in found if f.severity == fsmcheck.PROBLEM)
@@ -1227,7 +1420,9 @@ def cmd_tex(args) -> int:
         t = tex.parse(data)
         out = Path(args.out) if args.out else (src.with_suffix(".dds") if src
                                                else Path(Path(name).name).with_suffix(".dds"))
-        arcfolder.write_file(out, tex.to_dds(t))
+        dds = tex.to_dds(t)
+        _keep_edits(out, dds, False, "write this one elsewhere with -o")     # the .dds is the one people edit
+        arcfolder.write_file(out, dds)
         ui.ok(f"wrote {out}  ({tex.info(t)})")
         return 0
 
@@ -1303,8 +1498,16 @@ def cmd_terrain(args) -> int:
             except ValueError:
                 nums = None
             if nums:
+                if not all(math.isfinite(v) for v in nums):
+                    raise RiftError(f"({text}): a world position is two or three finite numbers, x,z or x,y,z")
+                if _game_kind(args) == "ddo":
+                    raise RiftError("Dragon's Dogma Online's field has no terrain cells: a position there is a "
+                                    "world position as it is (its terrain, scr\\fd\\model, is world space)")
                 x, z = nums[0], nums[-1]
                 c = terrain.cell_at(x, z)
+                if c not in set(terrain.cells()):
+                    raise RiftError(f"({text}) lies outside Gransys' terrain: it would be cell {c.name}, which the "
+                                    "game does not have ('riftstone terrain cells' lists the ones it has)")
                 dx, _, dz = c.offset
                 print(f"  ({text}) lies in cell {c.name}: local x {x - dx:.1f}, z {z - dz:.1f}")
                 return 0
@@ -1345,6 +1548,8 @@ def cmd_terrain(args) -> int:
         else:
             out_data = terrain.worldize(data, cell)
         dst = Path(args.out) if args.out else src.with_name(f"{src.stem}.{args.action[:5]}{src.suffix}")
+        if args.action == "worldize":           # the world-space copy is the one edited next to its neighbours
+            _keep_edits(dst, out_data, False, "write this one elsewhere with -o")
         arcfolder.write_file(dst, out_data)
         dx, _, dz = cell.offset
         sign = "-" if args.action == "localize" else "+"
@@ -1487,7 +1692,8 @@ def cmd_learn(args) -> int:
     if not args.topic:
         print("Topics: " + ", ".join(sorted(helpmod.TOPICS)))
         return 0
-    topic = args.topic if args.topic in helpmod.TOPICS else helpmod.topic_for(args.topic)
+    topic = next((t for t in (args.topic, f"tab:{args.topic.lower()}") if t in helpmod.TOPICS), None) \
+        or helpmod.topic_for(args.topic)             # a Studio tab by its name too: learn world
     if topic is None:
         raise RiftError(f"no help for {args.topic!r}; `riftstone learn` lists the topics")
     print(helpmod.text(topic, args.lang, args.field))
@@ -1498,6 +1704,8 @@ def cmd_skeleton(args) -> int:
     """A model's joints (what motions address), or two models' skeletons compared by joint id."""
     from . import port as portmod
 
+    if len(args.targets) > 2:                           # was: the third and later were left out without a word
+        raise RiftError("skeleton takes one model, or two to compare")
     a, an, _ = _load_resource(args, args.targets[0])
     if len(args.targets) == 1:
         sk = portmod.skeleton(a)
@@ -1529,15 +1737,18 @@ def _ddo_items(args, game: Game) -> int:
         raise RiftError(f"{m.name} is a Dark Arisen mod; make one with: riftstone new <folder> --game ddo")
     root = m.root if m else None
 
+    def name(i: int) -> str:               # a row shorter than the header has no Name
+        return items[i].get("Name", "")
+
     def one_item() -> int:
         ids = ddo.find_items(items, words)
         if not ids:
             raise RiftError(f"no item is called {words!r} (riftstone items list <words> --game ddo)")
         if len(ids) > 1 and not words.isdigit():
-            exact = [i for i in ids if items[i].get("Name", "").lower() == words.lower()]
+            exact = [i for i in ids if name(i).lower() == words.lower()]
             if len(exact) != 1:
                 raise RiftError(f"{len(ids)} items match {words!r}: "
-                                + ", ".join(f"{i} {items[i]['Name']}" for i in ids[:6]) + "; give the id")
+                                + ", ".join(f"{i} {name(i)}" for i in ids[:6]) + "; give the id")
             ids = exact
         return ids[0]
 
@@ -1551,14 +1762,15 @@ def _ddo_items(args, game: Game) -> int:
 
     if args.action == "list":
         hits = ddo.find_items(items, words) if words else sorted(items)
-        for i in hits[:args.limit if hasattr(args, "limit") else 60]:
+        for i in hits[:args.limit]:
             r = items[i]
-            print(f"  {i:>6}  {r.get('Name', ''):<40} {ui.mist('price ' + (r.get('Price') or '-'))}")
-        ui.info(f"{len(hits)} item(s)" + ("; showing 60" if len(hits) > 60 else ""))
+            print(f"  {i:>6}  {name(i):<40} {ui.mist('price ' + (r.get('Price') or '-'))}")
+        ui.info(f"{len(hits)} item(s)" + (f"; showing {args.limit}" if len(hits) > args.limit else ""))
         return 0 if hits else 1
     if args.action == "shop":
         src, _ = ddo.server_file(game, root, ddo.SHOP_FILE)
         shops, style = ddo.read_json(src)
+        ddo.check_shops(shops, src)
         if not words:
             for sh in shops:
                 goods = sh["Data"]["GoodsParamList"]
@@ -1570,26 +1782,32 @@ def _ddo_items(args, game: Game) -> int:
         if not args.shop or not re.fullmatch(r"[0-9]{1,9}", str(args.shop)):     # '²' passed isdigit()
             raise RiftError("--shop <shop id> (riftstone items shop --game ddo lists the shops)")
         item = one_item()
-        price = args.buy if args.buy is not None else int(items[item].get("Price") or 1)
+        listed = (items[item].get("Price") or "").strip()
+        if args.buy is None and listed and not re.fullmatch(r"[0-9]{1,9}", listed):
+            raise RiftError(f"{name(item)} ({item}) costs {listed!r} in the server's item list, which is no price: "
+                            "give the shop's price with --buy")
+        price = args.buy if args.buy is not None else int(listed or 1)
         note = ddo.shop_add(shops, int(args.shop), item, price, args.stock)
-        ui.ok(f"{items[item]['Name']} ({item}) for {price}: {note}")
+        ui.ok(f"{name(item)} ({item}) for {price}: {note}")
         save(ddo.SHOP_FILE, shops, style)
         return 0
     if args.action in ("sets", "drop"):
         src, _ = ddo.server_file(game, root, ddo.SPAWN_FILE)
         spawn, style = ddo.read_json(src)
+        ddo.check_drop_tables(spawn, src)
         item = one_item()
         if args.action == "sets":
             hits = ddo.drop_tables_with(spawn, item)
-            for tid, name, chance in hits:
-                print(f"  table {tid:>4}  {name:<40} {chance * 100:.0f}%")
-            ui.info(f"{items[item]['Name']} ({item}) drops from {len(hits)} table(s); add it to another: "
+            for tid, table, chance in hits:
+                print(f"  table {tid:>4}  {table:<40} {chance * 100:.0f}%")
+            ui.info(f"{name(item)} ({item}) drops from {len(hits)} table(s); add it to another: "
                     "riftstone items drop <item> --set <table> --percent N --mod <mod> --game ddo")
             return 0
         if args.set is None or args.weight_pct is None:
             raise RiftError("--set <drop table id> and --percent <chance> (items sets <item> --game ddo finds tables)")
+        ddo.check_spawns(spawn, src)                  # drop counts the rows that use the table, and writes it back
         note = ddo.drop_add(spawn, args.set, item, args.weight_pct / 100)
-        ui.ok(f"{items[item]['Name']} ({item}) at {args.weight_pct}%: {note}")
+        ui.ok(f"{name(item)} ({item}) at {args.weight_pct}%: {note}")
         save(ddo.SPAWN_FILE, spawn, style)
         return 0
     raise RiftError(f"'items {args.action}' is Dark Arisen only for now; on Online: list, shop, sets, drop")
@@ -1778,8 +1996,14 @@ def cmd_spawns(args) -> int:
                     at = ()
                 if len(at) != 3:
                     raise RiftError("--at is x,y,z, e.g. --at 58600,42716,-45360")
-            new = lot.copy(lt, args.number, at)
-            what = f"Copied record {args.number} ({recs[args.number].name}) as record {lt.count}, id {new.records[-1].id}"
+            # the id: clear of the group's other layouts and of the game's own ids, under 32 for enemies
+            reserved, below = modfiles.group_ids(game, idx, root, name)
+            new = lot.copy(lt, args.number, at, reserved, below)
+            rid = new.records[-1].id
+            what = f"Copied record {args.number} ({recs[args.number].name}) as record {lt.count}, id {rid}"
+            if below is not None and rid >= below:
+                ui.warn(f"every id under {below} is taken in this group: the game keeps one kill-record bit per id, "
+                        f"so id {rid} shares id {rid % below}'s (killing one counts for both)")
         else:
             new = lot.remove(lt, args.number)
             what = f"Removed record {args.number} ({recs[args.number].name}); the ones after it moved up one"
@@ -1828,10 +2052,10 @@ def _ddo_spawns(args, data, out, root, name, tid) -> int:
     return 0
 
 
-def _world(game: Game, idx, rebuild: bool = False, lang: str = "eng"):
+def _world(game: Game, idx, rebuild: bool = False, lang: str = "eng", quiet: bool = False):
     from . import world
 
-    return world.load(game, idx, rebuild, lambda: ui.Progress(1, "mapping the world"), lang)
+    return world.load(game, idx, rebuild, None if quiet else (lambda: ui.Progress(1, "mapping the world")), lang)
 
 
 def _story(g: dict) -> str:
@@ -1860,12 +2084,18 @@ def _ddo_world(args, game: Game, idx) -> int:
     C = w.col
     rows = w.rows
     eid = lambda r: ddo.enemy_id(r[C("EnemyId")])  # noqa: E731
-    if args.json:
-        out = [dict(zip(w.schema, r), EnemyName=w.enemy_name(eid(r)), StageName=w.stage_name(r[C("StageId")]))
-               for r in rows]
-        print(json.dumps(out[:args.limit] if args.action != "overview" else out, indent=1, ensure_ascii=False))
+
+    def emit(doc) -> int:           # --json: the rows the action lists (it printed every row, whatever was asked)
+        print(json.dumps(doc, indent=1, ensure_ascii=False))
         return 0
+
+    def as_json(some) -> list[dict]:
+        return [dict(zip(w.schema, r), EnemyName=w.enemy_name(eid(r)), StageName=w.stage_name(r[C("StageId")]))
+                for r in some]
+
     if args.action in ("overview", "build"):
+        if args.json:
+            return emit(as_json(rows))
         per_enemy = Counter(eid(r) for r in rows)
         ui.ok(f"{len({r[C('StageId')] for r in rows})} stages, {len(rows):,} spawn rows, {len(per_enemy)} enemies, "
               f"{len(w.doc.get('dropsTables', []))} drop tables  (server data: {w.assets})")
@@ -1876,6 +2106,9 @@ def _ddo_world(args, game: Game, idx) -> int:
         return 0
     if args.action == "stages":
         per = Counter(r[C("StageId")] for r in rows)
+        if args.json:
+            return emit([{"StageId": sid, "StageNo": w.stages.get(sid, (None, ""))[0], "StageName": w.stage_name(sid),
+                          "Spawns": per[sid]} for sid in sorted(per)[:args.limit]])
         for sid in sorted(per)[:args.limit]:
             no = w.stages.get(sid, (None, ""))[0]
             print(f"  {sid:>5}  {ui.mist(f'st{no:04d}' if no is not None else '      ')}  {w.stage_name(sid):<40} {per[sid]:>5} spawns")
@@ -1889,6 +2122,8 @@ def _ddo_world(args, game: Game, idx) -> int:
         for r in rows:
             if r[C("StageId")] == sid:
                 groups[(r[C("LayerNo")], r[C("GroupId")])].append(r)
+        if args.json:
+            return emit(as_json([r for _, rs in sorted(groups.items())[:args.limit] for r in rs]))
         ui.ok(f"{w.stage_name(sid)} (StageId {sid}): {sum(map(len, groups.values()))} spawns in {len(groups)} groups")
         for (layer, g), rs in sorted(groups.items())[:args.limit]:
             kinds = Counter(w.enemy_name(eid(r)) for r in rs)
@@ -1904,6 +2139,10 @@ def _ddo_world(args, game: Game, idx) -> int:
         where = defaultdict(set)
         for r in rows:
             where[eid(r)].add(r[C("StageId")])
+        if args.json:
+            return emit([{"EnemyId": f"0x{e:06X}", "EnemyName": w.enemy_name(e), "Spawns": per[e],
+                          "Stages": sorted(where[e])}
+                         for e in sorted(per, key=lambda e: w.enemy_name(e).lower())[:args.limit]])
         for e in sorted(per, key=lambda e: w.enemy_name(e).lower())[:args.limit]:
             print(f"  {w.enemy_name(e):<34} {ui.mist(f'0x{e:06X}')}  {per[e]:>5} placements in {len(where[e])} stage(s)")
         ui.info(f"{len(per)} enemies spawn" + (f"; showing {args.limit}" if len(per) > args.limit else ""))
@@ -1915,6 +2154,8 @@ def _ddo_world(args, game: Game, idx) -> int:
         hits = [r for r in rows if eid(r) in ids]
         if not hits:
             raise RiftError(f"the server spawns no {' '.join(args.rest)!r}")
+        if args.json:
+            return emit(as_json(hits[:args.limit]))
         per = Counter((r[C("StageId")], r[C("LayerNo")], r[C("GroupId")], w.enemy_name(eid(r)), r[C("Lv")]) for r in hits)
         ui.ok(f"{len(hits)} placements of {', '.join(sorted({w.enemy_name(e) for e in ids}))}")
         for (sid, layer, g, name, lv), n in sorted(per.items())[:args.limit]:
@@ -1931,6 +2172,13 @@ def _ddo_encounter(args, game: Game, idx) -> int:
 
     if not args.mod and not args.dry_run:
         raise RiftError('say which mod gets the encounter: --mod "My Mod" (riftstone new "My Mod" --game ddo)')
+    # checked as Dark Arisen's encounter.plan checks them: NaN or 1e39 made spawn points no float holds
+    if not (math.isfinite(args.spread) and 0 < args.spread <= 5000):
+        raise RiftError("--spread is the distance between spawn points, more than 0 and at most 5000")
+    if args.at_once is not None and not 1 <= args.at_once <= 500:
+        raise RiftError("on Online --at-once is how many spawn points the group's layout gets, 1 to 500")
+    if args.level is not None and not 1 <= args.level <= 0xFFFF:
+        raise RiftError("--level is 1 to 65535 (the server reads a spawn's level as a 16-bit number)")
     m = Mod.load(Path(args.mod)) if args.mod else None
     if m is not None and m.game != "ddo":
         raise RiftError(f"{m.name} is a Dark Arisen mod; make one with: riftstone new <folder> --game ddo")
@@ -1967,11 +2215,12 @@ def _ddo_encounter(args, game: Game, idx) -> int:
         data, out = modfiles.load(game, idx, m.root, lname, ltid)
         lt = lot_ddo.parse(data)
         pts = ddo.layout_points(lt)
+    if args.at_once and group is not None and not lay:              # was: passed over without a word
+        raise RiftError(f"--at-once adds spawn points to the group's client layout, and group {group} of StageId "
+                        f"{sid} has none (riftstone world stage {sid} --game ddo)")
     if args.at_once and lay and args.at_once > len(pts):
         # more points at once: add them to the group's client layout (the mod's copy), in rings
         # around the group's points, --spread apart
-        import math
-
         if m is None:
             raise RiftError("adding spawn points writes the group's layout into a mod: give --mod")
         have = [p for p in pts if p]
@@ -1981,24 +2230,30 @@ def _ddo_encounter(args, game: Game, idx) -> int:
         cy = sum(p[1] for p in have) / len(have)
         cz = sum(p[2] for p in have) / len(have)
         grown = args.at_once - len(lt.records)
+        spots = []
         for i in range(grown):
             ring, k = divmod(i, 8)
             r = args.spread * (ring + 1)
             ang = 2 * math.pi * k / 8 + ring * 0.39
-            lt = lot_ddo.copy(lt, 0, (cx + r * math.cos(ang), cy, cz + r * math.sin(ang)))
-        if not args.dry_run:
-            modfiles.save(out, lot_ddo.build(lt), lname, ltid)
+            spots.append((cx + r * math.cos(ang), cy, cz + r * math.sin(ang)))
+        lt = lot_ddo.copies(lt, 0, spots)            # one copy of the layout (a copy per point was quadratic)
+        grown_data = lot_ddo.build(lt)
         pts = pts + [None] * grown
+    # the rows first: a refusal here (--count, a group the stage lacks) used to come after the grown layout
+    # was already saved into the mod
     new, notes = ddo.encounter(w, sid, enemy, args.count, group, layer, args.level, len(pts) or None)
     if lay:
-        notes.append(f"spawn points from {lay}" + (f"; {grown} added to the mod's copy in rings {args.spread:g} "
-                                                     f"apart around the group (their height is the group's "
-                                                     f"average; in game UNKNOWN)" if grown else ""))
+        notes.append(f"spawn points from {lay}" + (f"; {grown} {'would be ' if args.dry_run else ''}added to the "
+                                                     f"mod's copy in rings {args.spread:g} apart around the group "
+                                                     f"(their height is the group's average; in game UNKNOWN)"
+                                                     if grown else ""))
     for n in notes:
         ui.info(n)
     if args.dry_run:
         ui.ok(f"would add {len(new)} spawn row(s); nothing written")
         return 0
+    if grown:
+        modfiles.save(out, grown_data, lname, ltid)
     arcfolder.write_file(mine, ddo.dumps(w.doc))
     ui.ok(f"-> {mine}")
     ui.info(f"riftstone install \"{m.root}\" writes it into the server's assets ({w.assets}); restart the server "
@@ -2009,23 +2264,27 @@ def _ddo_encounter(args, game: Game, idx) -> int:
 def cmd_world(args) -> int:
     from . import lot, world
 
+    def emit(doc) -> int:   # --json: the rows the action lists (it printed the whole map, cut at 2,000,000
+        print(json.dumps(doc, ensure_ascii=False))     # characters: no JSON at all on the real 9 MB map)
+        return 0
+
     game = _game(args)
-    idx = _index(game)
+    idx = _index(game, args.json)
     try:
         if game.is_ddo and args.action != "types":
             return _ddo_world(args, game, idx)
         if args.action == "types":
             rows = world.atlas(idx)
+            if args.json:
+                return emit(rows[:args.limit])
             for r in rows[:args.limit]:
                 print(f"  {r['ext']:<12} {r['class']:<26} {r['count']:>7,} ({r['names']:,} names)  {r['riftstone']}")
             ui.info(f"{len(rows)} resource types in the game" + (f"; showing {args.limit}" if len(rows) > args.limit else ""))
             return 0
-        w = _world(game, idx, args.rebuild or args.action == "build", args.lang)
+        w = _world(game, idx, args.rebuild or args.action == "build", args.lang, args.json)
         rest = args.rest
-        if args.json:
-            print(json.dumps({"stages": w.data["stages"]} if args.action in ("overview", "stages") else w.data,
-                             ensure_ascii=False)[:2_000_000])
-            return 0
+        if args.json and args.action in ("overview", "build", "stages"):
+            return emit({"stages": w.data["stages"]})
         if args.action in ("overview", "build"):
             ui.ok(f"{len(w.stages)} stages, {len(w.groups):,} groups, {len(w.layouts):,} layouts, "
                   f"{len(w.placements):,} placements, {len(w.enemies)} enemies")
@@ -2052,9 +2311,14 @@ def cmd_world(args) -> int:
             from .encounter import parse_stage
             s = parse_stage(rest[0])
             st = w.stage(s)
-            ui.ok(f"Stage {s}" + (f" -- {', '.join(st['rooms'])}" if st["rooms"] else ""))
             groups = w.groups_of(s, "e")
             free = w.free_groups(s, "e")
+            if args.json:
+                return emit({"stage": s, **st, "free_groups": free, "groups": [
+                    {**g, "placements": [p[5] for name in w.layouts_of(s, "e", g["number"])
+                                         for p in w.placements_in(name) if p[5]]}
+                    for g in sorted(groups, key=lambda g: (g["dlc"], g["number"]))]})
+            ui.ok(f"Stage {s}" + (f" -- {', '.join(st['rooms'])}" if st["rooms"] else ""))
             ui.info(f"{len(groups)} enemy groups; {len(free)} free group numbers of {world.GROUP_SLOTS}"
                     + (f" (first: {free[0]})" if free else ""))
             for g in sorted(groups, key=lambda g: (g["dlc"], g["number"])):
@@ -2071,9 +2335,11 @@ def cmd_world(args) -> int:
                     f"(riftstone world group {s} p <number>)")
             return 0
         if args.action == "enemies":
-            for em, e in sorted(w.enemies.items(), key=lambda kv: -kv[1]["placements"]):
-                if not e["placements"] and not args.all:
-                    continue
+            listed = [(em, e) for em, e in sorted(w.enemies.items(), key=lambda kv: -kv[1]["placements"])
+                      if e["placements"] or args.all]
+            if args.json:
+                return emit([{"id": em, **e} for em, e in listed])
+            for em, e in listed:
                 print(f"  {em:<9} {e['name'] or '?':<26} {e['placements']:>5} placements in {len(e['stages']):>3} "
                       f"stage(s), {e['groups']:>3} groups  {', '.join(e['classes'])}")
             return 0
@@ -2082,6 +2348,8 @@ def cmd_world(args) -> int:
                 raise RiftError("say which enemy: riftstone world enemy goblin (or em0100)")
             em = w.find_enemy(" ".join(rest))
             e = w.enemies[em]
+            if args.json:
+                return emit({"id": em, **e, "spawns": w.spawns_of(em)[:args.limit]})
             ui.ok(f"{em} {e['name']}: {e['placements']} placements in {len(e['stages'])} stage(s)"
                   + (f"; archive {e['archive']}" if e["archive"] else ""))
             for sp in w.spawns_of(em)[:args.limit]:
@@ -2093,6 +2361,8 @@ def cmd_world(args) -> int:
             if not rest:
                 raise RiftError("say which archive: riftstone world deps rom/enemy/em0200 (or shellhellhound)")
             hit, pulls, pulled_by = w.deps(" ".join(rest))
+            if args.json:
+                return emit({"archives": hit, "pulls": pulls[:args.limit], "pulled_by": pulled_by[:args.limit]})
             ui.ok(", ".join(hit[:6]) + (f" (+{len(hit) - 6})" if len(hit) > 6 else ""))
             ui.info(f"pulls in {len(pulls)} archive(s)" + (":" if pulls else ""))
             for a in pulls[:args.limit]:
@@ -2113,6 +2383,10 @@ def cmd_world(args) -> int:
             g = w.group(s, t, n)
             if g is None:
                 raise RiftError(f"stage {s} has no {lot.TYPES[t]} group {n}")
+            if args.json:
+                return emit({**g, "layouts": [{"name": name, **w.layouts[name],
+                                               "placements": w.placements_in(name)[:args.limit]}
+                                              for name in w.layouts_of(s, t, n)]})
             ui.ok(f"Stage {s}, {lot.TYPES[t]} group {n} ({g['list']})")
             ui.info(f"units {_units(w, g['units'])}; spawns {'all' if g['count_max'] < 0 else g['count_max']}, "
                     f"respawn type {g['respawn']}, {_story(g)}, hours {g['hours'][0]}..{g['hours'][1]}"
@@ -2182,26 +2456,34 @@ def _ddo_access(args, game: Game) -> int:
 
     assets = ddo.need_assets(game)
     ui.step(f"Reading the local server's mission quests ({assets})")
-    p = ddo_access.plan(assets, fill_pawns=args.fill_pawns)
-    for line in ddo_access.report_lines(ddo_access.audit(assets)):
+    # the quests as the server shipped them: while Solo Access is installed the live files are its own copies
+    p = ddo_access.plan(assets, fill_pawns=args.fill_pawns, game=game)
+    for line in ddo_access.report_lines(p.report):
         ui.info(line)
     for n in p.notes:
         ui.info(n)
     if not args.mod:
         ui.info('write the fix as a mod with --mod "Solo Access" (nothing is written without it)')
         return 0
-    if not p.files:
+    root = Path(args.mod)
+    # copies an earlier run wrote that this one does not: kept, install would put them back over the server's own
+    stale = ddo_access.stale(root, p)
+    if not p.files and not stale:
         ui.ok("Nothing to write: every mission already starts for one player")
         return 0
     if args.dry_run:
-        ui.ok(f"Dry run: {len(p.files)} quest file(s) would go into {Path(args.mod)}; nothing written")
+        for rel in stale:
+            ui.info(f"would remove {rel}: no longer needed")
+        ui.ok(f"Dry run: {len(p.files)} quest file(s) would go into {root}; nothing written")
         return 0
-    written = ddo_access.write(Path(args.mod), p)
-    root = Path(args.mod).resolve()
+    written = ddo_access.write(root, p)
+    root = root.resolve()
     for rel in written:
         ui.ok(f"-> {rel}  ({ui.human(len(p.files[rel]))})")
+    for rel in stale:
+        ui.ok(f"removed {rel}: no longer needed")
     ui.info(f'next: riftstone install "{root}" --game ddo, then restart the local server '
-            "(C:\\Dev\\DDO\\ddon.cmd server stop, then start it or Play Solo.cmd)")
+            "(<path> server stop, then start it or Play Solo.cmd)")
     ui.info(f'remove it: riftstone uninstall "{root}" --game ddo (restart the server after)')
     ui.info("the files are checked; how a solo party then plays the content is UNKNOWN until you play it")
     return 0
@@ -2240,7 +2522,7 @@ def _ddo_solo(args, game: Game) -> int:
     for rel in written:
         ui.ok(f"-> {rel}  ({ui.human(len(p.files[rel]))})")
     ui.info(f'next: riftstone install "{root}" --game ddo, then restart the local server '
-            "(C:\\Dev\\DDO\\ddon.cmd server stop, then start it or Play Solo.cmd)")
+            "(<path> server stop, then start it or Play Solo.cmd)")
     ui.info(f'remove it: riftstone uninstall "{root}" --game ddo (restart the server after)')
     ui.info("the files are checked; how it plays is UNKNOWN until you play it")
     return 0
@@ -2427,16 +2709,19 @@ def cmd_dungeon(args) -> int:
     hours = encounter.parse_hours(args.hours) if args.hours else None
     if args.plan and Path(args.plan).exists() and not args.force:
         raise RiftError(f"{args.plan} exists; pass --force to replace it")
+    # the mod first: a --mod that is not one is refused before anything is planned or a --plan saved, and its own
+    # navigation mesh (when it has one) is the ground the encounters and the check stand on
+    root = Mod.load(Path(args.mod)).root if args.mod else None
     idx = _index(game)
     try:
         w = _world(game, idx)
         b = bestiary.load(game, idx, w, rebuild=args.rebuild)
-        only = {w.find_enemy(e) for e in args.enemies.split(",")} if args.enemies else None
-        exclude = {w.find_enemy(e) for e in args.exclude.split(",")} if args.exclude else set()
+        only = {w.find_enemy(e) for e in args.enemies.split(",") if e.strip()} if args.enemies else None
+        exclude = {w.find_enemy(e) for e in args.exclude.split(",") if e.strip()} if args.exclude else set()
         s = encounter.parse_stage(args.stage)
         d = dungeon.direct(game, idx, w, s, seed=args.seed, grammar=grammar, which=args.pool, only=only,
                            exclude=exclude, spacing=args.spacing, max_points=args.at_once, b=b,
-                           keep_lots=args.keep_lot_flags)
+                           keep_lots=args.keep_lot_flags, mod_root=root)
         text = dungeon.plan_text(d, args.story, hours)
         if args.json:
             print(text)
@@ -2450,27 +2735,19 @@ def cmd_dungeon(args) -> int:
         if args.plan:
             Path(args.plan).write_text(text + "\n", encoding="utf-8")
             ui.ok(f"plan saved: {args.plan} (riftstone encounters \"{args.plan}\" --mod <mod> writes it)")
-        if not args.mod:
+        if root is None:
             if not args.plan:
                 ui.info("nothing written: --mod <mod> writes these encounters into a mod, --plan <file> saves the plan")
             return 0
-        root = Mod.load(Path(args.mod)).root
         entries = encounter_plan.parse(text)
-        done = encounter_plan.apply(game, idx, w, root, entries, dry_run=args.dry_run)
+        # checked before anything is written: every encounter planned in a scratch copy of the mod first (the group
+        # numbers and refusals a real run gets), every spawn point found on the mesh in the doors' region
+        done = encounter_plan.apply(game, idx, w, root, entries, dry_run=True)
         proof = dungeon.check(d.space, [enc for _, enc, _ in done])
         for _, enc, files in done:
             for n in enc.notes:
                 if "spawn point" in n and ("fit" in n or "from walkable" in n) or "open ground" in n:
                     ui.warn(f"{enc.enemy}: {n}")
-        if not args.dry_run:                  # the files as written, read back
-            layouts = []
-            for _, enc, files in done:
-                for f in files:
-                    if f.name.endswith(".lot.yaml"):
-                        layouts.append(lot.yaml_to_bytes(f.read_text(encoding="utf-8"), str(f)))
-            written = dungeon.check_layouts(d.space, layouts)
-            if written.points != proof.points or written.problems:
-                raise RiftError(f"the written layouts differ from the plan: {written.problems[:3]}")
         ui.ok(f"checked: {proof.on_mesh} of {proof.points} spawn points on stage {d.space.nav_stage}'s navigation mesh, "
               f"{proof.in_region} reached on foot from the doors (the farthest {proof.farthest:.0f} m in)")
         for problem in proof.problems[:8]:
@@ -2478,9 +2755,21 @@ def cmd_dungeon(args) -> int:
         if args.dry_run:
             ui.info("dry run: nothing written")
             return 0 if not proof.problems else 1
+        if proof.problems:
+            raise RiftError(f"{len(proof.problems)} spawn point(s) are not on ground reached from the doors; nothing "
+                            "written")
+        done = encounter_plan.apply(game, idx, w, root, entries)
+        layouts = []                          # the files as written, read back
+        for _, enc, files in done:
+            for f in files:
+                if f.name.endswith(".lot.yaml"):
+                    layouts.append(lot.yaml_to_bytes(f.read_text(encoding="utf-8"), str(f)))
+        written = dungeon.check_layouts(d.space, layouts)
+        if written.points != proof.points or written.problems:
+            raise RiftError(f"the written layouts differ from the plan: {written.problems[:3]}")
         ui.ok(f"{len(done)} encounter(s) written into {root.name}. riftstone install \"{root.name}\" puts them into the "
               "game; how it plays is UNKNOWN until played")
-        return 0 if not proof.problems else 1
+        return 0
     finally:
         idx.close()
 
@@ -2573,6 +2862,14 @@ def cmd_skin(args) -> int:
               f"(the rest vanilla), {len(fam.materials)} materials pointed at model\\...\\s{args.number:02d}")
         for f in skins.write(root, fam, args.number, res, args.title or "", args.source or ""):
             ui.info(f.relative_to(root).as_posix())
+        variant = skins.ddo_variant_of_folder(Path(args.textures))
+        if variant is not None:          # tools/ddo_skins.py's folder: the package carries this recipe instead
+            skins.record_ddo(root, fam, args.number, variant, res)
+            ui.info(f"made from Dragon's Dogma Online's {variant} chimera: a package of this mod carries the recipe, "
+                    "and each player's Riftstone makes the maps from their own Online client")
+        elif skins.mark_other_game(root, fam, args.number, tex_in):
+            ui.warn("some maps are Dragon's Dogma Online textures: they stay in this mod on this PC, and a package "
+                    "refuses to carry them (make the skin with 'riftstone monster convert ... --as-skin' instead)")
         ui.info(f"place it: riftstone encounter <stage> {fam.enemy} --count 1 --at x,y,z --skin {args.number} "
                 f"--mod \"{root.name}\" (needs the enemy_skins plugin)")
         return 0
@@ -2610,7 +2907,7 @@ def cmd_monster(args) -> int:
             games[k] = find_game(k)
         except RiftError:
             raise RiftError(f"riftstone monster compares both games, and {KINDS[k]['title']} was not found (--game "
-                            "cannot stand in: set RIFTSTONE_DDO for Online)") from None
+                            "cannot stand in: set RIFTSTONE_GAME to its folder, or RIFTSTONE_DDO for Online)") from None
     quiet = bool(getattr(args, "json", False))
     idxs = {k: _index(g, quiet) for k, g in games.items()}
     try:
@@ -2793,6 +3090,10 @@ def cmd_loader(args) -> int:
     from . import install, loader, runtime
 
     game = _game(args)
+    if args.action in ("status", "install", "remove") and (args.plugin_action or args.file):
+        # a plugin's words after these went unread: 'loader remove remove x.asi' removed the loader itself
+        raise RiftError(f"'loader {args.action}' takes no more words; plugins: riftstone loader plugin list|add|"
+                        "remove|release, safe mode: riftstone loader safe-mode status|off")
     if args.action == "status":
         s = loader.status(game)
         version = runtime.loader_version(game.root / "dinput8.dll") if s["installed"] else None
@@ -2804,9 +3105,9 @@ def cmd_loader(args) -> int:
         if st["safe_mode"]:
             ui.warn("SAFE MODE is on: the game starts without plugins and mods ('riftstone loader safe-mode off')")
         _show_session_end(runtime.session_end(game.root, running=install.game_running(game)))
-        quarantined = set(st["quarantine"])
+        quarantined = {q.lower() for q in st["quarantine"]}       # the loader keeps unusual names in lower case
         for p in s["plugins"]:
-            ui.info(f"plugin: {p}" + ("  (QUARANTINED)" if p in quarantined else ""))
+            ui.info(f"plugin: {p}" + ("  (QUARANTINED)" if p.lower() in quarantined else ""))
         for r in runtime.list_reports(game.state_dir / "logs")[:5]:
             ui.info(f"{r['kind']} report: {r['path']}")
         if s["log"]:
@@ -2815,6 +3116,8 @@ def cmd_loader(args) -> int:
     if args.action == "d3d9":
         return _loader_d3d9(game, args)
     if args.action == "safe-mode":
+        if args.plugin_action not in (None, "status", "off"):
+            raise RiftError(f"'loader safe-mode {args.plugin_action}': safe-mode takes status or off")
         if args.plugin_action == "off":
             was = runtime.safe_mode_off(game.root)
             ui.ok("safe mode is off: the next start loads plugins and mods again" if was else
@@ -2824,15 +3127,20 @@ def cmd_loader(args) -> int:
             ui.ok("safe mode is " + ("ON: the game starts without plugins and mods" if st["safe_mode"] else "off"))
         return 0
     if args.action == "plugin":
+        # each action by name: 'off' and 'status' (safe-mode's words) fell through to remove and deleted the plugin
+        if args.plugin_action not in (None, "list", "add", "remove", "release"):
+            raise RiftError(f"'loader plugin {args.plugin_action}': plugin takes list, add <file>, remove <name> or "
+                            f"release <name> ('{args.plugin_action}' goes with safe-mode)")
+        if args.plugin_action in ("add", "remove", "release") and not args.file:
+            raise RiftError(f"name the plugin: riftstone loader plugin {args.plugin_action} "
+                            + ("<.asi or .dll file>" if args.plugin_action == "add" else "<name>"))
         if args.plugin_action == "release":
-            if not args.file:
-                raise RiftError("name the plugin: riftstone loader plugin release <name>")
             if runtime.release_plugin(game.root, args.file):
                 ui.ok(f"{args.file} is out of quarantine; the next start loads it")
             else:
                 ui.info(f"{args.file} was not quarantined")
             return 0
-        if args.plugin_action == "list":
+        if args.plugin_action in (None, "list"):
             names = loader.list_plugins(game)
             ui.ok(f"{len(names)} plugin(s) in {loader.plugins_dir(game)}")
             for n in names:
@@ -2853,7 +3161,7 @@ def cmd_loader(args) -> int:
                 ui.info(f"settings: {ini}")
             if not game.loader_installed():
                 ui.warn("the loader is not installed yet; run 'riftstone loader install' so plugins load")
-        else:
+        elif args.plugin_action == "remove":
             loader.remove_plugin(game, args.file)
             ui.ok(f"Removed plugin {args.file}")
         return 0
@@ -2868,14 +3176,15 @@ def cmd_loader(args) -> int:
         if r["chained"]:
             ui.info(f"your previous dinput8.dll now loads through Riftstone as {r['chained']}")
         if r["mods_moved_to_overlay"]:
-            ui.info(f"moved to overlay mode: {', '.join(r['mods_moved_to_overlay'])}")
+            ui.info(f"served from the overlay: {', '.join(r['mods_moved_to_overlay'])}")
     else:
         r = loader.remove_loader(game, idx)
-        ui.ok("Loader removed")
+        ui.ok("Loader removed: the game runs as Steam installed it")
         if r["restored_other_dinput8"]:
             ui.info("your previous dinput8.dll is back in place")
-        if r["mods_moved_to_direct"]:
-            ui.info(f"re-installed directly: {', '.join(r['mods_moved_to_direct'])}")
+        if r["mods_waiting"]:
+            ui.info(f"these mods are off until the loader is back (Riftstone.cmd loader install): "
+                    f"{', '.join(r['mods_waiting'])}")
     return 0
 
 
@@ -2981,7 +3290,7 @@ def _show_session_end(end: dict | None) -> None:
 
 
 def cmd_crash(args) -> int:
-    from . import install, runtime
+    from . import install, legal, runtime
 
     game = _game(args)
     logs = game.state_dir / "logs"
@@ -3010,8 +3319,8 @@ def cmd_crash(args) -> int:
     rep = runtime.parse_report(chosen["path"].read_text(encoding="utf-8", errors="replace"))
     lines = runtime.explain(rep, game.root)
     if args.json:
-        print(json.dumps({"report": str(chosen["path"]), "facts": rep, "explanation": lines, "session_end": end},
-                         indent=1, default=str))
+        print(json.dumps({"report": str(chosen["path"]), "facts": rep, "explanation": lines, "session_end": end,
+                          "support": legal.SUPPORT}, indent=1, default=str))
         return 0
     if not args.report:
         _show_session_end(end)
@@ -3021,6 +3330,7 @@ def cmd_crash(args) -> int:
     for line in lines:
         ui.info(line)
     ui.info(f"the whole report: {chosen['path']}")
+    ui.warn(legal.SUPPORT)
     return 0
 
 
@@ -3080,6 +3390,11 @@ def cmd_saves(args) -> int:
     if args.action == "backup":
         if not found:
             raise RiftError("no DDDA.sav found under Steam's userdata; pass --save <file>")
+        for a, p in found:
+            # a folder given as --save: its parent folder was copied as if it were the save's
+            if not p.is_file():
+                raise RiftError(f"--save {p}: " + ("a folder; name the DDDA.sav in it" if p.is_dir() else
+                                                   "no such file"))
         for a, p in found:
             try:
                 saves.check(p.read_bytes())
@@ -3161,7 +3476,8 @@ def cmd_saves(args) -> int:
         ui.warn(f"this puts {b.name} ({b.kind}) back as {what} in {target.parent}; what it replaces is kept first. "
                 "Steam Cloud may then ask which save to keep: choose this PC's. Run again with --yes to do it.")
         return 1
-    running = install.game_running(game)
+    # no game folder: the game is looked for by its exe's name (game_running(None) raised AttributeError)
+    running = install.game_running(game) if game else install.exe_running("DDDA.exe")
     kept = saves.restore_backup(b, target, plugin_root, game_running=lambda: running)
     ui.ok(f"Restored {b.name} ({b.kind}) to {target.parent}")
     ui.info(f"what it replaced is kept as {kept}" if kept else "the save already held these bytes; nothing changed")
@@ -3251,8 +3567,8 @@ def cmd_auto(paths: list[str]) -> int:
             else:
                 ui.fail(f"{raw} does not exist")
                 code = 1
-        except RiftError as e:
-            ui.fail(str(e))
+        except (RiftError, OSError) as e:           # the next dropped path still gets its turn
+            ui.fail(_os_error(e) if isinstance(e, OSError) else str(e))
             code = 1
     return code
 
@@ -3272,11 +3588,17 @@ def cmd_vfs(args) -> int:
         target = Path(path).resolve()
         if any(target.is_relative_to(root) for root in protected):
             raise RiftError("vfs output must be outside every base/mod source folder")
-        with target.open("xb") as stream: stream.write(data)
+        try:
+            with target.open("xb") as stream: stream.write(data)
+        except FileExistsError:
+            raise RiftError(f"{target} already exists; vfs writes only a new file") from None
     if args.out and not args.read:
         raise RiftError("vfs --out requires --read PATH")
     if args.read:
-        data = view.open(args.read).read()
+        try:
+            data = view.open(args.read).read()
+        except FileNotFoundError:
+            raise RiftError(f"--read {args.read}: the snapshot has no such file") from None
         if args.out:
             write_new(args.out, data)
         view.report["read"] = {"path": args.read, "bytes": len(data), "output": args.out}
@@ -3289,11 +3611,44 @@ def cmd_vfs(args) -> int:
     return 0
 
 
+def _count(text: str) -> int:
+    """--limit, --top: a whole number of at least 1 (0 showed 'nothing matches', a negative one everything,
+    or every type but the last)."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"is at least 1, not {n}")
+    return n
+
+
+def _port(text: str) -> int:
+    """studio --port: 0 (any free port) to 65535 (outside it the server's bind raised OverflowError)."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if not 0 <= n <= 65535:
+        raise argparse.ArgumentTypeError(f"is 0 (any free port) to 65535, not {n}")
+    return n
+
+
+# A value may start with a minus: positions (--at -100,-350,-8800; half of Gransys has negative x), which
+# argparse takes for an unknown option unless it is a plain number like -5.
+_NEGATIVE = re.compile(r"^-\.?\d")
+
+
+def _takes_negatives(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    p._negative_number_matcher = _NEGATIVE          # argparse's own test for "a number, not an option"
+    return p
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="riftstone",
                                  description="Modding toolchain for Dragon's Dogma: Dark Arisen and Dragon's Dogma Online.",
                                  epilog=QUICK, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--version", action="version", version=f"riftstone {__version__}")
+    ap.add_argument("--version", action="version", version=f"riftstone {__version__}\n" + _legal_lines())
     sub = ap.add_subparsers(dest="cmd", metavar="<command>")
 
     def add(name, fn, help_text, game=True, aliases=()):
@@ -3327,7 +3682,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("find", cmd_find, "search every resource in the game by name (--game both: both games)")
     p.add_argument("text")
     p.add_argument("--type", help="only this extension, e.g. statusparam, mod, tex")
-    p.add_argument("--limit", type=int, default=60)
+    p.add_argument("--limit", type=_count, default=60)
     p.add_argument("--json", action="store_true")
     p = add("extract", cmd_extract, "copy original resource(s) out of the game (parameters as YAML)")
     p.add_argument("resources", nargs="+", help="engine path with extension, e.g. param/status/enemy.statusparam")
@@ -3358,7 +3713,7 @@ def build_parser() -> argparse.ArgumentParser:
                                      "and whether it ports", game=False)
     p.add_argument("resource", help="engine path, e.g. ui/00_message/enemy/enemy_name.gmd")
     p.add_argument("--as", dest="as_", help="the path in the game that lacks the first one")
-    p.add_argument("--limit", type=int, default=12)
+    p.add_argument("--limit", type=_count, default=12)
     p = add("import", cmd_import, "turn changed archives (another tool's output, an old archive mod) into a mod "
                                    "of only what changed, so it merges with other mods")
     p.add_argument("paths", nargs="+", help="archives, or folders of archives (e.g. a copy of nativePC)")
@@ -3367,7 +3722,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--per-archive", action="store_true", help="never merge a change into files/")
     p = add("new", cmd_new, "create a mod (in the mods folder, where Studio and --mod \"<name>\" find it)", game=False)
     p.add_argument("folder", metavar="name", help='the mod\'s name ("Harder Goblins"), or a folder path')
-    p.add_argument("--game", choices=["ddda", "ddo"], help="the game the mod is for (default ddda)")
+    p.add_argument("--game", choices=["ddda", "ddo"], help="the game the mod is for (default: $RIFTSTONE_GAME's "
+                                                           "game, else ddda)")
     p.add_argument("--name", help="a name to show that differs from the folder's")
     p.add_argument("--author")
     p.add_argument("--here", action="store_true", help="make it in the current folder, not the mods folder")
@@ -3390,7 +3746,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("mods", nargs="*")
     p = add("index", cmd_index, "(re)build the resource index and show resource types")
     p.add_argument("--rebuild", action="store_true")
-    p.add_argument("--top", type=int, default=20)
+    p.add_argument("--top", type=_count, default=20, help="how many resource types to list (default 20)")
     p = add("open", cmd_open, "open any resource to the best view: YAML if editable, else a structured read-out")
     p.add_argument("targets", nargs="+", help="a file on disk, or an engine path like scr/st443/etc/st443_00m00n_e20.lot")
     p.add_argument("--arc", help="take it from this archive")
@@ -3417,8 +3773,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--like", help="from-dds: the original .tex whose format to keep "
                                   "(default: a .tex next to the .dds)")
     p.add_argument("-o", "--out", help="write here instead of next to the input")
-    p = add("terrain", cmd_terrain, "Gransys terrain cells: where a stage model sits, and moving a cell model or "
-                                    "its collision between the cell's frame and the world (the 'floating terrain' fix)")
+    p = _takes_negatives(add("terrain", cmd_terrain, "Gransys terrain cells: where a stage model sits, and moving a "
+                                                     "cell model or its collision between the cell's frame and the "
+                                                     "world (the 'floating terrain' fix)"))
     p.add_argument("action", choices=["cells", "where", "check", "localize", "worldize"])
     p.add_argument("target", nargs="?", default="", help="where: an engine name, a file or a world position x,z; "
                                                            "check/localize/worldize: a cell's .mod or .sbc file")
@@ -3437,7 +3794,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("action", choices=["info", "keys", "bones", "convert"])
     p.add_argument("targets", nargs="+", help="a .lmt file, or an engine path like motion/pl/m/m00/m0004_at/m0004_at.lmt")
     p.add_argument("--motion", type=int, help="keys: the motion slot (lmt info lists them)")
-    p.add_argument("--limit", type=int, default=12, help="info: motions shown; keys: keys shown per track")
+    p.add_argument("--limit", type=_count, default=12, help="info: motions shown; keys: keys shown per track")
     p.add_argument("--to", choices=["ddda", "ddo"], help="convert: the game to convert for")
     p.add_argument("--drop-bones", help="convert: remove the tracks of these joint ids, e.g. 55,150-154 (the "
                                         "player weapon joints the two games rig differently)")
@@ -3462,7 +3819,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vs-game", choices=["ddda", "ddo"], help="the game the second model is in (default --game)")
     p.add_argument("--tolerance", type=float, default=0.5, help="offset difference that counts, model units")
     p.add_argument("--arc", help="take the first one from this archive")
-    p = add("spawns", cmd_spawns, "list a layout's records; copy (add) or remove one inside a mod")
+    p = _takes_negatives(add("spawns", cmd_spawns, "list a layout's records; copy (add) or remove one inside a mod"))
     p.add_argument("action", choices=["list", "copy", "remove"])
     p.add_argument("layout", help="a layout, e.g. scr/st100/etc/st100_45m55n_e143.lot")
     p.add_argument("number", nargs="?", type=int, help="copy/remove: the record's number (spawns list)")
@@ -3476,10 +3833,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rebuild", action="store_true", help="re-read the game (the map is cached)")
     p.add_argument("--lang", default="eng", choices=["eng", "fre", "ger", "ita", "spa", "jpn", "zht"],
                    help="language of the enemy and room names (default eng)")
-    p.add_argument("--limit", type=int, default=60)
+    p.add_argument("--limit", type=_count, default=60)
     p.add_argument("--all", action="store_true", help="enemies: also those only named in group lists")
     p.add_argument("--json", action="store_true")
-    p = add("encounter", cmd_encounter, "add N of an enemy to a stage as a new enemy group, e.g. 100 goblins")
+    p = _takes_negatives(add("encounter", cmd_encounter, "add N of an enemy to a stage as a new enemy group, e.g. "
+                                                         "100 goblins"))
     p.add_argument("stage", help="the stage, e.g. 424 or st424 (riftstone world stages)")
     p.add_argument("enemy", nargs="+", help="the enemy: em0100, goblin, 'greater goblin' ...")
     p.add_argument("--count", type=int, required=True, help="how many in total")
@@ -3620,16 +3978,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rebuild", action="store_true", help="read both games again (the census is cached)")
     p.add_argument("--dry-run", action="store_true", help="convert: show the plan, write nothing")
     p.add_argument("--json", action="store_true", help="list: machine-readable")
-    p = add("package", cmd_package, "one zip for players without Riftstone: the loader, plugins and the mods' "
-                                    "archives, to unzip into the game folder")
-    p.add_argument("mods", nargs="*", help="the mod folders, in priority order like install")
-    p.add_argument("--out", required=True, help="the .zip to write, e.g. dist\\my-mods.zip")
+    p = add("package", cmd_package, "share mods with no game data: a zip of deltas and recipes that each player's "
+                                    "Riftstone turns into the mods from their own game (package install), or "
+                                    "check one; --plugins-only: the loader and plugins for players without Riftstone")
+    p.add_argument("items", nargs="*", metavar="mod | install ZIP | check ZIP",
+                   help="the mod folders, in priority order like install; or: install <zip>, check <zip>")
+    p.add_argument("--out", help="make, --plugins-only: the .zip to write, e.g. dist\\my-mods.zip")
     p.add_argument("--plugins-only", action="store_true", dest="plugins_only",
-                   help="a loader + plugins zip with no game data (all built plugins unless --plugin is given)")
-    p.add_argument("--plugin", action="append", help="a native plugin to include (.asi; its .ini comes along); "
+                   help="a loader + plugins zip with no mods and no game data, to unzip into the game folder "
+                        "(Riftstone's stable built plugins unless --plugin names them; experimental ones only by name)")
+    p.add_argument("--ninput", nargs="?", const="built", metavar="XINPUT1_3.DLL",
+                   help="--plugins-only: add Ninput (EXPERIMENTAL) under optional\\ninput, off until a player copies it "
+                        "(default: native\\ninput's own build)")
+    p.add_argument("--plugin", action="append", help="make: a native plugin to include (.asi; its .ini comes along); "
                                                      "repeat for more")
-    p.add_argument("--name", help="the package's title (default: the mods' names)")
-    p.add_argument("--force", action="store_true", help="replace the .zip if it exists")
+    p.add_argument("--name", help="make: the package's title (default: the mods' names)")
+    p.add_argument("--force", action="store_true", help="make: replace the .zip if it exists")
+    p.add_argument("--into", help="install: the folder of mods to make them in (default: Studio's mods folder)")
+    p.add_argument("--json", action="store_true", help="check: machine-readable")
     p = add("items", cmd_items, "items: list, add (new), stats and set (an item's fields), sell (shop), craft (recipe), "
                                 "drop (sets, drop)")
     p.add_argument("action", choices=["list", "new", "stats", "set", "shop", "recipe", "sets", "drop"])
@@ -3654,14 +4020,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stock", type=int, default=3, help="new/shop: how many the shop has (default 3)")
     p.add_argument("--restock", type=int, default=5, help="new/shop: the shop's restock setting (default 5)")
     p.add_argument("--free", action="store_true", help="list: show the unused slots instead")
-    p.add_argument("--limit", type=int, default=60)
+    p.add_argument("--limit", type=_count, default=60)
     p = add("text", cmd_text, "find a line of game text, or add a line to a text file in every language")
     p.add_argument("action", choices=["find", "add"])
     p.add_argument("rest", nargs="+", metavar="words | file line",
                    help='find: the words to look for; add: a text file and the line, e.g. '
                         'id/npc_wind/stage/st100_eng.gmd "A new line."')
     p.add_argument("--lang", help="find: which language to search, or 'all' (default english; all for DDO)")
-    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--limit", type=_count, default=50)
     p.add_argument("--mod", help="add: the mod that gets the line")
     p.add_argument("--label", help="add: give the new line a label")
     p.add_argument("--one-language", action="store_true",
@@ -3674,8 +4040,8 @@ def build_parser() -> argparse.ArgumentParser:
             "plugin, safe-mode")
     p.add_argument("action", choices=["status", "install", "remove", "plugin", "safe-mode", "d3d9"])
     p.add_argument("plugin_action", nargs="?", choices=["list", "add", "remove", "release", "status", "off"],
-                   default="list", help="with 'plugin': list, add <file>, remove <name>, release <name> (from "
-                   "quarantine); with 'safe-mode': status or off; with 'd3d9': status, add <DXVK release, folder "
+                   help="with 'plugin': list (the default), add <file>, remove <name>, release <name> (from "
+                   "quarantine); with 'safe-mode': status (the default) or off; with 'd3d9': status (the default), add <DXVK release, folder "
                    "or x32 d3d9.dll> (into riftstone\\dxvk, named in [d3d9] chain) or off")
     p.add_argument("file", nargs="?", help="the .asi/.dll to add, or the plugin name to remove or release; with "
                    "'d3d9 add': DXVK's release")
@@ -3710,7 +4076,7 @@ def build_parser() -> argparse.ArgumentParser:
                                     "else %%LOCALAPPDATA%%\\Riftstone\\saves)")
     p.add_argument("--json", action="store_true")
     p = add("studio", cmd_studio, "open Riftstone Studio in your browser")
-    p.add_argument("--port", type=int, default=0)
+    p.add_argument("--port", type=_port, default=0, help="0 (the default): any free port")
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--workspace", help="folder that holds your mods (default: the mods folder, as riftstone mods "
                                        "shows it)")
@@ -3741,6 +4107,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.fn(args)
     except RiftError as e:
         ui.fail(str(e))
+        return 2
+    except OSError as e:        # a file named that is missing or a folder, one in use, a folder that is a file
+        ui.fail(_os_error(e))
         return 2
     except KeyboardInterrupt:
         ui.fail("stopped")

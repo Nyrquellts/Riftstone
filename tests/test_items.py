@@ -97,7 +97,9 @@ class ItlTest(unittest.TestCase):
         for bad in (text.replace("id: 2", "id: 9"), text.replace("buy: 140", "buy: -1"),
                     text.replace("buy: 140", "buy: 99999999999"), text.replace("weight: 0.2", "weight: heavy"),
                     text.replace("sell: 56", "sell: [1]"), text + "  - id: 5\n    raw: abcd\n",
-                    text.replace("    buy: 140", "    colour: red")):
+                    text.replace("    buy: 140", "    colour: red"),
+                    text.replace("stamp:", "stmp:"), text.replace("items:", "reserved: 1\ncolour: 3\nitems:")):
+            self.assertNotEqual(bad, text)                  # the top-level keys were never checked
             with self.assertRaises(ParamError, msg=bad[-200:]):
                 itl.yaml_to_bytes(bad, "t.yaml")
 
@@ -219,7 +221,8 @@ class ItemsTest(unittest.TestCase):
     def test_new_item_refusals(self):
         for kwargs in ({"name": " ", "like": "1"}, {"name": "x", "like": "nothing"}, {"name": "x", "like": "1", "slot": 2},
                        {"name": "x", "like": "1", "slot": 99}, {"name": "x\0", "like": "1"},
-                       {"name": "x", "like": "1", "buy": -5}):
+                       {"name": "x", "like": "1", "buy": -5},
+                       {"name": "x", "like": "1", "weight": 10 ** 400}):   # was: OverflowError from float()
             with self.assertRaises(RiftError, msg=kwargs):
                 items.new(self.game, self.idx, self.mod.root, **kwargs)
         self.assertFalse((self.mod.root / "files" / "etc").exists())   # nothing was written

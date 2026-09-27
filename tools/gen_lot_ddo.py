@@ -11,7 +11,7 @@ DDO.exe's own loaders -- no field is guessed.
   names           the member each value is stored to, looked up in that class's MtDTI properties
 
 Dev-only: needs capstone, the unpacked client exe and the DDO toolkit's symbol map and property dump:
-    python tools/gen_lot_ddo.py [--exe DDO.exe] [--re C:\\Dev\\DDO\\re\\out] [--check]
+    python tools/gen_lot_ddo.py [--exe DDO.exe] [--re <path>] [--check]
 --check parses every distinct layout in the client with the result (22,983 of 22,983 on 03.04.003).
 """
 from __future__ import annotations

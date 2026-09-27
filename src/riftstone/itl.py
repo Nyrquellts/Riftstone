@@ -273,6 +273,10 @@ def from_yaml(text: str, source: str | None = None) -> ItemList:
     doc = yamlish.parse(text, source)
     if not isinstance(doc, Map) or not isinstance(doc.get("riftstone"), Scalar) or doc.get("riftstone").text not in TAGS:
         raise ParamError(f"not a Riftstone item list (expected 'riftstone: {TAG}')", 1, 1, source)
+    for k, _ in doc.items:                  # was: a misspelled stamp or reserved silently took the default
+        if k.text not in ("riftstone", "resource", "stamp", "reserved", "items"):
+            raise ParamError(f"an item list has riftstone, resource, stamp, reserved and items, not {k.text!r}",
+                             k.line, k.col, source)
     t = ItemList()
     if doc.get("stamp") is not None:
         t.stamp = _u32(doc.get("stamp"), "stamp", source)

@@ -42,7 +42,7 @@ import math
 import struct
 from dataclasses import dataclass, field
 
-from . import typemap, xfsclasses
+from . import typemap, xfsclasses, yamlish
 from .errors import FormatError
 
 MAGIC = b"XFS\0"
@@ -51,7 +51,11 @@ VERSION_DDO = 0x000F      # Dragon's Dogma Online
 HEADER = struct.Struct("<4sHHIII")
 HEADER_DDO = struct.Struct("<4sHHIIII")   # + u32 reserved after the object count
 NULL_REF = b"\xfe\xff\x00\x00"
-MAX_DEPTH = 256
+# Objects nest no deeper than a parameter file holds (98): in YAML the root object is one level down, an
+# object in a list two more, and a list of resource references two more.  Vanilla files nest at most 12
+# deep (Dark Arisen) and 11 (Online).
+MAX_DEPTH = (yamlish.MAX_DEPTH - 3) // 2
+MAX_OBJECTS = 0x10000     # object numbers are 16-bit: 0..65535
 MAX_CLASSES = 4096
 MAX_PROPS = 4096
 MAX_COUNT = 1 << 20
@@ -511,8 +515,8 @@ def build(x: Xfs) -> bytes:
         _U32.pack_into(out, start + 4, len(out) - start - 4)
 
     write_obj(x.root, 0)
-    if counter[0] > 0xFFFF:
-        raise FormatError("XFS", f"{counter[0]} objects; object numbers are 16-bit")
+    if counter[0] > MAX_OBJECTS:
+        raise FormatError("XFS", f"{counter[0]} objects; object numbers are 16-bit ({MAX_OBJECTS} objects at most)")
     if x.version == VERSION_DDO:
         head = HEADER_DDO.pack(MAGIC, VERSION_DDO, x.minor, counter[0], x.extra.get("reserved", 0),
                                len(x.classes), len(defs))

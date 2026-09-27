@@ -7,8 +7,8 @@ previews and for editing textures in any paint program:
   BC5 normal maps (31: red and green are the two channels, blue is rebuilt) and uncompressed (40, BGRA).
 * :func:`encode` -- RGBA pixels as a ``.tex`` with a full mip chain, in a template's format id and
   attributes (BC1 or BC3), so a map that came out of the game goes back as the same kind of texture.
-* :func:`png` / :func:`read_png` -- 8-bit RGBA PNG out; PNG in (grey, grey+alpha, RGB, RGBA, palette;
-  8 or 16 bits; not interlaced).
+* :func:`png` / :func:`read_png` -- 8-bit RGBA PNG out; PNG in (grey, grey+alpha, RGB, RGBA, palette, each
+  with its transparency; 8 or 16 bits; not interlaced).
 * :func:`preview` -- a small PNG of a texture (the largest mip that fits), for pages.
 
 The encoder is a simple one (colour end points on the block's bounding box, indices by projection),
@@ -27,7 +27,7 @@ BC3 = {24, 37, 43, 47}
 BC5 = {31}
 RGBA8 = {40}
 MAX_SIDE = 4096
-MAX_PNG = 64 * 1024 * 1024          # decompressed bytes a PNG may claim
+MAX_PNG = (8 * MAX_SIDE + 1) * MAX_SIDE     # decompressed bytes a PNG may claim: 16-bit RGBA rows at the largest side
 
 
 def codec(fmt: int) -> str:
@@ -307,6 +307,8 @@ def read_png(data: bytes, max_pixels: int = MAX_SIDE * MAX_SIDE) -> tuple[int, i
     chans = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(ctype)
     if chans is None or depth not in (8, 16) or (ctype == 3 and depth != 8):
         raise FormatError("png", "only 8- or 16-bit grey, RGB, RGBA and 8-bit palette PNGs are supported")
+    if trns is not None and ctype in (0, 2) and len(trns) != 2 * chans:
+        raise FormatError("png", "its transparent colour (tRNS) does not fit the image")
     bpp = chans * depth // 8
     stride = w * bpp
     if (stride + 1) * h > MAX_PNG:
@@ -343,17 +345,18 @@ def read_png(data: bytes, max_pixels: int = MAX_SIDE * MAX_SIDE) -> tuple[int, i
             raise FormatError("png", f"unknown row filter {ft}")
         img[y * stride:(y + 1) * stride] = line
         prev = line
+    n = w * h
+    opaque = _keyed(img, n, chans, depth, trns) if trns is not None and ctype in (0, 2) else b"\xff" * n
     if depth == 16:                          # 16-bit samples: keep the high byte
         img = img[0::2]
-    n = w * h
     out = bytearray(n * 4)
     if ctype == 6:
         out[:] = img
     elif ctype == 2:
-        out[0::4], out[1::4], out[2::4], out[3::4] = img[0::3], img[1::3], img[2::3], b"\xff" * n
+        out[0::4], out[1::4], out[2::4], out[3::4] = img[0::3], img[1::3], img[2::3], opaque
     elif ctype == 0:
         out[0::4] = out[1::4] = out[2::4] = img
-        out[3::4] = b"\xff" * n
+        out[3::4] = opaque
     elif ctype == 4:
         out[0::4] = out[1::4] = out[2::4] = img[0::2]
         out[3::4] = img[1::2]
@@ -365,6 +368,22 @@ def read_png(data: bytes, max_pixels: int = MAX_SIDE * MAX_SIDE) -> tuple[int, i
         out[0::4], out[1::4], out[2::4] = (img.translate(table(plte[k::3])) for k in range(3))
         out[3::4] = img.translate(alpha)
     return w, h, bytes(out)
+
+
+def _keyed(img: bytes, n: int, chans: int, depth: int, trns: bytes) -> bytes:
+    """Alpha for a grey or RGB PNG's colour key (tRNS: one 16-bit value per channel): 0 where every sample
+    of a pixel equals the key's, at full depth, else 255."""
+    width = depth // 8
+    same = None                              # one byte per pixel: 1 while its samples match the key
+    for c in range(chans):
+        v = int.from_bytes(trns[2 * c:2 * c + 2], "big")
+        if v >> depth:
+            return b"\xff" * n               # no sample of this depth can equal it
+        for k, b in enumerate(v.to_bytes(width, "big")):
+            hit = int.from_bytes(img[c * width + k::chans * width].translate(bytes(int(i == b) for i in range(256))),
+                                 "little")
+            same = hit if same is None else same & hit
+    return same.to_bytes(n, "little").translate(bytes([255, 0]) + bytes(254))
 
 
 def preview(t: tex.Tex, side: int = 256) -> tuple[bytes, int, int]:

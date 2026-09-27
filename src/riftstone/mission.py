@@ -42,7 +42,7 @@ MAX_STEPS = 2000
 MAX_RULES = 64
 MAX_PRODUCTIONS = 16
 MAX_SYMBOLS = 16
-_NAME = re.compile(r"\??[A-Za-z][A-Za-z0-9_]{0,31}$")
+_NAME = re.compile(r"\??[A-Za-z][A-Za-z0-9_]{0,31}")     # fullmatch: "$" alone let "Fight\n" through
 
 DEFAULT = {
     "format": FORMAT, "start": "Dungeon",
@@ -77,7 +77,7 @@ class Grammar:
 def parse(text: str) -> Grammar:
     try:
         doc = json.loads(text)
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:            # RecursionError: nesting deeper than the decoder goes
         raise RiftError(f"the mission grammar is not JSON: {e}") from None
     return grammar(doc)
 
@@ -94,7 +94,7 @@ def grammar(doc) -> Grammar:
         raise RiftError(f"rules is an object of 1..{MAX_RULES} named rules")
     out = {}
     for name, prods in rules.items():
-        if not isinstance(name, str) or not _NAME.match(name) or name.startswith("?") or name in KINDS:
+        if not isinstance(name, str) or not _NAME.fullmatch(name) or name.startswith("?") or name in KINDS:
             raise RiftError(f"rule name {name!r}: a word (letters, digits, _), not a beat kind or ?name")
         if not isinstance(prods, list) or not prods or len(prods) > MAX_PRODUCTIONS:
             raise RiftError(f"rule {name}: 1..{MAX_PRODUCTIONS} productions, each a list of symbols")
@@ -103,7 +103,7 @@ def grammar(doc) -> Grammar:
             if not isinstance(p, list) or not p or len(p) > MAX_SYMBOLS or not all(isinstance(s, str) for s in p):
                 raise RiftError(f"rule {name}: a production is a list of 1..{MAX_SYMBOLS} symbol names")
             for s in p:
-                if not _NAME.match(s):
+                if not _NAME.fullmatch(s):
                     raise RiftError(f"rule {name}: {s!r} is not a symbol (a word, optionally starting with ?)")
             ps.append(tuple(p))
         out[name] = tuple(ps)
@@ -114,7 +114,8 @@ def grammar(doc) -> Grammar:
                     raise RiftError(f"rule {name} uses {s!r}, which is neither a rule nor a beat kind "
                                     f"({', '.join(KINDS)})")
     start = doc.get("start")
-    if not isinstance(start, str) or start.lstrip("?") not in out and start not in KINDS:
+    # not "?Rule": every beat would be a side beat, and a mission needs a main path
+    if not isinstance(start, str) or not _NAME.fullmatch(start) or (start not in out and start not in KINDS):
         raise RiftError("start names a rule (or a beat kind)")
     weights = {}
     raw = doc.get("weights", {})

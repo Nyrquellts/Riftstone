@@ -63,14 +63,18 @@ server running (`docs/ONBOARDING.md`, "Dragon's Dogma Online"):
 
 ## A package on a clean install
 
-`Riftstone.cmd package "<your mod>" --out test.zip` makes one zip (add `--plugin <file.asi>` for each plugin).
-To test it:
+`Riftstone.cmd package "<your mod>" --out test.zip` makes one zip. Add `--plugin <file.asi>` for each
+plugin. The zip holds no game files: it has deltas against the player's own game files, plus recipes
+for anything that came from Online (`docs/legal.md`). To test it on a clean install:
 
-1. Use a game folder with nothing of Riftstone in it (a fresh copy, or the Steam folder after
-   `Riftstone.cmd restore` and removing the loader).
-2. Extract the zip into that folder.
-3. Start the game.
-4. Check `riftstone\logs\loader.log`: it exists, the plugins load, and F10 shows the panel.
-5. If Riftstone is on that machine, `Riftstone.cmd playtest` reads that folder like any other.
+1. Use a game folder with nothing of Riftstone in it: a fresh copy, or the Steam folder after
+   `Riftstone.cmd restore` and removing the loader.
+2. On that machine run `Riftstone.cmd package check test.zip`. It shows what the package holds.
+3. Run `Riftstone.cmd loader install`, then `Riftstone.cmd package install test.zip`. That makes the
+   mods from that machine's own game files and checks every file by SHA-256. Then install them as
+   usual with `Riftstone.cmd install "<mod>"`.
+4. Start the game.
+5. Check `riftstone\logs\loader.log`: it exists, the plugins load, and F10 shows the panel. Then run
+   `Riftstone.cmd playtest`.
 
 All of the above stays UNKNOWN in the docs until someone plays it.

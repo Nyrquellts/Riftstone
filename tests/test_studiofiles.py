@@ -17,6 +17,10 @@ import world_fixture
 from riftstone import mod, mrl, params, skins, studio, studiofiles, tex, texcodec, typemap
 from riftstone.errors import RiftError
 
+# the environment this module's classes set (a stand-in RIFTSTONE_HOME) is put back when it ends: a later
+# module that reads the real game (test_compat) otherwise found an empty stand-in index
+setUpModule, tearDownModule = helpers.module_env("RIFTSTONE_HOME", "RIFTSTONE_GAME", "RIFTSTONE_DDO", "RIFTSTONE_DDO_ASSETS", "RIFTSTONE_MODS", "RIFTSTONE_WORKSPACE")
+
 GPL = "files/scr/st424/etc/st424_e.gpl.yaml"
 
 
@@ -139,20 +143,45 @@ class StudioFilesTest(unittest.TestCase):
         layouts = [k for k in rows if k.endswith(".lot.yaml")]
         self.assertTrue(layouts and all(rows[k]["status"] == "adds" for k in layouts))
 
-        # planned into a new, separate mod: it would clash on the group list; a plan creates nothing
+        # planned into a new, separate mod: both change the group list, which install merges; a plan creates nothing
         plan = self.encounter({"new_mod": "Separate"}, dry=True)
         self.assertEqual((plan["mod"], plan["new_mod"], plan["clashes"], plan["written"]),
                          ("Separate", True, ["Chimera Look"], []))
-        self.assertIn("Put this encounter in Chimera Look", plan["note"])
+        self.assertIn("the lists are merged and every mod's groups kept", plan["note"])
         self.assertFalse((self.ws / "Separate").exists())
         self.assertFalse(any("not in any mod" in x for x in self.encounter({"mod": "Chimera Look"}, True, skin=n)["notes"]))
         self.assertTrue(any("not in any mod" in x for x in self.encounter({"mod": "Chimera Look"}, True, skin=77)["notes"]))
         w = self.encounter({"new_mod": "Separate"}, dry=False, skin=n)
         self.assertTrue((self.ws / "Separate" / mod.MOD_FILE).is_file() and w["written"])
         self.assertTrue(any("comes from Chimera Look" in x for x in w["notes"]))
-        self.assertEqual(self.rows("Separate")[GPL]["also"], ["Chimera Look"])
+        self.assertEqual((self.rows("Separate")[GPL]["also"], self.rows("Separate")[GPL]["merges"]), (["Chimera Look"], True))
         look = self.rows("Chimera Look")
         self.assertEqual((look[GPL]["also"], look[skin_rel(n)]["also"]), (["Separate"], []))
+        self.assertFalse(look[skin_rel(n)]["merges"])
+        # installed together, both encounters arrive: the two made apart took one number, so the later one moves
+        self.assertEqual(w["group"], e["group"])
+        from unittest import mock
+
+        from riftstone import install, loader
+        idx = self.s.open_index()
+        try:
+            helpers.stand_in_loader(self.game, idx, self.base / "built")    # Dark Arisen mods install through it
+        finally:
+            idx.close()
+        try:
+            with mock.patch.object(install, "known_vanilla", return_value=None),                     mock.patch.object(install, "game_running", lambda g: False):   # a stand-in, not Steam's game
+                done = self.api("POST", "install", body={"mods": ["Chimera Look", "Separate"]})
+            self.assertEqual([m["mods"] for m in done["merged"]], [["Chimera Look", "Separate"]])
+            self.assertEqual([(r["mod"], r["group"]) for r in done["renumbered"]], [("Separate", w["group"])])
+            self.assertEqual((done["conflicts"], done["unmoved"]), ([], []))
+        finally:
+            with mock.patch.object(install, "game_running", lambda g: False):
+                self.api("POST", "restore")
+                idx = self.s.open_index()
+                try:
+                    loader.remove_loader(self.game, idx)                    # the other tests share this game
+                finally:
+                    idx.close()
 
         # a new mod whose step fails is not made
         with self.assertRaises(RiftError):
@@ -263,6 +292,105 @@ class StudioFilesTest(unittest.TestCase):
         # making the skin again replaces it and keeps what it replaced
         r = self.skin(mod_="Edits", number=n, textures={"e5200_face_BM": {"b64": b64(picture(seed=40))}})
         self.assertTrue(r["kept"] and all((root / k).is_file() for k in r["kept"]))
+
+    def test_a_broken_skins_manifest_is_refused_before_anything_is_kept(self):
+        """Making a skin again copied the files it would replace into aside/_history before the mod's broken
+        skins.json was refused (and skins.write then refused it after writing the new files)."""
+        n = self.skin(new_mod="Hist Mod")["number"]
+        root = self.ws / "Hist Mod"
+        for broken in ("[1]", '{"chimera": []}', "not json"):
+            (root / skins.MANIFEST).write_text(broken, encoding="utf-8")
+            before = sorted((p.relative_to(root).as_posix(), p.read_bytes()) for p in root.rglob("*") if p.is_file())
+            with self.assertRaisesRegex(RiftError, skins.MANIFEST, msg=broken):
+                self.skin(mod_="Hist Mod", number=n, textures={"e5200_skin_BM": {"b64": b64(picture(seed=77))}})
+            after = sorted((p.relative_to(root).as_posix(), p.read_bytes()) for p in root.rglob("*") if p.is_file())
+            self.assertEqual(after, before, broken)
+
+    def test_a_mod_with_a_damaged_record_still_lists_its_files(self):
+        import shutil
+
+        n = self.skin(new_mod="Damaged Record")["number"]
+        root = self.ws / "Damaged Record"
+        try:
+            (root / mod.MOD_FILE).write_text("[]", encoding="utf-8")
+            self.assertIn(skin_rel(n), self.rows("Damaged Record"))
+        finally:
+            shutil.rmtree(root)
+
+    def test_work_goes_only_into_a_mod_of_this_game(self):
+        """An encounter or a skin went into a Dragon's Dogma Online mod while Dark Arisen was the game (mods/extract
+        and monsters/convert refuse that); a new mod was always made for Dark Arisen."""
+        from riftstone.game import Game
+
+        online = mod.Mod.create(self.ws / "Online Dest", "Online Dest", game="ddo").root
+        before = sorted(p.relative_to(online).as_posix() for p in online.rglob("*"))
+        for dry in (True, False):
+            with self.assertRaisesRegex(RiftError, "Online Dest is a Dragon's Dogma Online mod"):
+                self.encounter({"mod": "Online Dest"}, dry)
+        with self.assertRaisesRegex(RiftError, "Online Dest is a Dragon's Dogma Online mod"):
+            self.skin(mod_="Online Dest")
+        self.assertEqual(sorted(p.relative_to(online).as_posix() for p in online.rglob("*")), before)
+        s = studio.Studio(Game(self.base / "an online client", "ddo"), self.base / "online-mods")
+        studiofiles.make_mod(s, s.workspace / "Made Here", "Made Here")
+        self.assertEqual(mod.Mod.load(s.workspace / "Made Here").game, "ddo")
+
+    def test_mods_of_the_other_game_never_clash(self):
+        """A Dark Arisen mod's group list was shown "also in" an Online mod holding the same path, and the encounter
+        note sent the encounter there; a file set aside (never built) was shown clashing too."""
+        self.encounter({"new_mod": "Clash Here"}, False)
+        online = mod.Mod.create(self.ws / "Clash Online", "Clash Online", game="ddo").root
+        (online / GPL).parent.mkdir(parents=True)
+        (online / GPL).write_bytes((self.ws / "Clash Here" / GPL).read_bytes())
+        self.assertNotIn("Clash Online", self.rows("Clash Here")[GPL]["also"])
+        self.assertNotIn("Clash Online", self.encounter({"new_mod": "Clash Plan"}, True)["clashes"])
+        self.assertIn("Clash Here", self.encounter({"new_mod": "Clash Plan"}, True)["clashes"])
+        self.api("POST", "files/aside", {}, {"mod": "Clash Here", "rel": GPL})
+        self.assertEqual(self.rows("Clash Here")["aside/" + GPL]["also"], [])
+        self.assertNotIn("Clash Here", self.encounter({"new_mod": "Clash Plan"}, True)["clashes"])
+
+    def test_a_game_switch_forgets_the_last_games_world(self):
+        """switch() kept the world map and the 'is it running' answer of the game before: /api/world listed the
+        other game's stages and encounters planned against them."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from riftstone import install
+
+        s = studio.Studio(self.game, self.base / "switch-mods")
+        s.index_state["ready"] = True
+        other = world_fixture.make(self.base / "switched-to", bare=True)
+        with mock.patch("riftstone.world.load", lambda g, idx: SimpleNamespace(root=g.root, stages={}, groups=[],
+                                                                                placements=[])), \
+                mock.patch.object(studio, "find_game", lambda kind: other), \
+                mock.patch.object(studio.Studio, "start_index", lambda st: st.index_state.update(ready=True)), \
+                mock.patch.object(install, "game_running", lambda g: g.root == self.game.root):
+            self.assertEqual(s.world().root, self.game.root)
+            self.assertTrue(s.running())
+            s.switch("ddda")
+            self.assertEqual(s.world().root, other.root)
+            self.assertFalse(s.running())
+
+    def test_a_null_number_takes_its_default(self):
+        """{"spread": null} reached the plan as None (500); null means not given, as for count and the others."""
+        self.skin(new_mod="Null Spread")
+        plan = self.encounter({"mod": "Null Spread"}, True, spread=None, like=None, group=None)
+        self.assertEqual((plan["total"], plan["like"]), (1, None))
+
+    def test_numbers_too_large_for_a_float_are_refused(self):
+        """A 400-digit JSON integer went through float(): OverflowError (500) for the encounter's count, at_once,
+        group, like, spread and at, and for a preset's strength."""
+        n = self.skin(new_mod="Big Numbers")["number"]
+        big = 10 ** 400
+        for key in ("count", "at_once", "group", "like", "spread"):
+            with self.assertRaisesRegex(RiftError, key, msg=key):
+                self.encounter({"mod": "Big Numbers"}, True, **{key: big})
+        with self.assertRaisesRegex(RiftError, "at is"):
+            self.encounter({"mod": "Big Numbers"}, True, at=[big, 0, 0])
+        before = (self.ws / "Big Numbers" / skin_rel(n)).read_bytes()
+        with self.assertRaisesRegex(RiftError, "strength"):
+            self.api("POST", "files/preset", {}, {"mod": "Big Numbers", "rel": skin_rel(n), "preset": "frost",
+                                                  "strength": big})
+        self.assertEqual((self.ws / "Big Numbers" / skin_rel(n)).read_bytes(), before)
 
     def test_refusals(self):
         n = self.skin(new_mod="Guarded")["number"]

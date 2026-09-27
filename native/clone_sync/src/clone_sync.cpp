@@ -7,10 +7,16 @@
 
 using namespace riftstone::clone;
 namespace {
-std::mutex hook_mutex;
-Factory original=nullptr;
+// Enable, Disable and the state below.  No lock is ever held while the factory runs: it may call the hooked
+// factory again (on its own thread, or on one it waits for) or RsClone_Disable, and a lock held across the
+// call made those deadlock, or throw inside a noexcept function (std::terminate).  An SRW lock and a
+// condition variable never throw.
+SRWLOCK lifecycle=SRWLOCK_INIT;
+CONDITION_VARIABLE settled=CONDITION_VARIABLE_INIT;    // a synchronization in progress has finished
+std::atomic<Factory> original{nullptr};                // the trampoline: set before the hook goes on, never after
 void* target=nullptr;
 bool installed=false, enabled=false;
+unsigned syncing=0;                                    // results being synchronized now (no caller code runs there)
 
 bool valid(const Appearance& appearance) {
     if (appearance.skeleton.empty() || appearance.skeleton.size()>4096 || appearance.equipment.empty() ||
@@ -40,13 +46,45 @@ bool valid(const Appearance& appearance) {
     return true;
 }
 Actor* __cdecl intercept(Actor* source, bool incompatible) noexcept {
-    // Lifecycle lock covers the call. Disable waits for all accepted calls and
-    // leaves the trampoline allocated for entries already dispatched by Windows.
-    std::lock_guard lock(hook_mutex);
+    // The factory runs with no lock held.  Its result is synchronized only while the hook is still on when it
+    // comes back, and that synchronization is counted, so Disable can wait for it; the trampoline stays
+    // allocated for entries already dispatched by Windows.
+    const Factory call=original.load(std::memory_order_acquire);
     Actor* actor=nullptr;
-    try { actor=original(source,incompatible); } catch (...) { return nullptr; }
-    if (enabled && actor) actor->last_sync=RsClone_Synchronize(source,actor);
+    try { actor=call(source,incompatible); } catch (...) { return nullptr; }
+    if (!actor) return actor;
+    AcquireSRWLockExclusive(&lifecycle);
+    const bool sync=enabled;
+    if (sync) ++syncing;
+    ReleaseSRWLockExclusive(&lifecycle);
+    if (!sync) return actor;
+    actor->last_sync=RsClone_Synchronize(source,actor);
+    AcquireSRWLockExclusive(&lifecycle);
+    --syncing;
+    ReleaseSRWLockExclusive(&lifecycle);
+    WakeAllConditionVariable(&settled);
     return actor;
+}
+
+Status enable(HMODULE host) {                          // under lifecycle
+    if (installed) return Status::busy;
+    if (!host || host!=GetModuleHandleW(nullptr)) return Status::invalid;
+    // This explicit fixture export is the entire supported ABI/profile boundary.
+    target=reinterpret_cast<void*>(GetProcAddress(host,"RsSyntheticCreateCloneV1"));
+    auto* marker=reinterpret_cast<const char*>(GetProcAddress(host,"RsSyntheticCloneAbiV1"));
+    if (!target || !marker || std::strcmp(marker,"riftstone.synthetic-clone/1")) return Status::unavailable;
+    if (MH_Initialize()!=MH_OK) return Status::hook_failed;
+    void* trampoline=nullptr;
+    if (MH_CreateHook(target,reinterpret_cast<void*>(intercept),&trampoline)!=MH_OK) {
+        MH_Uninitialize(); return Status::hook_failed;
+    }
+    original.store(reinterpret_cast<Factory>(trampoline),std::memory_order_release);
+    HMODULE pinned;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(&RsClone_EnableSyntheticHost),&pinned) || MH_EnableHook(target)!=MH_OK) {
+        MH_RemoveHook(target); MH_Uninitialize(); original.store(nullptr); return Status::hook_failed;
+    }
+    installed=true; enabled=true; return Status::ok;
 }
 }
 
@@ -80,31 +118,27 @@ RS_CLONE_API Status __cdecl RsClone_GameProfile(const char* profile) noexcept {
     return Status::unavailable;
 }
 RS_CLONE_API Status __cdecl RsClone_EnableSyntheticHost(HMODULE host) noexcept {
-    std::lock_guard lock(hook_mutex);
-    if (installed) return Status::busy;
-    if (!host || host!=GetModuleHandleW(nullptr)) return Status::invalid;
-    // This explicit fixture export is the entire supported ABI/profile boundary.
-    target=reinterpret_cast<void*>(GetProcAddress(host,"RsSyntheticCreateCloneV1"));
-    auto* marker=reinterpret_cast<const char*>(GetProcAddress(host,"RsSyntheticCloneAbiV1"));
-    if (!target || !marker || std::strcmp(marker,"riftstone.synthetic-clone/1")) return Status::unavailable;
-    if (MH_Initialize()!=MH_OK) return Status::hook_failed;
-    if (MH_CreateHook(target,reinterpret_cast<void*>(intercept),reinterpret_cast<void**>(&original))!=MH_OK) {
-        MH_Uninitialize(); return Status::hook_failed;
-    }
-    HMODULE pinned;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
-        reinterpret_cast<LPCWSTR>(&RsClone_EnableSyntheticHost),&pinned) || MH_EnableHook(target)!=MH_OK) {
-        MH_RemoveHook(target); MH_Uninitialize(); original=nullptr; return Status::hook_failed;
-    }
-    installed=true; enabled=true; return Status::ok;
+    AcquireSRWLockExclusive(&lifecycle);
+    const Status status=enable(host);
+    ReleaseSRWLockExclusive(&lifecycle);
+    return status;
 }
 RS_CLONE_API Status __cdecl RsClone_Disable() noexcept {
-    std::lock_guard lock(hook_mutex);
-    if (!enabled) return Status::ok;
-    if (MH_DisableHook(target)!=MH_OK) return Status::hook_failed;
-    enabled=false;
+    // Callable from inside a factory call, on any thread.  It waits only for results being synchronized
+    // (they run no caller code); a call still inside the factory gives its result back unsynchronized.  Not
+    // to be called while holding an Actor's mutex: a synchronization in progress may be waiting for it.
+    AcquireSRWLockExclusive(&lifecycle);
+    Status status=Status::ok;
+    if (enabled) {
+        if (MH_DisableHook(target)!=MH_OK) status=Status::hook_failed;
+        else {
+            enabled=false;
+            while (syncing) SleepConditionVariableSRW(&settled,&lifecycle,INFINITE,0);
+        }
+    }
+    ReleaseSRWLockExclusive(&lifecycle);
     // Intentionally retain module and trampoline until process exit.
-    return Status::ok;
+    return status;
 }
 BOOL APIENTRY DllMain(HMODULE module,DWORD reason,LPVOID) {
     if (reason==DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(module);

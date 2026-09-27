@@ -43,9 +43,16 @@ Only the current executable's explicit `RsSyntheticCreateCloneV1` export and
 `RsSyntheticCloneAbiV1` marker opt into the fixture ABI. The factory returns a new,
 unready Actor with the requested skeleton; its hook synchronizes that result.
 An incompatible result stays unready. DLL initialization does no hook work in
-DllMain. Enable/Disable are explicit, accepted factory calls are serialized during
-lifecycle transitions, and disabled trampolines/module code remain retained until
-process exit. Reinstallation is refused. This does not interoperate with an engine
+DllMain. Enable/Disable are explicit, and disabled trampolines/module code remain
+retained until process exit. Reinstallation is refused. No lock is held while the
+factory runs, so a factory may call the hooked factory again (on its own thread or
+on one it waits for) or call Disable: a lock held across the call made those
+deadlock, or end in std::terminate inside the noexcept hook. A result is
+synchronized only if the hook is still on when it comes back; Disable waits for the
+synchronizations in progress (they run no caller code), so it must not be called
+while holding an Actor's mutex, and a call still inside the factory when Disable
+returns gives its result back unsynchronized. The lifecycle uses an SRW lock and a
+condition variable, which never throw. This does not interoperate with an engine
 allocator or promise DLL unloading.
 
 The regression host demonstrates the missing appearance before interception and
@@ -53,4 +60,8 @@ the synchronized result after interception. It checks resource lifetime, deep-co
 storage, skeleton and weight rejection, immutable snapshots, player retirement,
 and concurrent source updates/clone requests while disabling the hook. The runner
 starts five hidden fresh processes, each with 29 checks and 600 concurrent factory
-requests. Gameplay remains UNKNOWN; these are synthetic-host execution claims.
+requests, then four more, one per nested case (`clone_host.exe nested <case>`): a
+factory call that calls the hooked factory again on its own thread or on another it
+waits for, or disables the hook from its own thread or from another it waits for;
+each has 20 s, so a deadlock fails instead of hanging. Gameplay remains UNKNOWN;
+these are synthetic-host execution claims.

@@ -121,7 +121,7 @@ def list_mods(folder: Path) -> list[Path]:
 def _display_name(root: Path) -> str:
     try:
         return str(json.loads((root / MOD_FILE).read_text(encoding="utf-8-sig")).get("name") or "").strip()
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, RecursionError):   # nesting past the decoder too
         return ""
 
 
@@ -192,13 +192,17 @@ class Mod:
             meta = json.loads(f.read_text(encoding="utf-8-sig"))
         except ValueError as e:
             raise RiftError(f"{f}: {e}") from None
-        if meta.get("schema") != SCHEMA:
-            raise RiftError(f"{f}: expected \"schema\": \"{SCHEMA}\"")
+        if not isinstance(meta, dict) or meta.get("schema") != SCHEMA:
+            raise RiftError(f"{f}: expected an object with \"schema\": \"{SCHEMA}\"")
         game = str(meta.get("game", "ddda"))
         if game not in KINDS:
             raise RiftError(f"{f}: \"game\" must be one of {', '.join(KINDS)}")
+        try:
+            priority = int(meta.get("priority", 0))
+        except (TypeError, ValueError, OverflowError):
+            raise RiftError(f"{f}: \"priority\" is a whole number (the higher one wins a conflict)") from None
         return cls(root, str(meta.get("name") or root.name), str(meta.get("version", "0.1.0")),
-                   str(meta.get("author", "")), str(meta.get("description", "")), int(meta.get("priority", 0)), game)
+                   str(meta.get("author", "")), str(meta.get("description", "")), priority, game)
 
     @classmethod
     def create(cls, root: Path, name: str | None = None, author: str = "", game: str = "ddda") -> "Mod":
@@ -209,6 +213,12 @@ class Mod:
             raise RiftError(f"{root} is already a Riftstone mod")
         name = name or root.name
         check_name(name)
+        # a mod is a folder: refused before anything is made when a file stands where a folder goes
+        subs = ("files", "archives") + ((SERVER_DIR,) if game == "ddo" else ())
+        near = next((p for p in (root, *root.parents) if p.exists()), root)
+        for p in (near, *(root / s for s in subs)):
+            if p.exists() and not p.is_dir():
+                raise RiftError(f"{p} is a file; a mod is a folder (choose another place for it)")
         (root / "files").mkdir(parents=True, exist_ok=True)
         (root / "archives").mkdir(exist_ok=True)
         m = cls(root, name, author=author, game=game)
@@ -248,6 +258,12 @@ class Change:
     name: bytes
     type_id: int
     data: bytes
+    merged: tuple = ()     # a group list or layout merged from several mods' copies: those mods, in plan order
+
+    @property
+    def mods(self) -> tuple:
+        """The mods this change comes from (several for a merged group list)."""
+        return self.merged or (self.mod,)
 
     @property
     def label(self) -> str:
@@ -394,22 +410,52 @@ class Plan:
     missing_archives: list[Change] = field(default_factory=list)
     conflicts: list[dict] = field(default_factory=list)
     changes: int = 0
+    merged: list[dict] = field(default_factory=list)       # group lists and layouts merged (gplmerge, lotmerge)
+    renumbered: list[dict] = field(default_factory=list)   # {mod, stage, type, group, as} / {mod, layout, record, as}
+    unmoved: list[dict] = field(default_factory=list)      # groups that had to keep a number another mod uses
 
 
-def plan(game: Game, index, mods: list[Mod]) -> Plan:
-    """Where every change lands.  Later (higher priority) mods win a conflict."""
+def plan(game: Game, index, mods: list[Mod], keep: list | None = None, installed=()) -> Plan:
+    """Where every change lands.  Later (higher priority) mods win a conflict, except that a Dark Arisen group
+    list or layout several mods change is merged, each mod's groups and placements kept (gplmerge.py,
+    lotmerge.py); ``keep`` (the last install's ``renumbered``) and ``installed`` (its mods' names) keep the
+    numbers and ids those merges gave."""
     p = Plan()
     per_arc: dict[str, list[Change]] = defaultdict(list)
     # One spelling per archive: Windows ignores case, so "Rom/EM0100" and "rom/em0100" are one file.
-    canonical = {game.arc_name(f).lower(): game.arc_name(f) for f in game.archives()}
+    canonical = {n.lower(): n for n, _ in game.archive_names()}
+    # Clashes and merges are told apart by mod name: two folders with one name would override each other with
+    # nothing reported (and a merge would see only one copy).  The same folder twice is one mod.
+    named: dict[str, Mod] = {}
+    for m in mods:
+        prev = named.get(m.name)
+        if prev is not None and Path(prev.root).resolve() != Path(m.root).resolve():
+            raise BuildError(f"two mods are called '{m.name}' ({prev.root} and {m.root}): give one of them another "
+                             f"name in its {MOD_FILE}")
+        named.setdefault(m.name, m)
+    mods = list(named.values())
     for m in mods:
         if m.game != game.kind:
             raise BuildError(f"{m.name} is a {KINDS[m.game]['title']} mod, not a {game.title} one: use --game "
                              f"{m.game}, or bring its files across with 'riftstone port'")
         if m.game != "ddo" and (m.root / SERVER_DIR).is_dir() and collect_server(m):
             raise BuildError(f"{m.name}: server/ files are for Dragon's Dogma Online mods (its local server)")
-    for m in sorted(mods, key=lambda m: (m.priority, m.name.lower())):
-        for c in collect(m):
+    collected = [(m, collect(m)) for m in sorted(mods, key=lambda m: (m.priority, m.name.lower()))]
+    merging = game.kind == "ddda" and len(collected) > 1    # Online's lists and layouts are other formats
+    kept_back: list[dict] = []
+    merges = {}
+    if merging:
+        from . import gplmerge, lotmerge
+        p.renumbered, kept_back = gplmerge.renumber(index, collected, keep, installed)
+        # after the groups: a moved group's layouts are renamed, so they are new, not the game's layouts
+        moved, back = lotmerge.renumber(index, collected, keep, installed)
+        p.renumbered += moved
+        kept_back += back
+        # (merge, whether it merges a resource the game does not have): a new group list merges; a new layout is
+        # a new group's, whose number gplmerge keeps apart, so two mods adding one stay a plain clash
+        merges = {typemap.BY_EXT["gpl"]: (gplmerge.merge, True), typemap.BY_EXT["lot"]: (lotmerge.merge, False)}
+    for m, changes in collected:
+        for c in changes:
             p.changes += 1
             if c.arc is None:
                 arcs = index.archives_with(c.name, c.type_id)
@@ -424,15 +470,59 @@ def plan(game: Game, index, mods: list[Mod]) -> Plan:
                     continue
                 c.arc = arc_name
                 per_arc[arc_name].append(c)
+    p.unmoved = kept_back
+    originals: dict[str, arc.Archive] = {}
     for a, changes in sorted(per_arc.items()):
         by_key: dict[tuple, Change] = {}
+        copies: dict[tuple, dict[str, Change]] = defaultdict(dict)      # each mod's own copy, in plan order
+        fights: list[tuple[tuple, dict]] = []
         for c in changes:
-            prev = by_key.get((c.name, c.type_id))
+            key = (c.name, c.type_id)
+            prev = by_key.get(key)
             if prev is not None and prev.mod != c.mod and prev.sha256 != c.sha256:
-                p.conflicts.append({"archive": a, "resource": c.label, "loser": prev.mod, "winner": c.mod})
-            by_key[(c.name, c.type_id)] = c
+                fights.append((key, {"archive": a, "resource": c.label, "loser": prev.mod, "winner": c.mod}))
+            by_key[key] = c
+            copies[key][c.mod] = c
+        refused: dict[tuple, str] = {}
+        for key in dict.fromkeys(k for k, _ in fights):
+            if key[1] in merges:
+                change, why = _merge_copies(game, a, key, copies[key], originals, p, *merges[key[1]])
+                if change is not None:
+                    by_key[key] = change
+                elif why is not None:
+                    refused[key] = why
+        for key, fight in fights:
+            if key in refused:
+                p.conflicts.append({**fight, "detail": f"not merged: {refused[key]}"})
+            elif by_key[key].merged == ():
+                p.conflicts.append(fight)
         p.archives[a] = list(by_key.values())
     return p
+
+
+def _merge_copies(game: Game, a: str, key: tuple, copies: dict[str, Change], originals: dict, p: Plan,
+                  merge, new_ok: bool) -> tuple[Change | None, str | None]:
+    """One resource several mods change in archive a (a group list or a layout), merged against the game's copy
+    there by ``merge`` (gplmerge / lotmerge); the merge's disagreements go to p.conflicts.  (None, why) when the
+    copies cannot be merged; (None, None) for a resource the game does not have and ``merge`` leaves alone."""
+    from .merging import MergeError
+
+    name, type_id = key
+    if a not in originals:
+        originals[a] = arc.Archive.read(game.vanilla_arc(a))
+    e = originals[a].find(name, type_id)
+    if e is None and not new_ok:
+        return None, None
+    try:
+        data, fights = merge(e.data() if e is not None else None, [(m, c.data) for m, c in copies.items()])
+    except MergeError as err:
+        return None, str(err)
+    mods = tuple(copies)
+    last = copies[mods[-1]]
+    for loser, winner, what in fights:
+        p.conflicts.append({"archive": a, "resource": last.label, "loser": loser, "winner": winner, "detail": what})
+    p.merged.append({"archive": a, "resource": last.label, "mods": list(mods)})
+    return Change(last.mod, "merged: " + " + ".join(mods), a, name, type_id, data, merged=mods), None
 
 
 def check_plan(p: Plan) -> None:
