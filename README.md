@@ -91,9 +91,12 @@ Riftstone's own code is released under the **MIT License** ([LICENSE](LICENSE));
 ## Credits
 
 Designed and written by **NryQ**. Special thanks and heavy kudos to **LDKSuperDante (Austin Shelton)**
-for foundational research on Grigori combat state machines, shadow-table architecture, and enemy-wave
-concepts — veteran community work that helped inform Riftstone's encounter systems. Check out his
-projects and new releases: [Discord](https://discord.gg/wUAq2mbcyK) ·
+— author of **Dragon's Dogma Remastered** and **Project: Dragonforged** — for foundational research on
+Grigori combat state machines, shadow-table architecture, and enemy-wave concepts that helped inform
+Riftstone's encounter systems. Support his work and watch for his releases:
+[Patreon](https://www.patreon.com/DragonsDogmaRemastered) ·
+[Nexus](https://www.nexusmods.com/dragonsdogma/users/23347084) ·
+[GitHub](https://github.com/LDKSuperDante) · [Discord](https://discord.gg/wUAq2mbcyK) ·
 [YouTube](https://www.youtube.com/@austinshelton8438). Thanks also to everyone whose open tools and
 research this learned from, and to the Dragon's Dogma modding community.
 
