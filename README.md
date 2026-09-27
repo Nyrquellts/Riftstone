@@ -1,5 +1,9 @@
 # NryQ // Riftstone
 
+[![Discord — Bug Reports & Community](https://img.shields.io/badge/Discord-Bug%20Reports%20%26%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/xSY8kyECKt) [![Status: Alpha](https://img.shields.io/badge/status-ALPHA-00f0ff?style=for-the-badge)](#) [![License: MIT](https://img.shields.io/badge/License-MIT-3fb950?style=for-the-badge)](LICENSE)
+
+**🐞 Found a bug?** Report it on the [Discord](https://discord.gg/xSY8kyECKt).
+
 **A modding & modernization suite for Dragon's Dogma: Dark Arisen** (and a preservation toolkit for the
 shut-down Dragon's Dogma Online). Free, open-source (MIT), and it ships **zero Capcom assets** — it only
 reads and rewrites files in the copy of the game *you own*, on your own machine.
