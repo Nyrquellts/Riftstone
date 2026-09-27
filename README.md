@@ -4,6 +4,13 @@
 shut-down Dragon's Dogma Online). Free, open-source (MIT), and it ships **zero Capcom assets** — it only
 reads and rewrites files in the copy of the game *you own*, on your own machine.
 
+> ⚠️ **Alpha — early, in-progress release.** The modding toolkit is byte-for-byte proven on the whole
+> game, but the in-game plugins are still being playtested, so expect bugs and rough edges. It is
+> **non-destructive and fully reversible** — it never modifies your game files (mods load from an
+> overlay; delete three items and the game is exactly as it was), so it's safe to try.
+>
+> 🐞 **Report bugs & get help on Discord:** https://discord.gg/xSY8kyECKt
+
 ---
 
 ## What it does
@@ -100,4 +107,4 @@ Riftstone's encounter systems. Support his work and watch for his releases:
 [YouTube](https://www.youtube.com/@austinshelton8438). Thanks also to everyone whose open tools and
 research this learned from, and to the Dragon's Dogma modding community.
 
-**Support:** [Ko-fi](https://ko-fi.com/nryquellts) · [Patreon](https://patreon.com/c/NryQuellts)
+**Bug reports & community:** [Discord](https://discord.gg/xSY8kyECKt)  ·  **Support:** [Ko-fi](https://ko-fi.com/nryquellts) · [Patreon](https://patreon.com/c/NryQuellts)
