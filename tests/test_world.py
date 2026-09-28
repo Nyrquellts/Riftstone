@@ -195,7 +195,8 @@ class WorldTest(unittest.TestCase):
         enc2 = encounter.plan(self.game, self.idx, self.w, root, 424, "em0101", 4, "0,0,0", story="post")
         self.assertEqual((enc2.group, enc2.horde, enc2.points), (2, False, 4))
         g2 = [x for x in gpl.parse(enc2.gpl_data).groups if x["mGroup"] == 2][0]
-        self.assertEqual((g2["mSetCountMax"], g2["mAppearBgn"], g2["mAppearEnd"]), (-1, 7800, 0))
+        # after the Dragon: the game's own post-Dragon window, 7800..27999 (7800..0 loaded never)
+        self.assertEqual((g2["mSetCountMax"], g2["mAppearBgn"], g2["mAppearEnd"]), (-1, 7800, 27999))
         self.assertEqual(len([x for x in gpl.parse(enc2.gpl_data).groups if x["mGroup"] == 1]), 1)
 
     def test_studio_world_routes(self):

@@ -77,7 +77,8 @@ void StabilityRecordEnd(const wchar_t* code, const wchar_t* detail, ULONGLONG up
 LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep);
 void CrashFilterInstall();                      // ours first, the game's (and anyone's) chained after
 void StabilityInstallHooks();                   // SetUnhandledExceptionFilter, MessageBoxA
-void WriteHangReport(DWORD thread, DWORD seconds);
+void WriteHangReport(DWORD thread, DWORD seconds, BOOL notResponding);
+void WriteSnapshotReport(DWORD thread);   // riftstone snapshot: Local\RiftstoneSnapshot-<pid>, set from outside
 extern volatile LONG g_fatals;
 
 // ---- live.cpp ---------------------------------------------------------------------------------
@@ -132,6 +133,28 @@ BOOL ResourceTable(int* used, int* size);
 HANDLE GuardOpen(const wchar_t* fullPath, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
                  DWORD disposition, DWORD flags, HANDLE templ);
 BOOL InGameImage(DWORD_PTR v);                  // inside the game's executable image
+// The stability membrane (docs/stability-membrane.md): every guard's hits, counted where the guard acts and
+// written to riftstone\logs\riftstone_error.log by GuardsReport.  The order is the live page's contract with
+// riftstone/runtime.py (GUARD_KEYS); append only.
+enum GuardId {
+    GUARD_MISSING_TEXTURES, GUARD_FROM_ARCHIVES, GUARD_RAGDOLL_BODIES, GUARD_PARTICLES, GUARD_SHADOW_BUFFERS,
+    GUARD_BROKEN_TEXTURES, GUARD_GUI_TEXT, GUARD_COUNT
+};
+void GuardsInit();                              // after DetectGame: the [guard] keys, a fresh error log
+BOOL GuardOn(int id);
+void GuardHit(int id, DWORD_PTR where, const wchar_t* detail);  // detail may be NULL; cheap, any thread
+LONG GuardHits(int id);
+DWORD GuardLastWhere(int id);
+const char* GuardKeyA(int id);
+void GuardsReport();                            // new hits into the error log (the live thread, and at exit)
+// A loose texture under nativePC or the overlay that does not fit its file (a truncated or garbled .tex):
+// TRUE and why; the file hook then answers the open as if the file were missing.
+BOOL TextureFileBroken(const wchar_t* path, wchar_t* why, size_t cap);
+// The device the game created: its limits bound the shadow sizes (graphics.cpp calls it).
+void FixesDeviceCreated(DWORD maxTextureWidth, DWORD maxTextureHeight);
+// Whether [render] shadow_map_size was set (read from the ini): live.cpp then installs the device hook even with
+// frame timing off, so FixesDeviceCreated can still bound a raised map to the GPU.
+BOOL FixesShadowSizeSet();
 // The game's exit (DDDA build 2364871, exit_sites.h): 1 set, 0 clear, -1 unknown or another build.
 BOOL ExitSitesVerified();
 int GameQuitFlag();                             // sApp+0x266C: the game's own exit (or its loop ending)

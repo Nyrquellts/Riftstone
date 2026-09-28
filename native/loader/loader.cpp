@@ -194,6 +194,27 @@ static HANDLE MissingUnderNative(const wchar_t* path, DWORD access, DWORD share,
     return GuardOpen(full, access, share, sa, disposition, flags, templ);
 }
 
+// A loose .tex just opened for the game (from the overlay or nativePC) that does not fit its own file: close it
+// and answer as if it were missing -- the resource's own bytes from its archive, else the stand-in.  `served` is
+// the file that was opened, `name` the nativePC resource path.  Only unambiguous breakage is caught.
+static HANDLE GuardBrokenTex(HANDLE h, const wchar_t* served, const wchar_t* name, DWORD access, DWORD share,
+                             LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE templ) {
+    if (h == INVALID_HANDLE_VALUE || !GuardOn(GUARD_BROKEN_TEXTURES)) return h;
+    const wchar_t* dot = wcsrchr(served, L'.');
+    if (!dot || _wcsicmp(dot, L".tex") != 0) return h;
+    wchar_t why[160];
+    if (!TextureFileBroken(served, why, _countof(why))) return h;
+    wchar_t full[MAX_PATH * 2];
+    if (!NativeRelative(name, full, _countof(full))) return h;
+    HANDLE g = GuardOpen(full, access, share, sa, disposition, flags, templ);
+    if (g == INVALID_HANDLE_VALUE) return h;                     // no good copy and no stand-in: keep the file as is
+    CloseHandle(h);
+    GuardHit(GUARD_BROKEN_TEXTURES, 0, served);
+    LONG k = InterlockedIncrement(&g_missing);
+    if (k <= 200) LogLine(L"broken   %s: %s; a good copy was served instead", served, why);
+    return g;
+}
+
 static HANDLE WINAPI Hook_CreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
                                       DWORD disposition, DWORD flags, HANDLE templ) {
     RememberOpen(name);
@@ -203,11 +224,13 @@ static HANDLE WINAPI Hook_CreateFileW(LPCWSTR name, DWORD access, DWORD share, L
         HANDLE h = Real_CreateFileW(alt, access, share, sa, disposition, flags, templ);
         if (h != INVALID_HANDLE_VALUE) {
             NoteRedirect(name, alt);
-            return h;
+            return GuardBrokenTex(h, alt, name, access, share, sa, disposition, flags, templ);
         }
         LogLine(L"overlay  could not open %s (error %lu); using the original", alt, GetLastError());
     }
     HANDLE h = Real_CreateFileW(name, access, share, sa, disposition, flags, templ);
+    if (h != INVALID_HANDLE_VALUE && readOnly)
+        return GuardBrokenTex(h, name, name, access, share, sa, disposition, flags, templ);
     if (h == INVALID_HANDLE_VALUE && readOnly) {
         DWORD err = GetLastError();
         if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
@@ -235,11 +258,13 @@ static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD access, DWORD share, LP
             HANDLE h = Real_CreateFileW(alt, access, share, sa, disposition, flags, templ);
             if (h != INVALID_HANDLE_VALUE) {
                 NoteRedirect(wide, alt);
-                return h;
+                return GuardBrokenTex(h, alt, wide, access, share, sa, disposition, flags, templ);
             }
         }
     }
     HANDLE h = Real_CreateFileA(name, access, share, sa, disposition, flags, templ);
+    if (h != INVALID_HANDLE_VALUE && readOnly && haveWide)
+        return GuardBrokenTex(h, wide, wide, access, share, sa, disposition, flags, templ);
     if (h == INVALID_HANDLE_VALUE && readOnly && haveWide) {
         DWORD err = GetLastError();
         if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {

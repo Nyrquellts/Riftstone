@@ -54,13 +54,24 @@ void LogLine(const wchar_t* fmt, ...) {
     va_end(ap);
     char utf8[2048];
     WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof utf8, NULL, NULL);
-    g_lastLog = utf8;
+    g_lastLog += utf8;                             // accumulate: one FixesApplyPatches now logs several guards
+    g_lastLog += '\n';
     printf("  log   %s\n", utf8);
 }
 static int g_shadow = 0;
+static int g_ragdolls = 0;                        // [guard] ragdoll_bodies: off until TestRagdolls turns it on
+static int g_guitext = 0;                         // [guard] gui_text: off until TestGuiText turns it on
+static int g_widefoliage = 0;                      // [render] wide_foliage: off until TestStreamWindow turns it on
+static int g_particles = 0;                        // [guard] particles: off until TestParticleGuard turns it on
+static int g_shadowbuffers = 1;                    // [guard] shadow_buffers: on by default, like the game
 int IniInt(const wchar_t* section, const wchar_t* key, int def) {
     if (wcscmp(section, L"fps") == 0 && wcscmp(key, L"max_fps") == 0) return g_maxFps;
     if (wcscmp(section, L"render") == 0 && wcscmp(key, L"shadow_map_size") == 0) return g_shadow;
+    if (wcscmp(section, L"render") == 0 && wcscmp(key, L"wide_foliage") == 0) return g_widefoliage;
+    if (wcscmp(section, L"guard") == 0 && wcscmp(key, L"ragdoll_bodies") == 0) return g_ragdolls;
+    if (wcscmp(section, L"guard") == 0 && wcscmp(key, L"gui_text") == 0) return g_guitext;
+    if (wcscmp(section, L"guard") == 0 && wcscmp(key, L"particles") == 0) return g_particles;
+    if (wcscmp(section, L"guard") == 0 && wcscmp(key, L"shadow_buffers") == 0) return g_shadowbuffers;
     return def;
 }
 void IniStr(const wchar_t*, const wchar_t*, const wchar_t* def, wchar_t* out, DWORD cap) { wcsncpy_s(out, cap, def, _TRUNCATE); }
@@ -183,6 +194,7 @@ void TestFps() {
     // A build whose code differs: nothing is patched.
     MapImage(nullptr);
     *(uint8_t*)0x00EDDC86 = 0x90;
+    g_lastLog.clear();
     FixesApplyPatches();
     Check(*(uint32_t*)0x00EDD4B1 == CONST150 && g_lastLog.find("not what build 2364871 has") != std::string::npos,
           "a changed site patches nothing and says so");
@@ -248,6 +260,7 @@ void TestShadows() {
           "patched: the game's own getShadowMapSize gives 4096 (sun) and 2048 (lamps)");
     MapImage(nullptr);
     *(uint32_t*)0x014292C4 = 2049;
+    g_lastLog.clear();
     FixesApplyPatches();
     Check(table[2] == 2049 && g_lastLog.find("not what build 2364871 has") != std::string::npos,
           "a table that differs is left alone and the log says so");
@@ -255,6 +268,32 @@ void TestShadows() {
     g_shadow = 5000;
     FixesApplyPatches();
     Check(table[2] == 2048, "a size that is not a multiple of 32 is refused");
+
+    // shadow_buffers: FixesDeviceCreated bounds a raised sun map to what the GPU can make, once the device exists
+    MapImage(nullptr);
+    g_shadow = 8192;
+    FixesApplyPatches();
+    Check(table[2] == 8192, "sun shadow raised to 8192 at start-up, before any device");
+    LONG sb = GuardHits(GUARD_SHADOW_BUFFERS);
+    FixesDeviceCreated(16384, 16384);
+    Check(table[2] == 8192 && GuardHits(GUARD_SHADOW_BUFFERS) == sb,
+          "a GPU that can make 8192 leaves the raised sun map alone");
+    FixesDeviceCreated(4096, 4096);
+    Check(table[2] == 4096 && CallShadowSize(render, 0) == 4096 && CallShadowSize(render, 1) == 2048 &&
+          GuardHits(GUARD_SHADOW_BUFFERS) == sb + 1,
+          "a 4096-px GPU bounds the sun map to 4096 (lamps 2048) and counts a shadow_buffers hit");
+    FixesDeviceCreated(2048, 2048);
+    Check(table[2] == 2048, "a smaller GPU bounds the sun map again");
+    // off: [guard] shadow_buffers = 0 leaves even an over-large map (the owner opted out)
+    MapImage(nullptr);
+    g_shadow = 8192;
+    FixesApplyPatches();
+    g_shadowbuffers = 0;
+    sb = GuardHits(GUARD_SHADOW_BUFFERS);
+    FixesDeviceCreated(4096, 4096);
+    Check(table[2] == 8192 && GuardHits(GUARD_SHADOW_BUFFERS) == sb,
+          "[guard] shadow_buffers = 0: the raised map is left for the owner to own");
+    g_shadowbuffers = 1;
     g_shadow = 0;
 }
 
@@ -411,10 +450,520 @@ void TestExit() {
     *(uint8_t*)0x0072C4B8 = 0x00;                              // Exit Game would write 0 instead of 1
     *(uint32_t*)(uintptr_t)DDDA_SAPP = (uint32_t)(uintptr_t)app;
     app[DDDA_SAPP_QUIT] = 1;
+    g_lastLog.clear();
     Check(!ExitSitesVerified() && GameQuitFlag() == -1 && g_lastLog.find("not what build 2364871 has") != std::string::npos,
           "a changed site: neither flag is read, and the log says so");
     MapImage(nullptr);
     g_exitSites = -1;
+}
+
+// ---- ragdolls ---------------------------------------------------------------------------------------------
+// A container the way the game reads one: body data at +0x38 (the count at +0x68 >> 8), the body list at +0x4C;
+// a body holds its part at +0x18, and the two functions write the value into the part at +8 or +0xC.
+struct FakeContainer {
+    uint8_t obj[0x60];
+    uint8_t data[0x80];
+    uint8_t* list[4];
+    uint8_t bodies[4][0x20];
+    uint8_t parts[4][0x20];
+    void Ready(int n) {
+        memset(this, 0, sizeof *this);
+        *(uint32_t*)(data + 0x68) = (uint32_t)n << 8;
+        *(uint8_t**)(obj + 0x38) = data;
+        *(uint8_t***)(obj + 0x4C) = list;
+        for (int i = 0; i < 4; i++) {
+            list[i] = bodies[i];
+            *(uint8_t**)(bodies[i] + 0x18) = parts[i];
+        }
+    }
+    void NotReady() {                           // made, its bodies not set up yet
+        memset(this, 0, sizeof *this);
+    }
+    uint32_t Part(int i, int field) const { return *(const uint32_t*)(parts[i] + field); }
+};
+struct FakeOwner {
+    uint8_t obj[0x40];
+    FakeContainer ragdoll, set;
+    void Wire(bool withRagdoll, bool withSet) {
+        memset(obj, 0, sizeof obj);
+        *(uint8_t**)(obj + 0x24) = withRagdoll ? ragdoll.obj : nullptr;
+        *(uint8_t**)(obj + 0x20) = withSet ? set.obj : nullptr;
+    }
+};
+
+// The two functions take the object in edi and the value on the stack (ret 4); eax is what they leave.
+__declspec(noinline) static uint32_t CallSetBodies(uintptr_t fn, void* self, uint32_t value) {
+    uint32_t result;
+    __asm {
+        push edi
+        mov edi, self
+        push value
+        mov eax, fn
+        call eax
+        pop edi
+        mov result, eax
+    }
+    return result;
+}
+static int FaultFilter(EXCEPTION_POINTERS* e, uintptr_t* where) {
+    *where = (uintptr_t)e->ExceptionRecord->ExceptionAddress;
+    return e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                           : EXCEPTION_CONTINUE_SEARCH;
+}
+static bool Faults(uintptr_t fn, void* self, uint32_t value, uintptr_t* where) {
+    *where = 0;
+    __try {
+        CallSetBodies(fn, self, value);
+        return false;
+    } __except (FaultFilter(GetExceptionInformation(), where)) {
+        return true;
+    }
+}
+
+// The two inline walks: enter the check with eax = the container, and see which way it went.
+static volatile int g_walkPath = 0;
+__declspec(naked) static void WalkOn() {
+    __asm {
+        mov g_walkPath, 1
+        ret
+    }
+}
+__declspec(naked) static void WalkOff() {
+    __asm {
+        mov g_walkPath, 2
+        ret
+    }
+}
+__declspec(noinline) static int RunWalk(void* check, void* container, uint32_t* stored) {
+    uint32_t kept = 0;
+    g_walkPath = 0;
+    __asm {
+        push esi
+        sub esp, 0x10                         // the second walk keeps the container at [esp + 0x0C] (its frame)
+        mov dword ptr [esp + 8], 0
+        mov eax, container
+        call check
+        mov eax, [esp + 8]
+        mov kept, eax
+        add esp, 0x10
+        pop esi
+    }
+    *stored = kept;
+    return g_walkPath;
+}
+
+void TestRagdolls() {
+    printf("ragdolls (0x00794930, 0x007949E0 and two inline walks)\n");
+    MapImage(nullptr);
+    static FakeOwner o;
+    const uint32_t VALUE = 7, FLAGS = 0x40000014;
+
+    // the game's own code, before the guard: what it writes, what it leaves in eax, and where it stops
+    o.ragdoll.Ready(3), o.set.Ready(3), o.Wire(true, true);
+    uint32_t v8 = CallSetBodies(0x00794930, o.obj, VALUE), vC = CallSetBodies(0x007949E0, o.obj, FLAGS);
+    bool vanillaWrote = true;
+    for (int i = 0; i < 3; i++)
+        vanillaWrote &= o.ragdoll.Part(i, 8) == VALUE && o.set.Part(i, 8) == VALUE && o.ragdoll.Part(i, 0x0C) == FLAGS &&
+                        o.set.Part(i, 0x0C) == FLAGS;
+    Check(vanillaWrote && v8 == 3 && vC == 3,
+          "vanilla: every body of the ragdoll and of its set gets the value (+8, +0xC); eax = the set's count (3)");
+    o.ragdoll.Ready(2), o.Wire(true, false);
+    uint32_t vNoSet = CallSetBodies(0x00794930, o.obj, VALUE);
+    Check(vNoSet == (uint32_t)(uintptr_t)o.ragdoll.obj && o.ragdoll.Part(1, 8) == VALUE,
+          "vanilla: no set: the ragdoll's bodies get it and eax is the ragdoll container");
+    uintptr_t where = 0;
+    o.ragdoll.NotReady(), o.set.Ready(3), o.Wire(true, true);
+    Check(Faults(0x00794930, o.obj, VALUE, &where) && where == 0x00794942,
+          "vanilla: a ragdoll whose bodies are not set up yet stops the game at 0x00794942 (the crash of 2026-09-27)");
+    MapImage(nullptr);                                         // the fault left the function half run
+
+    g_ragdolls = 1;
+    FixesApplyPatches();
+    const uint8_t* s1 = (const uint8_t*)0x00794930;
+    const uint8_t* s3 = (const uint8_t*)0x008CF2D8;
+    const uint8_t* s4 = (const uint8_t*)0x00C2BAE0;
+    Check(g_ragdollGuard && s1[0] == 0xE9 && *(const uint8_t*)0x007949E0 == 0xE9 && s3[0] == 0xE9 && s4[0] == 0xE9 &&
+              s3[13] == 0x90 && s4[17] == 0x90 && *(const uint8_t*)0x008CF2E6 == 0x85,
+          "the guard is on: a jump at each of the four sites, the rest of each inline read filled, the loop after it kept");
+
+    // the same cases through the guard: the same writes and the same eax where the game did not stop
+    o.ragdoll.Ready(3), o.set.Ready(3), o.Wire(true, true);
+    uint32_t p8 = CallSetBodies(0x00794930, o.obj, VALUE), pC = CallSetBodies(0x007949E0, o.obj, FLAGS);
+    bool patchedWrote = true;
+    for (int i = 0; i < 3; i++)
+        patchedWrote &= o.ragdoll.Part(i, 8) == VALUE && o.set.Part(i, 8) == VALUE && o.ragdoll.Part(i, 0x0C) == FLAGS &&
+                        o.set.Part(i, 0x0C) == FLAGS;
+    Check(patchedWrote && p8 == v8 && pC == vC && o.ragdoll.Part(3, 8) == 0,
+          "guarded: the same bodies get the same values and eax is the same; the fourth, past the count, untouched");
+    o.ragdoll.Ready(2), o.Wire(true, false);
+    Check(CallSetBodies(0x00794930, o.obj, VALUE) == vNoSet && o.ragdoll.Part(1, 8) == VALUE,
+          "guarded: no set: the same as the game");
+    o.ragdoll.NotReady(), o.set.Ready(3), o.Wire(true, true);
+    bool faulted = Faults(0x00794930, o.obj, VALUE, &where);
+    uint32_t r = faulted ? 0 : CallSetBodies(0x007949E0, o.obj, FLAGS);
+    Check(!faulted && r == 3 && o.set.Part(2, 8) == VALUE && o.set.Part(2, 0x0C) == FLAGS && o.ragdoll.Part(0, 8) == 0,
+          "guarded: the ragdoll not set up yet has no bodies; the set's still get the value, and nothing stops");
+    o.ragdoll.NotReady(), o.set.NotReady(), o.Wire(true, true);
+    Check(!Faults(0x00794930, o.obj, VALUE, &where) && CallSetBodies(0x00794930, o.obj, VALUE) == 0,
+          "guarded: neither set up: nothing to walk, eax 0 (the set's count, as the game's accessor gives it)");
+
+    // the inline walks, their ways out pointed here
+    DWORD_PTR on1 = g_ragdollOn1, off1 = g_ragdollOff1, on2 = g_ragdollOn2, off2 = g_ragdollOff2;
+    g_ragdollOn1 = g_ragdollOn2 = (DWORD_PTR)WalkOn;
+    g_ragdollOff1 = g_ragdollOff2 = (DWORD_PTR)WalkOff;
+    uint32_t kept = 0;
+    static FakeContainer c;
+    c.Ready(3);
+    bool ready = RunWalk((void*)RagdollWalk1, c.obj, &kept) == 1 && RunWalk((void*)RagdollWalk2, c.obj, &kept) == 1 &&
+                 kept == (uint32_t)(uintptr_t)c.obj;
+    c.Ready(0);
+    bool empty = RunWalk((void*)RagdollWalk1, c.obj, &kept) == 2 && RunWalk((void*)RagdollWalk2, c.obj, &kept) == 2;
+    c.NotReady();
+    bool missing = RunWalk((void*)RagdollWalk1, c.obj, &kept) == 2 && RunWalk((void*)RagdollWalk2, c.obj, &kept) == 2 &&
+                   kept == (uint32_t)(uintptr_t)c.obj;
+    c.Ready(3);
+    *(uint8_t***)(c.obj + 0x4C) = nullptr;
+    bool noList = RunWalk((void*)RagdollWalk1, c.obj, &kept) == 2 && RunWalk((void*)RagdollWalk2, c.obj, &kept) == 2;
+    g_ragdollOn1 = on1, g_ragdollOff1 = off1, g_ragdollOn2 = on2, g_ragdollOff2 = off2;
+    Check(ready && empty && missing && noList,
+          "the inline walks: a set-up ragdoll is walked (the second keeps it at [esp+0xC] as the game does); none "
+          "without bodies, without its data or without its list");
+
+    MapImage(nullptr);
+    g_ragdolls = 0;
+    FixesApplyPatches();
+    Check(!g_ragdollGuard && *(const uint8_t*)0x00794930 == 0x8B, "[guard] ragdoll_bodies = 0: nothing patched");
+    MapImage(nullptr);
+    g_ragdolls = 1;
+    *(uint8_t*)0x00C2BAEB = 0xFE;                              // one byte of the last inline read differs
+    g_lastLog.clear();
+    FixesApplyPatches();
+    Check(!g_ragdollGuard && *(const uint8_t*)0x00794930 == 0x8B && g_lastLog.find("not what build 2364871 has") !=
+              std::string::npos,
+          "a site that differs: nothing patched at any site, and the log says so");
+    MapImage(nullptr);
+    g_ragdolls = 0;
+}
+
+// ---- the ragdoll body-count family --------------------------------------------------------------------------
+// The 55 inline copies scanned out of the exe (FAMILY_SITES).  Two proofs: the stub emitter's two paths run
+// on a fake body-data pointer here, and every real site is patched to a stub that carries its own bytes.
+static volatile LONG g_familyHits = 0;
+extern "C" void __stdcall TestFamilyHit(DWORD) { InterlockedIncrement(&g_familyHits); }
+static volatile uint32_t g_landZF = 0, g_landReg = 0;
+__declspec(naked) static void LandT() {
+    __asm {
+        mov g_landZF, 0
+        jnz done
+        mov g_landZF, 1
+    done:
+        ret
+    }
+}
+__declspec(naked) static void LandC() {
+    __asm {
+        mov g_landReg, esi
+        ret
+    }
+}
+// Enter a stub with ecx = the (fake) body-data pointer, every other register kept.
+__declspec(noinline) static void RunFamilyStub(void* stub, void* bodydata) {
+    __asm {
+        pushad
+        mov ecx, bodydata
+        mov eax, stub
+        call eax
+        popad
+    }
+}
+
+void TestRagdollFamily() {
+    printf("ragdoll body-count family (%d scanned sites)\n", (int)_countof(FAMILY_SITES));
+
+    // the emitter's two paths, on a fake body-data pointer (count at +0x68 >> 8), for both shapes
+    BYTE* cave = (BYTE*)VirtualAlloc(nullptr, 256, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    static uint8_t bd[0x80];
+    const BYTE origT[7] = {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF};        // test [ecx+0x68], 0xFFFFFF00
+    const BYTE origC[6] = {0x8B, 0x71, 0x68, 0xC1, 0xEE, 0x08};             // mov esi,[ecx+0x68]; shr esi,8
+    BYTE* cur = cave;
+    BYTE* stubT = EmitFamilyStub(cur, 'T', origT, 7, 0xABCD, (DWORD_PTR)LandT, (void*)TestFamilyHit);
+    BYTE* stubC = EmitFamilyStub(cur, 'C', origC, 6, 0xABCD, (DWORD_PTR)LandC, (void*)TestFamilyHit);
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+
+    g_familyHits = 0;
+    *(uint32_t*)(bd + 0x68) = 3u << 8;
+    RunFamilyStub(stubT, bd);
+    bool tReady = g_landZF == 0 && g_familyHits == 0;                        // bodies present: real test, ZF clear
+    *(uint32_t*)(bd + 0x68) = 0;
+    RunFamilyStub(stubT, bd);
+    bool tZero = g_landZF == 1 && g_familyHits == 0;                         // present but empty: real test, ZF set, no hit
+    RunFamilyStub(stubT, nullptr);
+    bool tNull = g_landZF == 1 && g_familyHits == 1;                         // not set up: guard sets ZF and counts
+    Check(tReady && tZero && tNull,
+          "'T' stub: real test when body data is present (empty reads as 0), and the game's ZF=count-0 answer when null");
+
+    g_familyHits = 0;
+    *(uint32_t*)(bd + 0x68) = 5u << 8;
+    g_landReg = 0xDEAD;
+    RunFamilyStub(stubC, bd);
+    bool cReady = g_landReg == 5 && g_familyHits == 0;                       // bodies present: the real count
+    g_landReg = 0xDEAD;
+    RunFamilyStub(stubC, nullptr);
+    bool cNull = g_landReg == 0 && g_familyHits == 1;                        // not set up: count 0, counted
+    Check(cReady && cNull, "'C' stub: the real count when present, 0 when the body data is null, counted once");
+    VirtualFree(cave, 0, MEM_RELEASE);
+
+    // every real site patched to a stub that carries its own (verified) bytes
+    MapImage(nullptr);
+    g_ragdolls = 1;
+    FixesApplyPatches();
+    Check(g_ragFamilyCount == (int)_countof(FAMILY_SITES) && g_ragFamilySkipped == 0,
+          "all family sites verified against build 2364871 and guarded");
+    bool patched = true, carries = true, newCrash = false;
+    for (const FamilySite& s : FAMILY_SITES) {
+        const BYTE* at = (const BYTE*)s.va;
+        int len = s.kind == 'T' ? 7 : 6;
+        if (at[0] != 0xE9) { patched = false; continue; }
+        for (int k = 5; k < len; k++) patched &= at[k] == 0x90;
+        const BYTE* stub = at + 5 + *(const int32_t*)(at + 1);
+        carries &= memcmp(stub + 4, s.bytes, len) == 0;                     // the stub's copy of the game's bytes
+        if (s.va == 0x007945B4) newCrash = at[0] == 0xE9;
+    }
+    Check(patched && carries, "each site jumps to a stub that keeps its own instruction bytes; the reads are filled");
+    Check(newCrash, "the live crash of 2026-09-27 (0x007945B4) is one of the guarded sites");
+
+    // a site that differs is left alone; the rest still go in
+    MapImage(nullptr);
+    *(uint8_t*)0x007945B4 = 0xFE;
+    g_lastLog.clear();
+    FixesApplyPatches();
+    Check(g_ragFamilyCount == (int)_countof(FAMILY_SITES) - 1 && g_ragFamilySkipped == 1 &&
+              *(const uint8_t*)0x007945B4 == 0xFE && g_lastLog.find("not what build 2364871 has") != std::string::npos,
+          "a family site that differs is skipped (unpatched) while the other sites are still guarded");
+
+    MapImage(nullptr);
+    g_ragdolls = 0;
+    FixesApplyPatches();
+    Check(g_ragFamilyCount == 0 && *(const uint8_t*)0x007945B4 == 0xF7,
+          "[guard] ragdoll_bodies = 0: no family site patched");
+    MapImage(nullptr);
+    g_ragdolls = 0;
+}
+
+// ---- the map's GUI text field (the null-string crash of 2026-09-27 22:56) ---------------------------------
+// The guard replaces `mov ecx,eax; lea esi,[ecx+1]` at 0x00606621 with a thunk: a null string becomes the
+// empty string; a non-null one is unchanged. Both paths continue at 0x00606626 (g_guiBack). We point g_guiBack
+// at a landing that records ecx/esi, so the thunk's two paths can be run without the rest of 0x006065E0.
+static volatile uint32_t g_guiEcx = 0, g_guiEsi = 0;
+__declspec(naked) static void LandGui() {
+    __asm {
+        mov g_guiEcx, ecx
+        mov g_guiEsi, esi
+        ret
+    }
+}
+__declspec(noinline) static void RunGuiThunk(void* stringVal) {
+    __asm {
+        push esi
+        push ecx
+        mov eax, stringVal
+        call GuiTextThunk
+        pop ecx
+        pop esi
+    }
+}
+
+void TestGuiText() {
+    printf("map GUI text field (0x006065E0's null-string crash)\n");
+    MapImage(nullptr);
+    g_guitext = 1;
+    FixesApplyPatches();
+    Check(g_guiTextGuard && *(const uint8_t*)0x00606621 == 0xE9, "the guard is on: a jump at 0x00606621");
+
+    DWORD_PTR back = g_guiBack;
+    g_guiBack = (DWORD_PTR)LandGui;                // catch the thunk instead of running the rest of the function
+    static char text[4] = "abc";
+    LONG before = GuardHits(GUARD_GUI_TEXT);
+    RunGuiThunk(text);
+    bool ok = g_guiEcx == (uint32_t)(uintptr_t)text && g_guiEsi == (uint32_t)(uintptr_t)text + 1 &&
+              GuardHits(GUARD_GUI_TEXT) == before;
+    RunGuiThunk(nullptr);
+    bool nul = g_guiEcx == (uint32_t)(uintptr_t)&g_guiEmpty && g_guiEsi == (uint32_t)(uintptr_t)&g_guiEmpty + 1 &&
+               GuardHits(GUARD_GUI_TEXT) == before + 1 && g_guiEmpty[0] == 0;
+    g_guiBack = back;
+    Check(ok && nul,
+          "a real string is walked unchanged; a null string becomes the empty string (the field shows nothing) and "
+          "is counted once");
+
+    MapImage(nullptr);
+    *(uint8_t*)0x00606621 = 0x90;
+    g_lastLog.clear();
+    FixesApplyPatches();
+    Check(!g_guiTextGuard && *(const uint8_t*)0x00606621 == 0x90 &&
+              g_lastLog.find("not what build 2364871 has") != std::string::npos,
+          "a site that differs: nothing patched, and the log says so");
+
+    MapImage(nullptr);
+    g_guitext = 0;
+    FixesApplyPatches();
+    Check(!g_guiTextGuard && *(const uint8_t*)0x00606621 == 0x8B, "[guard] gui_text = 0: nothing patched");
+    MapImage(nullptr);
+    g_guitext = 0;
+}
+
+// ---- the foliage/water/effects streaming window (3x3 -> 5x5) ---------------------------------------------
+void TestStreamWindow() {
+    printf("foliage streaming window ([render] wide_foliage)\n");
+    MapImage(nullptr);
+    g_widefoliage = 1;
+    FixesApplyPatches();
+    bool patched = g_wideFoliage;
+    for (const StreamSite& s : STREAM_SITES) patched &= *(const DWORD*)(s.va + 2) == s.newDisp;
+    Check(patched, "on: the four foliage/water/effect updaters read the 5x5 model counts (+0x7F0/+0x7F4)");
+    bool lotKept = *(const DWORD*)(0x00C60542 + 2) == 0x800;
+    Check(lotKept, "enemies and objects (updateLot) keep the 3x3 layout counts (+0x800)");
+
+    MapImage(nullptr);
+    *(uint8_t*)0x00C613FE = 0x90;
+    g_lastLog.clear();
+    FixesApplyPatches();
+    Check(!g_wideFoliage && *(const DWORD*)(0x00C5E776 + 2) == 0x800 &&
+              g_lastLog.find("is not what build 2364871 has") != std::string::npos,
+          "a site that differs: the window stays 3x3 at every site, and the log says so");
+
+    MapImage(nullptr);
+    g_widefoliage = 0;
+    FixesApplyPatches();
+    Check(!g_wideFoliage && *(const DWORD*)(0x00C5E776 + 2) == 0x800, "[render] wide_foliage = 0: the window stays 3x3");
+    MapImage(nullptr);
+    g_widefoliage = 0;
+}
+
+// ---- broken loose textures ([guard] broken_textures) ----------------------------------------------------
+static void WriteFileBytes(const wchar_t* path, const void* data, DWORD n) {
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD w = 0;
+    if (h != INVALID_HANDLE_VALUE) { WriteFile(h, data, n, &w, nullptr); CloseHandle(h); }
+}
+
+void TestBrokenTextures() {
+    printf("broken loose textures (TextureFileBroken)\n");
+    wchar_t dir[MAX_PATH], path[MAX_PATH];
+    GetTempPathW(_countof(dir), dir);
+    _snwprintf_s(path, _countof(path), _TRUNCATE, L"%srs-tex-test.tex", dir);
+    wchar_t why[160];
+
+    // a valid 4x4 BC1 texture with 3 mips (52 bytes): revision 0x99, offsets 28/36/44 all inside the file
+    uint32_t words[4] = {0x00584554u, 0x20000099u, 3u | (4u << 6) | (4u << 19), 1u | (20u << 8) | (1u << 16)};
+    uint32_t offs[3] = {28, 36, 44};
+    uint8_t valid[52];
+    memcpy(valid, words, 16);
+    memcpy(valid + 16, offs, 12);
+    memset(valid + 28, 0x10, 24);
+    WriteFileBytes(path, valid, sizeof valid);
+    Check(!TextureFileBroken(path, why, _countof(why)), "a valid .tex is not called broken");
+
+    WriteFileBytes(path, valid, 40);                            // cut so mip offset 44 is past the end
+    Check(TextureFileBroken(path, why, _countof(why)), "a truncated .tex (a mip past the end) is broken");
+
+    uint8_t badrev[52];
+    memcpy(badrev, valid, 52);
+    *(uint32_t*)(badrev + 4) = 0x20000055u;                     // revision 0x055, not 0x099/0x09D
+    WriteFileBytes(path, badrev, 52);
+    Check(TextureFileBroken(path, why, _countof(why)), "an unknown revision is broken");
+
+    uint8_t garbage[52];
+    memset(garbage, 0xAB, sizeof garbage);
+    WriteFileBytes(path, garbage, sizeof garbage);
+    Check(TextureFileBroken(path, why, _countof(why)), "a file with the wrong magic is broken");
+
+    uint8_t tiny[8] = {0x54, 0x45, 0x58, 0x00, 0, 0, 0, 0};
+    WriteFileBytes(path, tiny, sizeof tiny);
+    Check(TextureFileBroken(path, why, _countof(why)), "a file too short for a header is broken");
+
+    // a cube map (shape 0x60000, six faces): its mip offsets are not one flat run, so they are not range-checked;
+    // the old check flagged valid cubemaps (DefaultCube_CM.tex in game) and swapped the reflections for the stand-in
+    uint32_t cube[4] = {0x00584554u, 0x60000099u, 1u | (4u << 6) | (4u << 19), 6u};
+    uint32_t coffs[6] = {28, 36, 44, 52, 60, 68};       // later faces sit past this deliberately tiny file
+    uint8_t cubebuf[40];
+    memcpy(cubebuf, cube, 16);
+    memcpy(cubebuf + 16, coffs, 24);
+    WriteFileBytes(path, cubebuf, sizeof cubebuf);
+    Check(!TextureFileBroken(path, why, _countof(why)), "a cube map is not flagged broken (its faces lay out differently)");
+
+    DeleteFileW(path);
+    Check(!TextureFileBroken(path, why, _countof(why)), "a file that cannot be opened is not called broken (missing is handled elsewhere)");
+}
+
+// ---- the effect-system dispatch guard (crash 0x010CBFA4) --------------------------------------------------
+// The game calls 0x010CBFA0 with a1/a2/a3 on the stack and ecx = [a2+4] (both callers set it).  Run the real
+// function that way, so the reimplementation can be checked against it for every tag.
+__declspec(noinline) static uint32_t CallOrigDispatch(uintptr_t fn, void* a1, void* a2, void* a3) {
+    uint32_t r;
+    __asm {
+        mov ecx, a2
+        mov ecx, [ecx + 4]
+        push a3
+        push a2
+        push a1
+        mov eax, fn
+        call eax
+        mov r, eax
+    }
+    return r;
+}
+
+void TestParticleGuard() {
+    printf("effect dispatch guard (0x010CBFA4)\n");
+    MapImage(nullptr);
+    static uint8_t a2[0x100], ecxobj[0x200], pobj[0x200], a3[0x40], gobj[0x100], a1[8];
+    memset(a2, 0, sizeof a2); memset(ecxobj, 0, sizeof ecxobj); memset(pobj, 0, sizeof pobj);
+    memset(a3, 0, sizeof a3); memset(gobj, 0, sizeof gobj); memset(a1, 0, sizeof a1);
+    *(void**)(a2 + 4) = ecxobj;                          // ecx = [a2+4]
+    *(uint32_t*)(a2 + 0x88) = 0x1111;                    // tag 1
+    *(uint32_t*)(ecxobj + 0x10C) = 0x2222;               // tag 2 (and tag 3 with no sub-pointer)
+    *(void**)(ecxobj + 0x1D0) = pobj;                    // tag 3 sub-pointer
+    *(uint32_t*)(pobj + 0x10C) = 0x3333;                 // tag 3 via the sub-pointer
+    *(uint32_t*)(a3 + 0x14) = 0x4444;                    // default
+    *(uint32_t*)(gobj + 0x74) = 0x5555;                  // tag 4
+    DWORD old;
+    if (VirtualProtect((void*)0x018D2818, 4, PAGE_READWRITE, &old)) {   // the game global tag 4 reads
+        *(void**)0x018D2818 = gobj;
+        VirtualProtect((void*)0x018D2818, 4, old, &old);
+    }
+    bool eq = true;
+    for (int t = 0; t < 8; t++) {
+        a1[3] = (uint8_t)t;
+        eq &= CallOrigDispatch(0x010CBFA0, a1, a2, a3) == EffectDispatchImpl(a1, a2, a3);
+    }
+    Check(eq, "the reimplementation matches the game's dispatch for every tag");
+    *(void**)(ecxobj + 0x1D0) = nullptr;                 // tag 3 with a null sub-pointer
+    a1[3] = 3;
+    Check(CallOrigDispatch(0x010CBFA0, a1, a2, a3) == EffectDispatchImpl(a1, a2, a3), "tag 3 with a null sub-pointer matches too");
+    *(void**)(ecxobj + 0x1D0) = pobj;
+
+    g_particles = 1;
+    FixesApplyPatches();
+    Check(g_particleGuard && *(const uint8_t*)0x010CBFA0 == 0xE9, "the guard is on: a jump at 0x010CBFA0");
+    LONG before = GuardHits(GUARD_PARTICLES);
+    a1[3] = 1;
+    bool guarded = EffectDispatchGuarded((void*)0x4, a2, a3) == 0x4444 && GuardHits(GUARD_PARTICLES) == before + 1;
+    Check(guarded, "a fault reading the parameter block is contained: the game's default is returned, and counted");
+    Check(EffectDispatchGuarded(a1, a2, a3) == 0x1111, "a valid parameter block still dispatches (tag 1)");
+
+    MapImage(nullptr);
+    *(uint8_t*)0x010CBFA0 = 0x90;
+    g_lastLog.clear();
+    FixesApplyPatches();
+    Check(!g_particleGuard && *(const uint8_t*)0x010CBFA0 == 0x90 &&
+              g_lastLog.find("not what build 2364871 has") != std::string::npos,
+          "a site that differs: nothing patched, and the log says so");
+    MapImage(nullptr);
+    g_particles = 0;
+    FixesApplyPatches();
+    Check(!g_particleGuard && *(const uint8_t*)0x010CBFA0 == 0x8B, "[guard] particles = 0: nothing patched");
+    MapImage(nullptr);
+    g_particles = 0;
 }
 }  // namespace
 
@@ -435,6 +984,12 @@ static int Run(int argc, wchar_t** argv) {
     TestEnemySlots();
     TestResourceRelease();
     TestExit();
+    TestRagdolls();
+    TestRagdollFamily();
+    TestGuiText();
+    TestStreamWindow();
+    TestBrokenTextures();
+    TestParticleGuard();
     printf("%s\n", g_fails ? "FAILED" : "ALL PASSED");
     return g_fails ? 1 : 0;
 }

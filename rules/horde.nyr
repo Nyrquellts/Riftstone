@@ -11,6 +11,7 @@
 Horde := 1              # the signal: this group is a horde
 HordeRespawn := 5       # respawn type 5 with a spawn cap: that many in total from the spawn points
 Dragon := 7800          # the story flag the Dragon's defeat sets
+StoryEnd := 27999       # the end of the game's own whole-story window (0..27999)
 
 # More enemies than spawn points: the game's own horde setting (stage 330's group 35 brings 100
 # goblins from 7 spawn points), refilled until the cap, never on a day or a chance.
@@ -20,6 +21,11 @@ Dragon := 7800          # the story flag the Dragon's defeat sets
 # Otherwise each spawn point spawns its enemy, with no cap.
 [total <= points] => set_count_max <- -1
 
-[story == 1] => appear_bgn <- 0, appear_end <- 0
+# The story window: the group appears while the story value (sGameSys+0x30, the save's mScenarioNo) is at least
+# appear_bgn and below appear_end (the live check: 0x004A9AC7 jl, 0x004A9ACC jge; docs/spawn-system.md).  The game's
+# own "whole story" is 0..27999 (218 of its 631 groups with the scenario condition on; 626 end above their start).
+# A window ending at 0 (story "any" once wrote 0..0, "post" 7800..0) is never open: the Gran Soren Arena the owner
+# did not see (2026-09-27) and two of the Gran Soren Horde's groups had one.
+[story == 1] => appear_bgn <- 0, appear_end <- StoryEnd
 [story == 2] => appear_bgn <- 0, appear_end <- Dragon - 1
-[story == 3] => appear_bgn <- Dragon, appear_end <- 0
+[story == 3] => appear_bgn <- Dragon, appear_end <- StoryEnd

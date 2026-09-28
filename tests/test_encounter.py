@@ -64,6 +64,25 @@ class EncounterCellTest(unittest.TestCase):
         # the layout is 05m02n: its cell goes in as mSplitX 2, mSplitZ 5 (the name's second number, then its first)
         self.assertEqual([(la["mSplitX"], la["mSplitZ"]) for la in g["mLayoutIDArray"]], [(9, 9), (2, 5)])
 
+    def test_a_copy_of_a_scripted_group_appears_by_its_own_conditions(self):
+        """A group the game sets only on a script's order (or a request, or an event) names its own number there;
+        the copy's new number is named nowhere, so it must not keep that condition (Tower Arena Test, 2026-09-27:
+        three copies of stage 370's script-set group never appeared)."""
+        root = self._mod("Scripted")
+        name = rb"scr\st424\etc\st424_e"
+        doc = gpl.parse(modfiles.load(self.game, self.idx, None, name, GPL)[0])
+        g6 = [x for x in doc.groups if x["mGroup"] == 6][0]
+        for k in encounter.SCRIPTED:
+            g6[k] = 1
+        g6["mSetCondition.mAreaHit"] = 0
+        modfiles.save(modfiles.paths(root, name, GPL)[0], gpl.build(doc), name, GPL)
+        enc = encounter.plan(self.game, self.idx, self.w, root, 424, "goblin", 3, "20100,300,50000", points=3, like=6)
+        g = [x for x in gpl.parse(enc.gpl_data).groups if x["mGroup"] == enc.group][0]
+        self.assertEqual({k: g[k] for k in encounter.SCRIPTED}, dict.fromkeys(encounter.SCRIPTED, 0))
+        self.assertTrue(any("mFsm, mRequest, mSimpleEv" in n for n in enc.notes), enc.notes)
+        kept = [x for x in gpl.parse(enc.gpl_data).groups if x["mGroup"] == 6][0]
+        self.assertEqual({k: kept[k] for k in encounter.SCRIPTED}, dict.fromkeys(encounter.SCRIPTED, 1))  # the game's own
+
     def test_the_group_to_copy_may_be_in_the_dlc_list(self):
         """Everfall's groups 20-22 are st443_e_dlc01's; here the DLC list's group 1, whose goblin stands at
         300,-350,-8800.  An encounter among them (or like one) copies it into the stage's own list."""

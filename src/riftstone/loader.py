@@ -49,8 +49,9 @@ def _candidates() -> list[Path]:
 
 def built_loader() -> Path:
     for d in _candidates():
-        if (d / "dinput8.dll").is_file() and MARKER in (d / "dinput8.dll").read_bytes():
-            return d
+        dll = d / "dinput8.dll"
+        if dll.is_file() and is_ours(dll):          # is_ours swallows a locked/unreadable DLL (OSError), so a
+            return d                                 # build in flight or an AV lock does not crash Studio's API
     raise RiftError("the loader is not built. Run native\\loader\\build.cmd (needs Visual Studio C++ tools), "
                     "or use a Riftstone release that includes loader\\dinput8.dll")
 

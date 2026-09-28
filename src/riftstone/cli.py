@@ -811,9 +811,15 @@ def _package_plugins(args, items: list[str]) -> int:
     if not plugin_paths:
         raise RiftError("no plugins are built; run native\\plugins\\<name>\\build.cmd, or pass --plugin")
     ninput = None
-    if args.ninput:
-        ninput = (Path(__file__).resolve().parents[2] / "native" / "ninput" / "out-msvc" / "RelWithDebInfo" /
-                  "xinput1_3.dll") if args.ninput == "built" else Path(args.ninput)
+    if not getattr(args, "no_ninput", False) and args.ninput:
+        cand = (Path(__file__).resolve().parents[2] / "native" / "ninput" / "out-msvc" / "RelWithDebInfo" /
+                "xinput1_3.dll") if args.ninput == "built" else Path(args.ninput)
+        if cand.is_file():
+            ninput = cand
+        elif args.ninput != "built":
+            raise RiftError(f"{cand} does not exist (build it: native\\ninput\\build_msvc.cmd)")
+        else:
+            ui.warn("Ninput is not built (native\\ninput\\build_msvc.cmd); packaging without it (--no-ninput to silence)")
     r = package.build_plugins(plugin_paths, out, args.name or "Riftstone plugins", ninput=ninput)
     n = len(r["plugins"])
     ui.ok(f"Packaged the loader and {n} plugin{'s' if n != 1 else ''} (no game data)"
@@ -1194,21 +1200,37 @@ def _doctor_address_space(game: Game) -> int:
 
 
 def _doctor_d3d9(game: Game) -> int:
-    """[d3d9] chain (DXVK) and any d3d9.dll put straight into the game folder."""
+    """[d3d9] chain (DXVK), a graphics profile in the game folder, and any d3d9.dll put straight into it."""
+    from . import graphics
     from . import loader as loader_mod
 
     st = loader_mod.d3d9_status(game)
+    problems = 0
+    try:
+        applied = graphics.load_state(game)
+    except RiftError as e:
+        applied = None
+        ui.warn(str(e))
+        problems += 1
+    if applied:
+        gone = [rel for rel, sha in applied["files"].items() if not (game.root / Path(*rel.split("/"))).is_file()]
+        ui.ok(f"graphics profile {applied.get('profile')} is in the game folder ('riftstone graphics' shows it)")
+        if gone:
+            ui.warn(f"{len(gone)} of its files are gone from the game folder ({', '.join(gone[:3])}): 'riftstone "
+                    f"graphics apply {applied.get('profile')}' puts them back")
+            problems += 1
     if st["game_folder_d3d9"]:
-        ui.info(f"the game folder has its own d3d9.dll ({'DXVK' if st['game_folder_dxvk'] else 'not DXVK'}): the game "
-                "uses it instead of Windows' Direct3D 9")
+        ui.info(f"the game folder has its own d3d9.dll ({'DXVK' if st['game_folder_dxvk'] else 'not DXVK'}"
+                + (f", from graphics profile {applied.get('profile')}" if applied and "d3d9.dll" in applied["files"] else "")
+                + "): the game uses it instead of Windows' Direct3D 9")
     if not st["setting"]:
-        return 0
+        return problems
     if st["problem"]:
         ui.warn(f"[d3d9] chain = {st['setting']} {st['problem']}; the game gets its usual Direct3D 9")
-        return 1
+        return problems + 1
     ui.ok(f"[d3d9] chain: {st['setting']} ({'DXVK' if st['dxvk'] else 'a Direct3D 9 runtime'}, sha256 "
           f"{st['sha256'][:16]}...){' with ' + st['conf'].name if st['conf'] else ''}")
-    return 0
+    return problems
 
 
 def _doctor_runtime(game: Game, loader_installed: bool, running: bool = False) -> int:
@@ -3188,6 +3210,227 @@ def cmd_loader(args) -> int:
     return 0
 
 
+def cmd_graphics(args) -> int:
+    """riftstone graphics [status | list | check <profile> | apply <profile> | off]"""
+    from . import graphics
+
+    game = _game(args)
+    action = args.action
+    if action in ("apply", "check") and not args.profile:
+        raise RiftError(f"name the profile: riftstone graphics {action} <name> (riftstone graphics list shows them)")
+    if action in ("status", "list", "off") and args.profile:
+        raise RiftError(f"'graphics {action}' takes no profile name")
+
+    def as_json(r):
+        if isinstance(r, graphics.Result):
+            d = {k: as_json(v) for k, v in r.__dict__.items()}
+            return d
+        if isinstance(r, dict):
+            return {str(k): as_json(v) for k, v in r.items()}
+        if isinstance(r, (list, tuple)):
+            return [as_json(v) for v in r]
+        return str(r) if isinstance(r, Path) else r
+
+    def show(r: graphics.Result, verb: str) -> None:
+        if r.took_out:
+            show(r.took_out, "took out")
+        if r.wrote:
+            ui.ok(f"{verb} graphics profile {r.profile}: {len(r.wrote)} file(s) into {game.root}")
+        if r.removed:
+            ui.ok(f"{verb} graphics profile {r.profile}: {len(r.removed)} file(s) out of {game.root}")
+        for rel in r.moved_aside:
+            ui.info(f"{rel} was in the way: kept in the backup, and it comes back with 'riftstone graphics off'")
+        for rel in r.kept_changed:
+            ui.info(f"{rel} had changed since it was written (an ENB editor saves into it): kept as "
+                    f"{r.backup / 'changed' / rel}")
+        for rel in r.restored:
+            ui.info(f"{rel} is back as it was before the profile")
+        for rel in r.lost:
+            ui.warn(f"{rel} was in the way when the profile went in, and its copy is gone from {r.backup}")
+        for key, v in r.config.items():
+            ui.info(f"config.ini {key}: " + (f"{v[0]} -> {v[1]}" if isinstance(v, tuple) else f"back to {v}"))
+        for key, v in r.config_kept.items():
+            ui.info(f"config.ini {key} stays {v} (changed in the game's options since)")
+        for key, v in r.loader.items():
+            ui.info(f"riftstone_loader.ini {key}: " + (f"{v[0] or '(empty)'} -> {v[1] or '(empty)'}"
+                                                       if isinstance(v, tuple) else f"back to {v or '(empty)'}"))
+
+    if action == "apply":
+        r = graphics.apply(game, args.profile)
+        if args.json:
+            print(json.dumps(as_json(r), indent=1))
+            return 0
+        show(r, "put in")
+        ui.info(f"backup of everything it replaced: {r.backup}")
+        ui.info("'riftstone graphics off' takes it out again and puts the settings back")
+        return 0
+    if action == "off":
+        r = graphics.off(game)
+        if args.json:
+            print(json.dumps(as_json(r), indent=1))
+            return 0
+        show(r, "took out")
+        return 0
+    if action == "check":
+        p = graphics.load_profile(args.profile)
+        bad = graphics.problems(p, game, graphics.default_config(game))
+        if args.json:
+            print(json.dumps({"profile": p.name, "title": p.title, "files": len(p.files), "problems": bad}, indent=1))
+            return 1 if bad else 0
+        if bad:
+            ui.warn(f"graphics profile {p.name} ({p.title}) cannot be applied:")
+            for b in bad:
+                ui.info(b)
+            return 1
+        ui.ok(f"graphics profile {p.name} ({p.title}): {len(p.files)} file(s), every one the bytes profile.json names")
+        for n in p.notes:
+            ui.info(n)
+        return 0
+    st = graphics.status(game)
+    if args.json:
+        print(json.dumps(as_json(st), indent=1))
+        return 0
+    if action == "status":
+        if st["applied"]:
+            a = st["applied"]
+            ui.ok(f"graphics profile {a['profile']} ({a['title']}) is in the game folder since {a['applied']}")
+            changed = [rel for rel, s in st["files"].items() if s != "as written"]
+            for rel in changed:
+                ui.info(f"{rel}: {st['files'][rel]}" + (" (an ENB editor saves its settings into it)"
+                                                          if st["files"][rel] == "changed since" else ""))
+            ui.info(f"backup of what it replaced: {a['backup']}; 'riftstone graphics off' takes it out")
+        else:
+            ui.ok("no graphics profile is in the game folder")
+    folder = graphics.profiles_folder()
+    if not st["profiles"]:
+        ui.info(f"no profiles in {folder}")
+        return 0
+    for name, p in st["profiles"].items():
+        line = f"{name}: {p['title']} ({p['files']} file(s))"
+        if p["problems"]:
+            ui.warn(line + " -- " + "; ".join(p["problems"]))
+        else:
+            ui.info(line + " -- ready")
+    if action == "list":
+        ui.info(f"profiles folder: {folder}")
+    return 0
+
+
+def _place_list(game: Game) -> list[str]:
+    """The game's place list (English, what the Ferrystone and the map name places with) as the installed game holds
+    it: the loader's overlay copy of its archive when a mod changed it, else the game's own."""
+    from . import gmd, portcrystals, text as textlib
+
+    name = textlib.resolve(portcrystals.PLACE_LIST)
+    arcs = _index(game, quiet=True).archives_with(name, textlib.GMD)
+    if not arcs:
+        raise RiftError(f"{portcrystals.PLACE_LIST} is not in the game")
+    live = game.overlay_dir / (arcs[0] + ".arc")
+    e = arc.Archive.read(live if live.is_file() else game.vanilla_arc(arcs[0])).find(name, textlib.GMD)
+    if e is None:
+        raise RiftError(f"{portcrystals.PLACE_LIST} is not in {arcs[0]}")
+    return [m.text for m in gmd.parse(e.data()).messages]
+
+
+def cmd_portcrystals(args) -> int:
+    """riftstone portcrystals [status | add --stage S --at x,y,z [--slot N] [--name TEXT] | remove --slot N]"""
+    import time as _time
+
+    from . import install, loader as loaderlib, nav, portcrystals, saves
+
+    game = _game(args)
+    side = game.state_dir / "portcrystals.bin"
+    plugin = game.state_dir / "plugins" / "portcrystals.asi"
+    ini = game.state_dir / "plugins" / "portcrystals.ini"
+    ini_text = ini.read_bytes().decode("utf-8", errors="replace") if ini.is_file() else ""
+    try:
+        slots = int(loaderlib._ini_values(ini_text).get("portcrystals", {}).get("slots", "15"))
+    except ValueError:
+        slots = 15
+    names = portcrystals.read_names(ini_text)
+    slots = max(10, min(10 + portcrystals.MAX_EXTRA, slots))
+    if args.save:
+        save = Path(args.save)
+    else:
+        found = saves.steam_saves()
+        if args.account:
+            found = [(a, p) for a, p in found if a == args.account]
+        if len(found) != 1:
+            raise RiftError("no Steam save of the game was found" if not found else
+                            "saves of several accounts: name one with --account (" + ", ".join(a for a, _ in found) + ")")
+        save = found[0][1]
+    ten = portcrystals.save_slots(saves.unpack(save.read_bytes()))
+    fp = portcrystals.fingerprint(ten)
+    records = portcrystals.parse(side.read_bytes()) if side.is_file() else []
+    rec = next((r for r in records if r.fingerprint == fp), None)
+    if args.action == "status":
+        ui.ok(f"portcrystals plugin {'installed' if plugin.is_file() else 'NOT installed'}: slots = {slots}")
+        ui.info(f"the save {save} holds {sum(1 for s in ten if s[0])} placed crystal(s) in its ten (fingerprint {fp:016x})")
+        placed = [(k + 11, s) for k, s in enumerate(rec.slots) if s[0]] if rec else []
+        for n, s in placed:
+            x, y, z = rec.position(n - 11)
+            named = names.get(portcrystals.slot_key(s))
+            ui.info(f"slot {n}: stage {s[0]} at {x:.0f}, {y:.0f}, {z:.0f}"
+                    + (f", named by place-list message {named}" if named is not None else ""))
+        if not placed:
+            ui.info("no crystals past the ten for this save")
+        ui.info(f"the sidecar {side} keeps {len(records)} save(s)")
+        return 0
+    if install.game_running(game):
+        raise RiftError("Dragon's Dogma is running. Close it first: the plugin reads the sidecar when the game starts and "
+                        "writes it when the game saves.")
+    if args.action == "add":
+        if args.stage is None or not args.at:
+            raise RiftError("name the place: riftstone portcrystals add --stage 370 --at 1539,3911,1593")
+        try:
+            x, y, z = (float(v) for v in args.at.split(","))
+        except ValueError as e:
+            raise RiftError(f"--at {args.at!r} is not x,y,z") from e
+        if slots <= 10:
+            raise RiftError("slots = 10 in portcrystals.ini: there is no slot past the ten")
+        message = None
+        if args.name:
+            lines = _place_list(game)
+            message = next((i for i, t in enumerate(lines) if t.strip() == args.name.strip()), None)
+            if message is None:
+                raise RiftError(f"{args.name!r} is not a line of the game's place list as installed. Add it to a mod: "
+                                f"riftstone text add {portcrystals.PLACE_LIST} \"{args.name}\" --mod <mod>, install "
+                                "that mod, then run this again")
+        mesh = nav.stage_mesh(game, _index(game), args.stage)
+        if mesh is not None and mesh.locate((x, y, z)) is None:
+            spot = mesh.nearest((x, y, z), 400)
+            if spot is None:
+                raise RiftError(f"({x:.0f}, {y:.0f}, {z:.0f}) is not on stage {args.stage}'s walkable ground, nor within "
+                                "4 m of it: a Ferrystone would put you there")
+            x, y, z = spot.point
+            ui.info(f"moved onto the walkable ground: {x:.0f}, {y:.0f}, {z:.0f}")
+        written = int((_time.time() + 11644473600) * 10_000_000)
+        records, used = portcrystals.place(records, fp, slots, args.stage, x, y, z, slot=args.slot, written=written)
+        arcfolder.write_file(side, portcrystals.build(records))
+        ui.ok(f"a Portcrystal in slot {used} (stage {args.stage} at {x:.0f}, {y:.0f}, {z:.0f}) for this save; it appears "
+              "when you load it (the Ferrystone lists it)")
+        if message is not None:
+            text = portcrystals.write_names(ini_text, {portcrystals.name_key(x, y, z): message})
+            arcfolder.write_file(ini, text.encode("utf-8"))
+            ui.ok(f"named {args.name!r} (place-list message {message}) in {ini}")
+        if not plugin.is_file():
+            ui.warn("the portcrystals plugin is not installed: riftstone loader plugin add native\\plugins\\portcrystals"
+                    "\\out\\portcrystals.asi")
+        return 0
+    if args.slot is None:
+        raise RiftError("name the slot: riftstone portcrystals remove --slot 11")
+    if not rec or not 11 <= args.slot < 11 + len(rec.slots) or not rec.slots[args.slot - 11][0]:
+        raise RiftError(f"slot {args.slot} holds no crystal for this save")
+    key = portcrystals.slot_key(rec.slots[args.slot - 11])
+    rec.slots[args.slot - 11] = (0, 0, 0, 0)
+    arcfolder.write_file(side, portcrystals.build(records))
+    ui.ok(f"slot {args.slot} is empty for this save (its crystal is gone when you load it)")
+    if key in names and not any(portcrystals.slot_key(s) == key for r in records for s in r.slots if s[0]):
+        arcfolder.write_file(ini, portcrystals.write_names(ini_text, {key: None}).encode("utf-8"))
+        ui.info(f"its name is out of {ini}")
+    return 0
+
+
 def _loader_d3d9(game: Game, args) -> int:
     """riftstone loader d3d9 [status | add <DXVK release, folder or d3d9.dll> | off]"""
     from . import loader
@@ -3294,16 +3537,17 @@ def cmd_crash(args) -> int:
 
     game = _game(args)
     logs = game.state_dir / "logs"
-    found = runtime.list_reports(logs)
+    every = runtime.list_reports(logs, snapshots=True)
+    found = [r for r in every if r["kind"] != "snapshot"]         # a snapshot is asked for, not something wrong
     if args.list:
-        if not found:
-            ui.ok("no crash, fatal-error or hang reports")
-        for r in found:
+        if not every:
+            ui.ok("no crash, fatal-error or hang reports, and no snapshots")
+        for r in every:
             ui.info(f"{r['name']}  ({r['kind']}{', with a minidump' if r['dump'] else ''})")
         return 0
     end = runtime.session_end(game.root, running=install.game_running(game))
     if args.report:
-        match = [r for r in found if r["name"] == args.report or r["stamp"] == args.report]
+        match = [r for r in every if r["name"] == args.report or r["stamp"] == args.report]
         if not match:
             raise RiftError(f"no report named {args.report!r} in {logs} ('riftstone crash --list' shows them)")
         chosen = match[0]
@@ -3334,6 +3578,67 @@ def cmd_crash(args) -> int:
     return 0
 
 
+def _show_threads(dump: Path, match: str | None = None, every: bool = False, main: str | None = None) -> None:
+    """A minidump's threads grouped by what they are in, then each thread (those matching ``match``, else the main
+    thread and ten more) with where it is and the likely callers on its stack."""
+    from . import minidump
+
+    ts = minidump.threads(dump.read_bytes())
+    ui.ok(f"{len(ts)} threads in {dump.name}")
+    for line in minidump.summary(ts):
+        ui.info(line)
+    shown = [t for t in ts if match.lower() in (t.where + " " + " ".join(t.frames)).lower()] if match else ts
+    if not match and not every:
+        first = [t for t in ts if main and t.where.lower() == main.lower()]
+        shown = first + [t for t in ts if t not in first][:10]
+    for t in shown:
+        ui.info(f"thread {t.id}: at {t.where}" + (f" <- {' <- '.join(t.frames[:6])}" if t.frames else ""))
+    if len(shown) < len(ts) and not match:
+        name = dump.stem.split("-", 1)[1] if dump.stem.startswith(("hang-", "crash-", "snapshot-")) else f'"{dump}"'
+        ui.info(f"{len(ts) - len(shown)} more: riftstone threads {name} --all (or --match <module>)")
+
+
+def cmd_snapshot(args) -> int:
+    """riftstone snapshot: where the running game's threads are, while it goes on."""
+    from . import runtime
+
+    game = _game(args)
+    logs = game.state_dir / "logs"
+    r = runtime.request_snapshot(logs, timeout=args.timeout)
+    rep = runtime.parse_report(r["report"].read_text(encoding="utf-8", errors="replace"))
+    if args.json:
+        from . import minidump
+        ts = minidump.threads(r["dump"].read_bytes()) if r["dump"] else []
+        print(json.dumps({"report": str(r["report"]), "dump": str(r["dump"]) if r["dump"] else None,
+                          "dump_note": r["dump_note"], "main_thread": rep.get("main_thread"), "memory": rep.get("memory"),
+                          "summary": minidump.summary(ts) if ts else [],
+                          "threads": [t.__dict__ for t in ts]}, indent=1, default=str))
+        return 0
+    ui.ok(f"snapshot taken: {r['report']}")
+    for line in runtime.explain(rep, game.root):
+        ui.info(line)
+    if r["dump"]:
+        _show_threads(r["dump"], main=rep.get("main_thread"))
+    else:
+        ui.warn("no dump of every thread: " + (r["dump_note"] or "the loader did not say it wrote one ([loader] "
+                                                                  "minidump, or it is still writing)"))
+    return 0
+
+
+def cmd_threads(args) -> int:
+    """riftstone threads <dump>: what every thread of a loader's .dmp was doing."""
+    dump = Path(args.dump)
+    if not dump.is_file():
+        from . import runtime
+        logs = _game(args).state_dir / "logs"
+        named = [r for r in runtime.list_reports(logs, snapshots=True) if r["dump"] and args.dump in (r["name"], r["stamp"])]
+        if not named:
+            raise RiftError(f"{args.dump} is not a .dmp, or a report with one in {logs} ('riftstone crash --list')")
+        dump = named[0]["path"].with_suffix(".dmp")
+    _show_threads(dump, match=args.match, every=args.all)
+    return 0
+
+
 def cmd_playtest(args) -> int:
     """The last play session checked item by item from its logs; or the texture-guard test mod."""
     from . import install, playtest
@@ -3354,7 +3659,7 @@ def cmd_playtest(args) -> int:
         return 0
     if game.is_ddo:
         raise RiftError("playtest reads the Riftstone loader's logs, and the loader runs in Dark Arisen only")
-    items = playtest.check_session(game.root, previous=args.previous)
+    items = playtest.check_session(game.root, previous=args.previous, config=playtest.game_config())
     if args.json:
         print(json.dumps([i.as_dict() for i in items], indent=1))
         return 0
@@ -3987,9 +4292,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plugins-only", action="store_true", dest="plugins_only",
                    help="a loader + plugins zip with no mods and no game data, to unzip into the game folder "
                         "(Riftstone's stable built plugins unless --plugin names them; experimental ones only by name)")
-    p.add_argument("--ninput", nargs="?", const="built", metavar="XINPUT1_3.DLL",
-                   help="--plugins-only: add Ninput (EXPERIMENTAL) under optional\\ninput, off until a player copies it "
-                        "(default: native\\ninput's own build)")
+    p.add_argument("--ninput", nargs="?", const="built", default="built", metavar="XINPUT1_3.DLL",
+                   help="--plugins-only: which Ninput to include under optional\\ninput, off until a player copies it "
+                        "(default on: native\\ninput's own build; --no-ninput leaves it out)")
+    p.add_argument("--no-ninput", action="store_true", dest="no_ninput",
+                   help="--plugins-only: do not include Ninput in the package")
     p.add_argument("--plugin", action="append", help="make: a native plugin to include (.asi; its .ini comes along); "
                                                      "repeat for more")
     p.add_argument("--name", help="make: the package's title (default: the mods' names)")
@@ -4045,6 +4352,22 @@ def build_parser() -> argparse.ArgumentParser:
                    "or x32 d3d9.dll> (into riftstone\\dxvk, named in [d3d9] chain) or off")
     p.add_argument("file", nargs="?", help="the .asi/.dll to add, or the plugin name to remove or release; with "
                    "'d3d9 add': DXVK's release")
+    p = add("portcrystals", cmd_portcrystals, "the portcrystals plugin's crystals past ten for your save: status, add a "
+            "crystal anywhere (a stage and a spot, e.g. a tower's summit), remove one")
+    p.add_argument("action", nargs="?", choices=["status", "add", "remove"], default="status")
+    p.add_argument("--stage", type=int, help="add: the stage (riftstone world stages; 100 is the open world)")
+    p.add_argument("--at", help="add: x,y,z in that stage (cm); moved onto its walkable ground when it has one")
+    p.add_argument("--slot", type=int, help="add: this slot (11..slots) instead of the first free one; remove: the slot")
+    p.add_argument("--name", help="add: its name in the Ferrystone's list and on the map, a line of the game's place "
+                                  "list as installed (a mod adds one with riftstone text add)")
+    p.add_argument("--account", help="the Steam account whose save it is, when there are several")
+    p.add_argument("--save", help="the save file (default: the Steam account's DDDA.sav)")
+    p = add("graphics", cmd_graphics, "graphics profiles (an ENB and its preset, with the game's settings) put in and "
+            "taken out as one: status, list, check <profile>, apply <profile>, off")
+    p.add_argument("action", nargs="?", choices=["status", "list", "check", "apply", "off"], default="status")
+    p.add_argument("profile", nargs="?", help="with 'apply' or 'check': the profile's name (riftstone graphics list) "
+                                              "or its folder")
+    p.add_argument("--json", action="store_true")
     p = add("laa", cmd_laa, "is the game's exe (or any exe) large-address aware (4 GB, not 2 GB of address space); "
             "--copy writes a copy with the flag set")
     p.add_argument("exe", nargs="?", help="an exe or DLL (default: the game's)")
@@ -4056,6 +4379,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("report", nargs="?", help="a report name from riftstone\\logs (default: the newest)")
     p.add_argument("--list", action="store_true", help="list the reports instead")
     p.add_argument("--json", action="store_true", help="the parsed report and the explanation as JSON")
+    p = add("snapshot", cmd_snapshot, "where the running game's threads are right now, while it goes on: a report "
+            "and a .dmp of every thread in riftstone\\logs (the loader since 1.0.2)")
+    p.add_argument("--timeout", type=float, default=45.0, help="seconds to wait for the report and its dump")
+    p.add_argument("--json", action="store_true")
+    p = add("threads", cmd_threads, "what every thread of a loader's .dmp (a hang, crash or snapshot) was doing")
+    p.add_argument("dump", help="a .dmp file, or a report's name or time stamp from 'riftstone crash --list'")
+    p.add_argument("--match", help="only the threads in or called from this module (e.g. d3d9.dll, nvoglv32)")
+    p.add_argument("--all", action="store_true", help="every thread")
     p = add("playtest", cmd_playtest, "the last play session checked item by item from its logs (the loader, "
             "plugins, the F10 panel, the texture guard, how it ended); guard-mod: a test mod for the texture guard")
     p.add_argument("action", nargs="?", choices=["check", "guard-mod"], default="check")

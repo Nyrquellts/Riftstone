@@ -75,6 +75,12 @@ CATALOG: dict[str, dict] = {
         "summary": "A Warrior gets six skills like a staff: three more on the secondary-weapon skill button.",
         "own": True,
     },
+    "portcrystals": {
+        "title": "More Portcrystals",
+        "summary": "Place 15 Portcrystals instead of the game's 10 (10 to 32); the ones past ten are kept beside "
+                   "your save.",
+        "own": True,
+    },
     LOADER: {
         "title": "Riftstone loader",
         "summary": "Serves your mods without touching the game's files, reports crashes, loads the plugins.",
@@ -94,12 +100,14 @@ _RULES: dict[tuple[str, str, str], tuple] = {
     ("lod_tuner", "lod", "maxdistance"): ("int", 100, 100000),
     ("lod_tuner", "lod", "screenheight"): ("auto_int", 240, 8640),
     ("lod_tuner", "lod", "fieldofview"): ("auto_float", 10.0, 170.0),
+    ("lod_tuner", "lod", "farthest"): ("choice", "high", "lod"),
     ("compat", "compat", "enabled"): ("int", 0, 1),
     ("compat", "levels", "unlearned"): ("int", 1, 10),
     ("compat", "levels", "learned"): ("int", 1, 10),
     ("compat", "levels", "level2"): ("int", 1, 10),
     ("compat", "levels", "level3"): ("int", 1, 10),
     ("compat", "test", "level"): ("int", 1, 10),
+    ("portcrystals", "portcrystals", "slots"): ("int", 10, 32),
     ("free_sprint", "sprint", "mode"): ("choice", "out_of_battle", "always", "off"),
     ("free_sprint", "sprint", "who"): ("choice", "party", "arisen"),
     ("draw_distance", "draw", "enabled"): ("int", 0, 1),
@@ -124,8 +132,13 @@ _RULES: dict[tuple[str, str, str], tuple] = {
     (LOADER, "overlay", "position"): ("choice", "top-right", "top-left", "bottom-right", "bottom-left"),
     (LOADER, "overlay", "scale"): ("auto_float", 0.75, 3.0),
 }
+# Checks for every key of a section whose keys are data: portcrystals' [names] maps a crystal's position (its float
+# bits) to a message of the game's place list.
+_SECTION_RULES: dict[tuple[str, str], tuple] = {
+    ("portcrystals", "names"): ("int", 0, 65535),
+}
 _BOOL_KEYS = re.compile(r"^(enabled|overlay|log_redirects|crash_reports|minidump|plugins|safe_mode|safe_mode_notice|"
-                        r"fatal_hint|missing_textures|frame_stats|hang_reports|borderless|borderless_fill|"
+                        r"fatal_hint|missing_textures|from_archives|ragdoll_bodies|frame_stats|hang_reports|borderless|borderless_fill|"
                         r"background_run|backup|show_at_start|record|trace)$")
 
 
@@ -198,7 +211,7 @@ def _valid(stem: str, section: str, key: str, value) -> str:
     text = str(value).strip() if value is not None else ""
     if not text or len(text) > 64 or any(c in text for c in ";=[]\r\n\x00"):
         raise RiftError(f"{key}: a short value without ; = [ ] or line breaks")
-    rule = _RULES.get((stem.lower(), section.lower(), key.lower()))
+    rule = _RULES.get((stem.lower(), section.lower(), key.lower())) or _SECTION_RULES.get((stem.lower(), section.lower()))
     if rule is None and _BOOL_KEYS.match(key.lower()):
         rule = ("int", 0, 1)
     if rule is None:

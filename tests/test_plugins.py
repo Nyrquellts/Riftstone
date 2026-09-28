@@ -182,6 +182,25 @@ class PluginsTest(unittest.TestCase):
         self.assertIn("HumanEnemies = 0", text)
         self.assertIn("; 1 = on. 0 = the plugin loads and changes nothing.", text)      # comments kept
 
+    def test_portcrystals_settings_and_names(self):
+        """portcrystals.ini: slots within what the plugin takes, and each [names] entry a place-list message number."""
+        d = plugins.plugins_dir(self.game)
+        (d / "portcrystals.asi").write_bytes(b"MZ pc")
+        shipped = Path(SRC).parent / "native" / "plugins" / "portcrystals" / "portcrystals.ini"
+        (d / "portcrystals.ini").write_bytes(shipped.read_bytes() + b"[names]\n44C06000,45747800,44C72000 = 277\n")
+        self.assertEqual(plugins.set_value(self.game, "portcrystals", "portcrystals", "slots", "20")["value"], "20")
+        self.assertEqual(plugins.set_value(self.game, "portcrystals", "names", "44C06000,45747800,44C72000", "37")
+                         ["value"], "37")
+        for section, key, bad in (("portcrystals", "slots", "9"), ("portcrystals", "slots", "33"),
+                                  ("names", "44C06000,45747800,44C72000", "Tower"),
+                                  ("names", "44C06000,45747800,44C72000", "65536"),
+                                  ("names", "44C06000,45747800,44C72000", "-1")):
+            with self.assertRaises(RiftError, msg=(section, key, bad)):
+                plugins.set_value(self.game, "portcrystals", section, key, bad)
+        from riftstone import portcrystals
+        self.assertEqual(portcrystals.read_names((d / "portcrystals.ini").read_text(encoding="utf-8")),
+                         {"44C06000,45747800,44C72000": 37})
+
     def test_six_skill_warrior_settings_are_the_plugins_own_choices(self):
         """The shipped six_skill_warrior.ini: Studio offers only six and off (anything else patches nothing)."""
         shipped = Path(SRC).parent / "native" / "plugins" / "six_skill_warrior" / "six_skill_warrior.ini"

@@ -61,6 +61,11 @@ HORDE_FIELDS = {"set_count_max": "mSetCountMax", "rspn_type": "mRspnCondition.mR
                 "rspn_force_rspn": "mRspnCondition.mRspnForceRspn", "appear_bgn": "mAppearBgn",
                 "appear_end": "mAppearEnd"}
 STORY_CODES = {"any": 1, "pre": 2, "post": 3}          # rules/horde.nyr's story input (0: keep the copy's)
+# Set conditions under which the game sets a group only when something outside it names that group's number: a state
+# machine's order (mFsm: the group starts unsettable, `F6 46 34 04 74 06 66 C7 47 31 00 00` at 0x004A3B52, and the live
+# check refuses it, `F6 46 34 04 74 04 32 C0` at 0x004A9A7C), a request (mRequest, 0x004A3B32) or a simple event
+# (mSimpleEv).  A copy has a new number nothing names, so with one of these it would never appear (docs/spawn-system.md).
+SCRIPTED = ("mSetCondition.mFsm", "mSetCondition.mRequest", "mSetCondition.mSimpleEv")
 POOL = 10                     # active-enemy slots (sSetManager's pool)
 MAX_POINTS = 31               # the most placements any vanilla enemy layout holds
 FAR = 6000.0                  # a template group farther than this from the spot is reported
@@ -467,6 +472,9 @@ def plan(game, idx, w: World, mod_root: Path, stage, enemy: str, total: int, at:
     horde = any(s.id == horde_rules.CONSTANTS["Horde"] for s in ruled.signals)
     new["mSetCondition.mIsEmGroupLink"] = 0
     new["mSetCondition.mLinkEmGroup"] = 0
+    scripted = [k for k in SCRIPTED if new.get(k)]
+    for k in scripted:                            # the copy has no script, request or event that would set it
+        new[k] = 0
     lot_flag = None
     if tmpl.get("mLoadCondition.mLotFlag") or tmpl.get("mLoadCondition.mLotFlag2"):
         lot_flag = tmpl.get("mDataLotFlag.mFlagNo", 0)
@@ -521,6 +529,10 @@ def plan(game, idx, w: World, mod_root: Path, stage, enemy: str, total: int, at:
         enc.notes.append(f"copies group {like}'s conditions (load flags, story window, areas): it appears when "
                          f"group {like} does." if lot_flag is None or not always else
                          f"copies group {like}'s story window and areas.")
+    if scripted:
+        enc.notes.append(f"group {tnum} is set only when something outside it asks for it ("
+                         + ", ".join(k.rsplit(".", 1)[-1] for k in scripted) + "); nothing asks for the new group, so "
+                         "those conditions are cleared and it appears by its own")
     if lot_flag is not None:
         enc.notes.append(f"group {tnum} loads only while lot flag {lot_flag} is set; the new group "
                          + ("loads whenever the stage does (the condition is cleared, as groups without one have it)"

@@ -7,8 +7,11 @@
 //   fatal-<time>.txt           the game's own fatal-error box (e.g. "Failed open file"): the message,
 //                              the files that were missing, the last files opened; the box itself
 //                              gains one line naming the report
-//   hang-<time>.txt            no frame for [live] hang_seconds while the game is in front: the main
-//                              thread's registers and stack (the game is not touched)
+//   hang-<time>.txt (+ .dmp)   no frame for [live] hang_seconds while the game is in front, or while
+//                              Windows calls it not responding: the main thread's registers and stack, and
+//                              every thread in the .dmp (the game is not touched)
+//   snapshot-<time>.txt (+ .dmp)  asked for from outside while the game runs (riftstone snapshot sets
+//                              Local\RiftstoneSnapshot-<pid>, live.cpp): the same, and the game goes on
 //
 // Only the newest [loader] keep_reports of each kind are kept.
 //
@@ -624,12 +627,34 @@ static int WINAPI Hook_MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT
 // ---------------------------------------------------------------------------
 // hangs
 
-void WriteHangReport(DWORD thread, DWORD seconds) {
+// The hang's minidump, written on a thread of its own: MiniDumpWriteDump (and loading dbghelp) can wait for a
+// lock the stuck game holds, and the watch that called it must go on.  One at a time: the watch writes one
+// report a hang.
+static wchar_t g_hangDumpFor[MAX_PATH];
+
+static DWORD WINAPI HangDumpThread(LPVOID) {
+    HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
+    auto dump = dbg ? (MiniDumpWriteDump_t)GetProcAddress(dbg, "MiniDumpWriteDump") : NULL;
+    wchar_t path[MAX_PATH];
+    HANDLE d = OpenDump(g_hangDumpFor, path);
+    BOOL ok = FALSE;
+    if (dump && d != INVALID_HANDLE_VALUE)
+        ok = dump(GetCurrentProcess(), GetCurrentProcessId(), d,
+                  (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory | MiniDumpWithThreadInfo),
+                  NULL, NULL, NULL);
+    if (d != INVALID_HANDLE_VALUE) CloseHandle(d);
+    return ok ? 1 : 0;
+}
+
+// A report on the main thread (where it is, its registers, its stack), and with `dump` every thread's state in a
+// .dmp beside it: a hang ("hang"), or a snapshot asked for while the game runs ("snapshot").
+static void ThreadReport(const wchar_t* kind, const wchar_t* title, const wchar_t* intro, const wchar_t* logged,
+                         DWORD thread, BOOL dump) {
     wchar_t stamp[32], path[MAX_PATH], where[MAX_PATH];
     Stamp(stamp, _countof(stamp));
     // Open the file before the main thread is suspended: while it is stopped it may hold the heap
     // lock, and CreateFile allocates.  Only register and stack reads happen while it is stopped.
-    HANDLE f = OpenReport(L"hang", stamp, L"txt", path);
+    HANDLE f = OpenReport(kind, stamp, L"txt", path);
     if (f == INVALID_HANDLE_VALUE) return;
     CONTEXT c = {};
     c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
@@ -655,10 +680,8 @@ void WriteHangReport(DWORD thread, DWORD seconds) {
         }
         CloseHandle(h);
     }
-    Header(f, L"Riftstone hang report");
-    Out(f, L"\r\nthe game drew no frame for %lu s while it was the window in front; this report does not\r\n", seconds);
-    Out(f, L"stop or change the game. If it recovers, it was a long load; if not, this is where its main\r\n");
-    Out(f, L"thread was waiting.\r\n");
+    Header(f, title);
+    Out(f, L"\r\n%s\r\n", intro);
     if (got) {
 #ifdef _M_IX86
         Where(c.Eip, where, _countof(where));
@@ -688,7 +711,39 @@ void WriteHangReport(DWORD thread, DWORD seconds) {
     PluginsSection(f);
     FilesSection(f);
     CloseHandle(f);
-    LogLine(L"hang     no frame for %lu s; report written to %s", seconds, path);
+    LogLine(L"%-8s %s; report written to %s", kind, logged, path);
+    if (dump) {
+        wcscpy_s(g_hangDumpFor, path);
+        HANDLE t = CreateThread(NULL, 0, HangDumpThread, NULL, 0, NULL);
+        if (t) {
+            DWORD code = 0;
+            BOOL done = WaitForSingleObject(t, 30000) == WAIT_OBJECT_0 && GetExitCodeThread(t, &code) && code;
+            LogLine(done ? L"%-8s every thread's state written beside it (.dmp)"
+                         : L"%-8s the dump of every thread did not finish in 30 s; the report stands without it", kind);
+            CloseHandle(t);
+        }
+    }
+}
+
+void WriteHangReport(DWORD thread, DWORD seconds, BOOL notResponding) {
+    wchar_t intro[512], logged[96];
+    _snwprintf_s(intro, _countof(intro), _TRUNCATE,
+                 L"the game drew no frame for %lu s %s; this report does not\r\n"
+                 L"stop or change the game. If it recovers, it was a long load; if not, this is where its main\r\n"
+                 L"thread was waiting%s.",
+                 seconds, notResponding ? L"and stopped answering Windows (\"not responding\")" : L"while it was the window in front",
+                 g_minidump ? L", and the .dmp beside this report holds every thread" : L"");
+    _snwprintf_s(logged, _countof(logged), _TRUNCATE, L"no frame for %lu s%s", seconds,
+                 notResponding ? L", not responding" : L"");
+    ThreadReport(L"hang", L"Riftstone hang report", intro, logged, thread, g_minidump);
+}
+
+// Asked for while the game runs (riftstone snapshot): the game is not stopped, only paused while its threads are read.
+void WriteSnapshotReport(DWORD thread) {
+    ThreadReport(L"snapshot", L"Riftstone snapshot",
+                 L"a snapshot asked for while the game ran (riftstone snapshot): where its main thread was, and in the\r\n"
+                 L".dmp beside this report every thread. The game went on.",
+                 L"asked for", thread, TRUE);
 }
 
 // ---------------------------------------------------------------------------
@@ -949,6 +1004,7 @@ void StabilityStart() {
     Rotate(L"crash");
     Rotate(L"fatal");
     Rotate(L"hang");
+    Rotate(L"snapshot");
 
     BOOL automatic = IniInt(L"loader", L"safe_mode", 1) != 0;
     int early = StateInt(L"session", L"early_crashes", 0);

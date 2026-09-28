@@ -98,6 +98,30 @@ of their own at every ViewRange, by default FARTHEST's x3 for objects and grass
 models, objects and grass without its other costs. The frame rate of any of these setups is UNKNOWN
 until measured.
 
+**FARTHEST with levels of detail (`Farthest = lod`, 2026-09-27).** For players who keep FARTHEST, the
+plugin can give it levels of detail instead. Each of the ten ViewRange tests loads ViewRange with the
+multiplier at 1; FARTHEST branches to the level store with HIGH, FAR stores 2 as the multiplier. With
+`Farthest = lod` the FARTHEST branch lands on that same store, so FARTHEST picks HIGH up to `middist x 3`,
+MEDIUM up to `lowdist x 3` and LOW beyond, as NORMAL (x1) and FAR (x2) do; the other two settings run
+exactly as before. Three shapes, one branch each:
+
+- `cmp edx, 3; je <level store>; cmp edx, 2; jne; mov eax, edx`, e.g. the cloth's
+  `uSimSoftBody::getTargetLODLevel`: `83 FA 03 74 33 83 FA 02 75 02 8B C2` at `0x0083D24A` (also
+  `0x00C6E333`, `0x00FA77B6`, and `uModel::drawModel`'s `83 FA 03 74 33` at `0x00FFC519`). The je's
+  displacement becomes 5, onto `mov eax, edx`.
+- `cmp eax, 3; jne; mov [esp+14h], 1; jmp; cmp eax, 2; jne; mov [esp+m], eax`:
+  `83 F8 03 75 0A C7 44 24 14 01` at `0x00845969` (also `0x00B898B9`, `0x00F1FE3F`). The FARTHEST
+  block starts with `jmp +0Dh` onto the store.
+- `cmp eax, 3; jne; mov [esp+l], ebx; jmp; ...`: `83 F8 03 75 06 89 5C 24 14` at `0x00EA5440` (also
+  `0x00F6196F`, `0x00FA6048`). The block starts with `jmp +09h`.
+
+Every run is compared before anything is written, and one difference leaves all ten alone. The
+harness (`test/run_tests.py`, profile `farlod`) checks that each branch lands on its store and runs the
+cloth's choice at FARTHEST in the game's own code: x3 for scenery and for an enemy. Scenery that
+`lod_tuner` rescales still stays whole until it is about `PopPixels` tall; characters switch at three
+times their vanilla distances (their pair also sets cloth detail). The default stays `Farthest = high`,
+the game's own; what `lod` does to the frame rate and the look in game: UNKNOWN.
+
 ### Settings (`lod_tuner.ini`, next to the `.asi`)
 
 | Key | Default | Meaning |

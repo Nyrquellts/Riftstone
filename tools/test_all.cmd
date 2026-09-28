@@ -39,8 +39,14 @@ rem the draw_distance plugin, the same way
 %PY% -B "%ROOT%\native\plugins\draw_distance\test\run_tests.py" || goto :fail
 rem the six_skill_warrior plugin, the same way (every patched compare, and the game's skill code on fake players)
 %PY% -B "%ROOT%\native\plugins\six_skill_warrior\test\run_tests.py" || goto :fail
+rem the portcrystals plugin, the same way (the moved list, the replaced runs, the save sidecar through the real
+rem save and load copies, a reload in a new process)
+%PY% -B "%ROOT%\native\plugins\portcrystals\test\run_tests.py" || goto :fail
 rem the save_backup plugin, in a stand-in game process against fake Steam saves (skips without a build)
 %PY% -B "%ROOT%\native\plugins\save_backup\test\run_tests.py" || goto :fail
+rem the stage_enemies plugin (load an enemy's archive in a stage it is not native to), inside the real
+rem DDDA.exe code: the byte sites, tag resolution against the archive table, and the thunk on a fake frame
+%PY% -B "%ROOT%\native\plugins\stage_enemies\test\run_tests.py" || goto :fail
 rem Ninput, the native plugin host: its offline harnesses (hook arbiter, XInput proxy, display arbiter; no game)
 if exist "%ROOT%\native\ninput\out-msvc" (
   %PY% -B "%ROOT%\native\ninput\test\run_tests.py" || goto :fail

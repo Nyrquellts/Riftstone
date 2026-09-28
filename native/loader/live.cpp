@@ -94,6 +94,7 @@ static_assert(offsetof(LiveBlock, d3dPath) == 0xA20, "layout");
 
 static LiveBlock* g_block = NULL;
 static HANDLE g_mapping = NULL;
+static HANDLE g_snapshotEvent = NULL;           // Local\RiftstoneSnapshot-<pid>: riftstone snapshot sets it
 static CRITICAL_SECTION g_noteLock;
 static BOOL g_noteReady = FALSE;
 static char g_lastFallback[260], g_notes[256];
@@ -279,9 +280,9 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* d3d, UINT adapter
     HRESULT hr = Real_CreateDevice(d3d, adapter, type, focus, flags, pp, out);
     if (SUCCEEDED(hr) && out && *out) {
         NoteParams(pp, focus);
-        GraphicsDeviceCreated(*out);                    // the pool counters (graphics.cpp)
+        GraphicsDeviceCreated(*out);                    // shadow-map bound + the pool counters (graphics.cpp)
         void** table = *(void***)*out;
-        if (!g_devVtable) {
+        if (g_frameStats && !g_devVtable) {             // frame timing only when [live] frame_stats is on
             BOOL ok = PatchSlot(table, VT_PRESENT, (void*)Hook_Present, (void**)&Real_Present) &&
                       PatchSlot(table, VT_RESET, (void*)Hook_Reset, (void**)&Real_Reset);
             if (ok) g_devVtable = table;
@@ -289,7 +290,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* d3d, UINT adapter
                     pp ? pp->BackBufferHeight : 0, pp && pp->Windowed ? L"windowed" : L"fullscreen", flags,
                     ok ? L"on" : L"unavailable");
             if (ok) OverlayDeviceReady();
-        } else if (table != g_devVtable) {
+        } else if (g_frameStats && table != g_devVtable) {
             LogLine(L"live     a second kind of Direct3D device was created; frame timing stays on the first");
         }
     }
@@ -298,7 +299,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* d3d, UINT adapter
 
 static IDirect3D9* WINAPI Hook_Direct3DCreate9(UINT sdk) {
     IDirect3D9* d3d = GraphicsCreate9(sdk, Real_Direct3DCreate9);   // [d3d9] chain, or the game's own
-    if (d3d && g_frameStats && !g_d3dVtable) {
+    if (d3d && (g_frameStats || FixesShadowSizeSet()) && !g_d3dVtable) {   // shadow_buffers needs the device too
         void** table = *(void***)d3d;
         if (PatchSlot(table, VT_CREATE_DEVICE, (void*)Hook_CreateDevice, (void**)&Real_CreateDevice)) g_d3dVtable = table;
     }
@@ -314,7 +315,7 @@ void LiveInstallHooks() {
     if (!g_frameStats) {
         LogLine(L"live     frame timing off ([live] frame_stats = 0)");
         OverlaySettings(FALSE);
-        if (GraphicsChainWanted())                      // the chain still needs the game's Direct3DCreate9
+        if (GraphicsChainWanted() || FixesShadowSizeSet())   // the chain, or bounding a raised shadow map, still needs it
             HookImport("d3d9.dll", "Direct3DCreate9", (void*)Hook_Direct3DCreate9, (void**)&Real_Direct3DCreate9);
         return;
     }
@@ -404,10 +405,22 @@ static void Publish(const MemInfo& m, BOOL hangNow) {
     }
     int active = -1, usable = -1, slots = -1;
     if (EnemySlots(&active, &usable, &slots) && slots > 0) NoteEnemyPeak(active);   // the panel's peak
-    PoolStats pools;
-    BOOL counted = GraphicsPools(&pools);
+    // This thread is also the hang watch, so it never waits for the pool counters' lock: a busy lock keeps
+    // the last numbers.
+    static PoolStats s_pools;
+    static BOOL s_counted = FALSE;
+    static wchar_t s_d3dPath[MAX_PATH];
+    PoolStats fresh;
+    if (GraphicsPools(&fresh, FALSE)) {
+        s_pools = fresh;
+        s_counted = TRUE;
+    }
+    const PoolStats& pools = s_pools;
+    BOOL counted = s_counted;
     wchar_t d3dPath[MAX_PATH];
-    int provider = GraphicsProvider(d3dPath, _countof(d3dPath));
+    int provider = GraphicsProvider(d3dPath, _countof(d3dPath), FALSE);
+    if (d3dPath[0]) wcscpy_s(s_d3dPath, d3dPath);
+    else wcscpy_s(d3dPath, s_d3dPath);
 
     InterlockedIncrement((volatile LONG*)&b->seq);        // odd: writing
     MemoryBarrier();
@@ -531,8 +544,8 @@ static void PressureTick(const MemInfo& seen, int pressureMb, int reliefMb, ULON
         *since = GetTickCount64();
         PoolStats pools;
         wchar_t path[MAX_PATH], what[768] = L"";
-        int provider = GraphicsProvider(path, _countof(path));
-        uint64_t managedMb = GraphicsPools(&pools) ? pools.bytes[D3DPOOL_MANAGED] >> 20 : 0;
+        int provider = GraphicsProvider(path, _countof(path), FALSE);
+        uint64_t managedMb = GraphicsPools(&pools, FALSE) ? pools.bytes[D3DPOOL_MANAGED] >> 20 : 0;
         if (managedMb && provider == D3D_WINDOWS && managedMb >= 256)
             _snwprintf_s(what, _countof(what), _TRUNCATE, L" Direct3D 9 (Windows' own) holds %llu MB of managed textures "
                          L"and buffers, and Windows keeps a copy of those inside the game's address space: DXVK through "
@@ -626,7 +639,9 @@ static DWORD WINAPI LiveThread(LPVOID) {
                 if (g_ring[i & 255] > med * 5 / 2 && g_ring[i & 255] > 20000) g_stutters++;
         }
         countedPos = pos;
-        // Hangs: frames stopped while the game is in front.
+        // Hangs: frames stopped while the game is in front, or while Windows calls its window not responding.
+        // A frozen fullscreen game is usually behind the desktop by the time its player has got out of it
+        // (2026-09-27: one was ended at shutdown, "terminated because it was hung", and no report was written).
         LONG frames = g_frames;
         ULONGLONG now = GetTickCount64();
         if (frames != lastFrames) {
@@ -636,12 +651,19 @@ static DWORD WINAPI LiveThread(LPVOID) {
         }
         BOOL front = !needFront || (g_gameWindow && !IsIconic(g_gameWindow) &&
                      GetAncestor(GetForegroundWindow(), GA_ROOTOWNER) == GetAncestor(g_gameWindow, GA_ROOTOWNER));
-        BOOL hangNow = frames > 0 && front && now - lastFrameChange >= (ULONGLONG)hangSeconds * 1000;
+        BOOL notResponding = !front && g_gameWindow && IsHungAppWindow(g_gameWindow);
+        BOOL hangNow = frames > 0 && (front || notResponding) && now - lastFrameChange >= (ULONGLONG)hangSeconds * 1000;
         if (hangNow && hangReports && !hangWritten) {
             hangWritten = TRUE;
-            WriteHangReport(g_presentThread ? g_presentThread : g_mainThread, (DWORD)((now - lastFrameChange) / 1000));
+            WriteHangReport(g_presentThread ? g_presentThread : g_mainThread, (DWORD)((now - lastFrameChange) / 1000),
+                            notResponding);
         }
         Publish(m, hangNow);
+        // A snapshot asked for from outside (riftstone snapshot sets the event): the same report as a hang, with
+        // every thread, while the game goes on.
+        if (g_snapshotEvent && WaitForSingleObject(g_snapshotEvent, 0) == WAIT_OBJECT_0)
+            WriteSnapshotReport(g_presentThread ? g_presentThread : g_mainThread);
+        GuardsReport();                                     // the stability membrane: new guard hits into riftstone_error.log
         if (tick % 20 == 0) CrashFilterInstall();           // stay first in line for crashes
         if (tick % 120 == 0) StabilityAlive();              // every 30 s
     }
@@ -668,12 +690,18 @@ void LiveStart() {
         return;
     }
     FillStatic();
+    // Auto-reset: one set, one snapshot.  Named by the process id, so a second game has its own.
+    wchar_t snap[64];
+    _snwprintf_s(snap, _countof(snap), _TRUNCATE, L"Local\\RiftstoneSnapshot-%lu", GetCurrentProcessId());
+    g_snapshotEvent = CreateEventW(NULL, FALSE, FALSE, snap);
     HANDLE t = CreateThread(NULL, 0, LiveThread, NULL, 0, NULL);
     if (t) CloseHandle(t);
     LogLine(L"live     publishing to Local\\RiftstoneLive (memory, frame times, counters) for Studio");
+    if (g_snapshotEvent) LogLine(L"live     snapshots on request: %s (riftstone snapshot)", snap);
 }
 
 void LiveStop() {
+    GuardsReport();                                         // flush any last guard hits to the error log
     MemInfo m;
     SampleMemory(&m, FALSE);
     if (m.vaUsed > g_vaUsedPeak) g_vaUsedPeak = m.vaUsed;
@@ -696,12 +724,20 @@ void LiveStop() {
     if (g_pressureEpisodes)
         _snwprintf_s(pressure, _countof(pressure), _TRUNCATE, L"; memory pressure %lu time%s", (unsigned long)g_pressureEpisodes,
                      g_pressureEpisodes == 1 ? L"" : L"s");
+    // The stability membrane: every guard that caught something this session, with its count (riftstone_error.log has each).
+    wchar_t guards[256] = L"";
+    for (int i = 0, len = 0; i < GUARD_COUNT && len < 200; i++) {
+        LONG h = GuardHits(i);
+        if (h <= 0) continue;
+        len += _snwprintf_s(guards + len, _countof(guards) - len, _TRUNCATE, L"%s%hs %ld", len ? L", " : L"; guards caught: ",
+                            GuardKeyA(i), h);
+    }
     LogLine(L"summary  ran %llu min %llu s; %ld frames (average %.2f ms, %.1f fps); %lu stutters; address space peak "
             L"%llu MB, peak commit %llu MB, smallest free block %llu MB (memory %s); %ld overlay redirects, %ld missing "
-            L"files, %ld stand-ins, %ld fatal errors%s%s%s%s",
+            L"files, %ld stand-ins, %ld fatal errors%s%s%s%s%s",
             up / 60000, (up / 1000) % 60, frames, avgMs, avgMs > 0 ? 1000.0 / avgMs : 0.0, g_stutters,
             g_vaUsedPeak >> 20, g_privatePeak >> 20, freeMin >> 20, MemVerdictWord(verdict), g_redirects, g_missing,
-            g_fallbacks, g_fatals, d3d, pressure, why[0] ? L"; ended by: " : L"", why);
+            g_fallbacks, g_fatals, d3d, pressure, guards, why[0] ? L"; ended by: " : L"", why);
     if (g_block) {
         InterlockedIncrement((volatile LONG*)&g_block->seq);
         g_block->flags |= 32u;   // exited
