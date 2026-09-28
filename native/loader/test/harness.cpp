@@ -971,6 +971,189 @@ static int D3d9Mode(const wchar_t* root) {
     return 0;
 }
 
+// ---- d3d9bench: what a texture's Release costs with the pools counted, and the counters under many threads -------
+//
+// 64 managed textures kept; one thread's AddRef/Release pairs over them, timed ("single <ns a pair>"); then four
+// threads' at once while a fifth makes and releases a texture over and over, so freed addresses come back while the
+// others release ("multi <ns a pair, wall clock> churn <textures made>"); ten frames, "ready", exits after
+// <root>\done.  The counters must then hold exactly the 64 kept textures.
+
+static IDirect3DTexture9* g_benchTex[64];
+static IDirect3DDevice9* g_benchDev = NULL;
+static volatile LONG g_benchStop = 0;
+static const int BENCH_PAIRS = 400000;
+
+static DWORD WINAPI BenchPairs(LPVOID seed) {
+    for (int i = 0; i < BENCH_PAIRS; i++) {
+        IDirect3DTexture9* t = g_benchTex[(i * 7 + (int)(INT_PTR)seed) & 63];
+        t->AddRef();
+        t->Release();
+    }
+    return 0;
+}
+
+static DWORD WINAPI BenchChurn(LPVOID made) {
+    LONG n = 0;
+    while (!g_benchStop) {
+        IDirect3DTexture9* t = NULL;
+        if (SUCCEEDED(g_benchDev->CreateTexture(32, 32, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, NULL))) {
+            t->Release();
+            n++;
+        }
+    }
+    *(LONG*)made = n;
+    return 0;
+}
+
+static int D3d9BenchMode(const wchar_t* root) {
+    HWND wnd = MakeWindow(WS_OVERLAPPEDWINDOW);
+    IDirect3D9* d3d = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!d3d) {
+        printf("d3d unavailable\n");
+        return 0;
+    }
+    IDirect3DDevice9* dev = DddaDevice(d3d, wnd, 320, 240);
+    if (!dev) {
+        printf("d3d unavailable (CreateDevice)\n");
+        d3d->Release();
+        return 0;
+    }
+    g_benchDev = dev;
+    int made = 0;
+    for (auto& t : g_benchTex)
+        if (SUCCEEDED(dev->CreateTexture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, NULL))) made++;
+    printf("made %d\n", made);
+    if (made == 64) {
+        LARGE_INTEGER f, a, b;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&a);
+        BenchPairs(NULL);
+        QueryPerformanceCounter(&b);
+        printf("single %.1f\n", (double)(b.QuadPart - a.QuadPart) * 1e9 / (double)f.QuadPart / BENCH_PAIRS);
+        LONG churned = 0;
+        HANDLE th[5];
+        QueryPerformanceCounter(&a);
+        for (int i = 0; i < 4; i++) th[i] = CreateThread(NULL, 0, BenchPairs, (LPVOID)(INT_PTR)(i + 1), 0, NULL);
+        th[4] = CreateThread(NULL, 0, BenchChurn, &churned, 0, NULL);
+        WaitForMultipleObjects(4, th, TRUE, INFINITE);
+        QueryPerformanceCounter(&b);
+        InterlockedExchange(&g_benchStop, 1);
+        WaitForSingleObject(th[4], INFINITE);
+        for (HANDLE h : th) CloseHandle(h);
+        printf("multi %.1f churn %ld\n", (double)(b.QuadPart - a.QuadPart) * 1e9 / (double)f.QuadPart / (4.0 * BENCH_PAIRS),
+               churned);
+        for (int i = 0; i < 10; i++) {
+            dev->Clear(0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, i * 20), 1.0f, 0);
+            dev->Present(NULL, NULL, NULL, NULL);
+        }
+    }
+    printf("ready\n");
+    fflush(stdout);
+    WaitForDone(root);
+    for (auto& t : g_benchTex) Let(t);
+    dev->Release();
+    d3d->Release();
+    DestroyWindow(wnd);
+    return 0;
+}
+
+// ---- d3d9race: textures and their surfaces released from several threads at once --------------------------
+//
+// A texture's surface passes its references on to the texture, and the multithreaded device takes its own
+// lock around both.  Two threads release the 64 textures directly, two release surfaces of the same textures
+// (GetSurfaceLevel + Release), one makes and releases textures, one binds them (SetTexture) and draws frames.
+// "done <ms>" when every thread finished; "stuck" when they did not within 20 s (a deadlock), and the process
+// ends itself so the test is not left waiting.  "ready", exits after <root>\done.
+
+static volatile LONG g_raceLeft = 0;
+
+static DWORD WINAPI RaceSurfaces(LPVOID seed) {
+    for (int i = 0; i < BENCH_PAIRS / 4; i++) {
+        IDirect3DSurface9* s = NULL;
+        if (SUCCEEDED(g_benchTex[(i * 5 + (int)(INT_PTR)seed) & 63]->GetSurfaceLevel(0, &s)) && s) s->Release();
+    }
+    InterlockedDecrement(&g_raceLeft);
+    return 0;
+}
+
+static DWORD WINAPI RacePairs(LPVOID seed) {
+    for (int i = 0; i < BENCH_PAIRS / 4; i++) {
+        IDirect3DTexture9* t = g_benchTex[(i * 7 + (int)(INT_PTR)seed) & 63];
+        t->AddRef();
+        t->Release();
+    }
+    InterlockedDecrement(&g_raceLeft);
+    return 0;
+}
+
+static DWORD WINAPI RaceDraw(LPVOID) {
+    for (int i = 0; !g_benchStop; i++) {
+        g_benchDev->SetTexture(0, g_benchTex[i & 63]);
+        g_benchDev->SetTexture(0, NULL);
+        if ((i & 255) == 0) {
+            g_benchDev->Clear(0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, i & 255, 0), 1.0f, 0);
+            g_benchDev->Present(NULL, NULL, NULL, NULL);
+        }
+    }
+    return 0;
+}
+
+static int D3d9RaceMode(const wchar_t* root) {
+    HWND wnd = MakeWindow(WS_OVERLAPPEDWINDOW);
+    IDirect3D9* d3d = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!d3d) {
+        printf("d3d unavailable\n");
+        return 0;
+    }
+    IDirect3DDevice9* dev = DddaDevice(d3d, wnd, 320, 240);
+    if (!dev) {
+        printf("d3d unavailable (CreateDevice)\n");
+        d3d->Release();
+        return 0;
+    }
+    g_benchDev = dev;
+    int made = 0;
+    for (auto& t : g_benchTex)
+        if (SUCCEEDED(dev->CreateTexture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, NULL))) made++;
+    printf("made %d\n", made);
+    fflush(stdout);
+    if (made == 64) {
+        LONG churned = 0;
+        g_raceLeft = 4;
+        HANDLE th[6];
+        DWORD t0 = GetTickCount();
+        th[0] = CreateThread(NULL, 0, RacePairs, (LPVOID)1, 0, NULL);
+        th[1] = CreateThread(NULL, 0, RacePairs, (LPVOID)2, 0, NULL);
+        th[2] = CreateThread(NULL, 0, RaceSurfaces, (LPVOID)3, 0, NULL);
+        th[3] = CreateThread(NULL, 0, RaceSurfaces, (LPVOID)4, 0, NULL);
+        th[4] = CreateThread(NULL, 0, BenchChurn, &churned, 0, NULL);
+        th[5] = CreateThread(NULL, 0, RaceDraw, NULL, 0, NULL);
+        while (g_raceLeft > 0 && GetTickCount() - t0 < 20000) Sleep(50);
+        if (g_raceLeft > 0) {
+            printf("stuck %ld of 4 threads after %lu ms\n", g_raceLeft, GetTickCount() - t0);
+            fflush(stdout);
+            TerminateProcess(GetCurrentProcess(), 3);   // the deadlocked threads cannot be joined
+        }
+        DWORD ms = GetTickCount() - t0;
+        InterlockedExchange(&g_benchStop, 1);
+        WaitForMultipleObjects(6, th, TRUE, INFINITE);
+        for (HANDLE h : th) CloseHandle(h);
+        printf("done %lu churn %ld\n", ms, churned);
+        for (int i = 0; i < 10; i++) {
+            dev->Clear(0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, i * 20), 1.0f, 0);
+            dev->Present(NULL, NULL, NULL, NULL);
+        }
+    }
+    printf("ready\n");
+    fflush(stdout);
+    WaitForDone(root);
+    for (auto& t : g_benchTex) Let(t);
+    dev->Release();
+    d3d->Release();
+    DestroyWindow(wnd);
+    return 0;
+}
+
 // ---- d3d9mem <n>: what managed textures cost the address space under this Direct3D 9 ------------------
 //
 // n managed DXT5 textures of 2048x2048 with all 12 levels (5,592,432 bytes each), filled through LockRect as
@@ -1227,7 +1410,7 @@ int main(int argc, char** argv) {
         printf("fatal-returned %d\n", r);
         return 0;
     }
-    if (strcmp(mode, "live") == 0 || strcmp(mode, "hang") == 0) {
+    if (strcmp(mode, "live") == 0 || strcmp(mode, "hang") == 0 || strcmp(mode, "hangbehind") == 0) {
 #ifdef HARNESS_DDDA_LAYOUT
         if (argc > 2 && strcmp(argv[2], "engine-cap") == 0)   // 7 of the vanilla ten in use; enemy_cap's 30, 17 in use
             printf("engine %s\n", LayOutDdda() && StandInEngine(7, 100) && StandInEngineMoved(30, 17) ? "stand-in" : "missing");
@@ -1238,6 +1421,10 @@ int main(int argc, char** argv) {
         printf("ready\n");
         fflush(stdout);
         if (strcmp(mode, "hang") == 0) Sleep(4500);      // no frames: the detector's case
+        if (strcmp(mode, "hangbehind") == 0) {           // not in front, no frames, no messages: "not responding"
+            ShowWindow(w, SW_MINIMIZE);
+            Sleep(9000);
+        }
         WaitForDone(exe);
         if (dev) dev->Release();
         DestroyWindow(w);
@@ -1246,6 +1433,8 @@ int main(int argc, char** argv) {
     if (strcmp(mode, "close") == 0) return CloseMode(exe, argc > 2 ? argv[2] : "altf4");
     if (strcmp(mode, "overlay") == 0) return OverlayMode(argc, argv);
     if (strcmp(mode, "d3d9") == 0) return D3d9Mode(exe);
+    if (strcmp(mode, "d3d9bench") == 0) return D3d9BenchMode(exe);
+    if (strcmp(mode, "d3d9race") == 0) return D3d9RaceMode(exe);
     if (strcmp(mode, "d3d9mem") == 0) return D3d9MemMode(exe, argc > 2 ? atoi(argv[2]) : 64);
     if (strcmp(mode, "pressure") == 0) return PressureMode(exe, argc > 2 ? atoi(argv[2]) : 3450);
     if (strcmp(mode, "window") == 0) {

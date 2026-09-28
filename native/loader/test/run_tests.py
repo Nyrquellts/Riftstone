@@ -84,7 +84,8 @@ def game(root: Path, exe: str = "DDDA.exe", proxy: bool = True, ini: str = "", p
     files = {
         "nativePC/rom/enemy/em0100.arc": b"VANILLA-EM0100",
         "nativePC/rom/game_main.arc": b"VANILLA-MAIN",
-        "nativePC/rom/model/present_BM.tex": b"TEX\0\x44\x33\x22\x11",
+        # a valid 4x4 BC1 .tex (revision 0x099, 1 mip at offset 20): broken_textures must serve it as it is
+        "nativePC/rom/model/present_BM.tex": struct.pack("<IIIII", 0x00584554, 0x20000099, 1 | (4 << 6) | (4 << 19), 1, 20) + b"\0" * 8,
         "riftstone/overlay/rom/enemy/em0100.arc": b"OVERLAY-EM0100",
         "riftstone/overlay/rom/newthing.arc": b"OVERLAY-NEW",
         "other/em0100.arc": b"OTHER",
@@ -160,7 +161,8 @@ def test_files(work: Path) -> None:
     check(r.get("missing-tex") == "size=52 magic=TEX word1=20000099",
           "a missing texture under nativePC opens as the 52-byte DDDA stand-in (revision 0x99)")
     check(r.get("missing-tex-outside", "").startswith("<cannot open>"), "a missing texture outside nativePC still fails")
-    check(r.get("present-tex") == "size=8 magic=TEX word1=11223344", "a texture that exists is served as it is")
+    check(r.get("present-tex") == "size=28 magic=TEX word1=20000099",
+          "a valid texture that exists is served as it is (broken_textures leaves it alone)")
     log = log_of(root)
     check("hook     KERNEL32.dll!CreateFileA installed" in log and "hook     KERNEL32.dll!CreateFileW installed" in log,
           "loader.log records the hooks")
@@ -584,6 +586,31 @@ def test_live(work: Path) -> None:
             else:
                 print("  skip  Direct3D 9 could not draw on this machine; frame timing not checked")
             check(bool(runtime.describe_live(live)), "describe_live summarises it")
+        # A snapshot asked for from outside (riftstone snapshot): the report and every thread, and the game goes on.
+        logs = root / "riftstone" / "logs"
+        try:
+            snap = runtime.request_snapshot(logs, pid=p.pid, timeout=40)
+        except Exception as e:                  # noqa: BLE001 -- reported as a failed check
+            snap = None
+            check(False, f"a snapshot on request ({e})")
+        if snap:
+            rep = runtime.parse_report(snap["report"].read_text(encoding="utf-8", errors="replace"))
+            check(rep["kind"] == "snapshot" and rep["main_thread"], "the snapshot names where the main thread was")
+            check(snap["dump"] is not None and snap["dump_note"] == "every thread's state written beside it (.dmp)",
+                  f"every thread's state beside it (.dmp): {snap['dump_note']}")
+            if snap["dump"]:
+                from riftstone import minidump
+                ts = minidump.threads(snap["dump"].read_bytes())
+                check(len(ts) >= 2 and any("DDDA.exe" in t.where or any("DDDA.exe" in f for f in t.frames) for t in ts),
+                      f"minidump.threads reads it ({len(ts)} threads, the stand-in game's among them)")
+            check(not reports(root, "hang"), "a snapshot is not a hang")
+            check([r["kind"] for r in runtime.list_reports(logs)] == [], "doctor and playtest do not count it as a problem")
+            # the live thread that wrote it goes on publishing (the stand-in draws its 60 frames and then waits; the
+            # clean exit below shows its main thread was let go)
+            before = runtime.read_live(p.pid)["uptime_ms"]
+            time.sleep(1.0)
+            after = runtime.read_live(p.pid)["uptime_ms"]
+            check(after > before, f"the live thread goes on after the snapshot (uptime {before} -> {after} ms)")
     finally:
         (root / "done").write_text("")
         p.wait(timeout=60)
@@ -606,6 +633,30 @@ def test_live(work: Path) -> None:
             if found:
                 rep = runtime.parse_report(found[0].read_text(encoding="utf-8", errors="replace"))
                 check(rep["kind"] == "hang" and rep["main_thread"], "the hang report holds where the main thread was")
+        else:
+            print("  skip  Direct3D 9 could not draw on this machine; hang detection not checked")
+    finally:
+        (root / "done").write_text("")
+        p.wait(timeout=60)
+
+    print("hang report while the game is not in front but has stopped answering Windows")
+    root = game(work / "hang-behind", ini="[live]\nhang_seconds = 2\n[loader]\nminidump = 1\n")
+    p = subprocess.Popen([str(root / "DDDA.exe"), "hangbehind"], cwd=root, stdout=subprocess.PIPE, text=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        seen = _wait_line(p, "ready")
+        drew = any(s.startswith("presented") for s in seen)
+        time.sleep(8.5)
+        found = reports(root, "hang")
+        if drew:
+            check(len(found) == 1, "minimized and not responding: one hang report, with the front-window rule on")
+            if found:
+                text = found[0].read_text(encoding="utf-8", errors="replace")
+                check("not responding" in text, "the report says the game stopped answering Windows")
+                dump = found[0].with_suffix(".dmp")
+                check(dump.is_file() and dump.stat().st_size > 0, "every thread's state beside it (.dmp)")
+            check("hang     every thread's state written beside it (.dmp)" in log_of(root),
+                  "loader.log says the dump was written")
         else:
             print("  skip  Direct3D 9 could not draw on this machine; hang detection not checked")
     finally:
@@ -1266,6 +1317,15 @@ def _live_soon(pid: int, want=lambda live: True, timeout: float = 4.0) -> dict |
     return live
 
 
+def _live_after(pid: int, want=lambda live: True, timeout: float = 4.0) -> dict | None:
+    """The first live page published after this call (a later seq than the page there now) that says what `want` asks.
+    A page published earlier can predate what the test waited for: a churning thread's texture still alive when the
+    loader last published, 250 ms before the race ended, reads as one texture too many."""
+    now = runtime.read_live(pid)
+    start = now["seq"] if now else -1
+    return _live_soon(pid, lambda live: live["seq"] > start and want(live), timeout)
+
+
 def test_d3d9(work: Path) -> None:
     print("Direct3D 9: the textures and buffers the game holds, by pool (graphics.cpp)")
     root = game(work / "pools")
@@ -1323,6 +1383,54 @@ def test_d3d9(work: Path) -> None:
         _wait_line(p, "ready2")
     finally:
         _finish(p, root)
+
+
+def test_d3d9_bench(work: Path) -> None:
+    print("Direct3D 9: what a counted Release costs, and the counters while freed addresses come back (graphics.cpp)")
+    results = {}
+    for name, ini in (("on", ""), ("off", "[d3d9]\npool_stats = 0\n")):
+        root = game(work / f"bench-{name}", ini=ini)
+        p = _popen(root, "d3d9bench")
+        try:
+            seen = _lines(_wait_line(p, "ready", timeout=180))
+            if seen.get("made") != "64":
+                print(f"  skip  Direct3D 9 could not make the textures here ({seen.get('made') or seen.get('d3d')})")
+                return
+            multi, _, churn = seen["multi"].partition(" churn ")
+            results[name] = (float(seen["single"]), float(multi), int(churn))
+            if name == "on":
+                want = 64 * _texture_bytes(64, 64, 1)
+                live = _live_after(p.pid, lambda lv: lv["d3d_counted"] and lv["frames"] >= 10)
+                check(bool(live) and live["d3d_objects"] == 64 and live["d3d_managed"] == want,
+                      f"{churn} textures made and released while four threads released others: the counters hold "
+                      f"exactly the 64 kept ({live and live['d3d_objects']} objects, "
+                      f"{live['d3d_managed'] if live else 0:,} of {want:,} bytes)")
+        finally:
+            _finish(p, root)
+    on, off = results["on"], results["off"]
+    print(f"  info  a texture's AddRef/Release pair, counted / not: one thread {on[0]:.0f} / {off[0]:.0f} ns; "
+          f"four threads at once {on[1]:.0f} / {off[1]:.0f} ns a pair")
+
+
+def test_d3d9_race(work: Path) -> None:
+    print("Direct3D 9: textures and their surfaces released from several threads at once, counted and not (graphics.cpp)")
+    for name, ini in (("counted", ""), ("not counted", "[d3d9]\npool_stats = 0\n")):
+        root = game(work / f"race-{name.replace(' ', '-')}", ini=ini)
+        p = _popen(root, "d3d9race")
+        try:
+            seen = _lines(_wait_line(p, "ready", timeout=60))
+            if seen.get("made") != "64":
+                print(f"  skip  Direct3D 9 could not make the textures here ({seen.get('made') or seen.get('d3d')})")
+                return
+            check("done" in seen and "stuck" not in seen,
+                  f"{name}: four threads releasing textures and their surfaces while one makes textures and one draws "
+                  f"all finish ({seen.get('done') or 'stuck ' + seen.get('stuck', '?')})")
+            if name == "counted" and "done" in seen:
+                live = _live_after(p.pid, lambda lv: lv["d3d_counted"] and lv["frames"] >= 10)
+                check(bool(live) and live["d3d_objects"] == 64,
+                      f"counted: exactly the 64 kept textures afterwards ({live and live['d3d_objects']})")
+        finally:
+            _finish(p, root)
 
 
 def _chain_game(work: Path, name: str, ini: str = "", chain: str = "riftstone\\dxvk\\d3d9.dll", dll: Path | None = None,
@@ -1810,7 +1918,8 @@ def main() -> int:
     ap.add_argument("--work")
     ap.add_argument("--only", help="comma-separated test names (files,reset,hooks,dinputchain,crash,overflow,"
                                    "filters,crashoff,rotation,quarantine,names,safe,state,live,cap,guard,window,"
-                                   "saves,foreignsaves,exit,overlay,d3d9,chain,dxvk,memory,other,engine,archives)")
+                                   "saves,foreignsaves,exit,overlay,d3d9,d3d9bench,chain,dxvk,memory,other,engine,"
+                                   "archives)")
     a = ap.parse_args()
     sys.stdout.reconfigure(errors="backslashreplace")    # a label quoting a damaged value must not stop the run
     need = ["harness.exe", "harness_ddda.exe", "dinput8.dll", "riftstone_loader.dll", "marker_plugin.asi",
@@ -1829,7 +1938,9 @@ def main() -> int:
              "quarantine": test_quarantine, "names": test_plugin_names, "safe": test_safe_mode,
              "state": test_state_after_clean_exit, "live": test_live, "cap": test_enemy_cap_renamed,
              "guard": test_guard_race, "window": test_window, "saves": test_saves, "foreignsaves": test_saves_foreign,
-             "exit": test_exit, "overlay": test_overlay, "d3d9": test_d3d9, "chain": test_chain, "dxvk": test_dxvk,
+             "exit": test_exit, "overlay": test_overlay, "d3d9": test_d3d9, "d3d9bench": test_d3d9_bench,
+             "d3d9race": test_d3d9_race,
+             "chain": test_chain, "dxvk": test_dxvk,
              "memory": test_memory, "other": test_other_programs, "engine": test_engine,
              "archives": test_from_archives}
     wanted = a.only.split(",") if a.only else list(tests)

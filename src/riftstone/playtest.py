@@ -15,7 +15,10 @@ game file is deleted or renamed, and uninstalling the mod puts everything back.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,7 +31,9 @@ _HEADER = re.compile(r"Riftstone loader (\S+) in (.+)$")
 _SUMMARY = re.compile(
     r"ran (\d+) min (\d+) s; (\d+) frames \(average ([\d.]+) ms, ([\d.]+) fps\); (\d+) stutters; address space peak "
     r"(\d+) MB(?:, peak commit (\d+) MB)?, smallest free block (\d+) MB(?: \(memory (\w+)\))?; (\d+) overlay "
-    r"redirects, (\d+) missing files, (\d+) stand-ins, (\d+) fatal errors(?:; ended by: (.*))?$")
+    r"redirects, (\d+) missing files, (\d+) stand-ins, (\d+) fatal errors"
+    r"(?:; Direct3D 9 ([^;]*?)(?:, managed textures and buffers peak (\d+) MB)?)?(?:; memory pressure (\d+) times?)?"
+    r"(?:; ended by: (.*))?$")
 _OPENED = re.compile(
     r"panel opened: enemy pool (?:(\d+) / (\d+) slots \(peak (-?\d+)\)|UNKNOWN), address space (?:([\d.]+) / "
     r"([\d.]+) GB \(([\d.]+)% headroom\)(, nearly used up)?|UNKNOWN), (?:([\d.]+) fps|fps UNKNOWN), stage "
@@ -146,6 +151,7 @@ _PLUGIN_OK = {
     "inclination_lock": re.compile(r"inclination_lock: Mode = \w+ \(game\)"),
     "save_backup": re.compile(r"watching the save"),
     "free_sprint": re.compile(r"free_sprint: Mode = \w+, Who = \w+ \(game\)"),
+    "portcrystals": re.compile(r"portcrystals: \d+ Portcrystals placed at once .*patched \(game\)"),
 }
 _PLUGIN_OFF = re.compile(r"Mode = off|nothing patched|switched off", re.I)
 _PLUGIN_BAD = re.compile(r"^(refused|failed)\b|FAILED", re.I)
@@ -169,9 +175,116 @@ def plugin_verdict(name: str, text: str) -> tuple[str, str]:
     return INFO, lines[0]
 
 
-def check_session(game_root: Path, previous: bool = False) -> list[Item]:
+def game_config() -> Path | None:
+    """Dark Arisen's own settings file: %LOCALAPPDATA%\\CAPCOM\\DRAGONS DOGMA DARK ARISEN\\config.ini."""
+    base = os.environ.get("LOCALAPPDATA")
+    return Path(base) / "CAPCOM" / "DRAGONS DOGMA DARK ARISEN" / "config.ini" if base else None
+
+
+def config_values(text: str) -> dict[str, dict[str, str]]:
+    """config.ini as {SECTION: {key: value}}: sections upper-case, keys lower-case."""
+    out: dict[str, dict[str, str]] = {}
+    section = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = out.setdefault(line[1:-1].strip().upper(), {})
+        elif section is not None and "=" in line:
+            k, _, v = line.partition("=")
+            section[k.strip().lower()] = v.strip()
+    return out
+
+
+def _session_window(log: Path, start: float | None) -> tuple[float, float] | None:
+    """The session as file times: from its first line's clock (the latest such moment before the log's last write)
+    to a little after that last write (the exit summary)."""
+    if start is None:
+        return None
+    try:
+        end = log.stat().st_mtime
+    except OSError:
+        return None
+    t = time.localtime(end)
+    back = (t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec - int(start)) % 86400
+    return end - back - 2, end + 120
+
+
+def _graphics_item(root: Path, logs: Path, start: float | None, ended: bool) -> Item:
+    """The graphics profile in the game folder (graphics.json), and whether DXVK ran this session when its ENB names
+    DXVK as the next Direct3D 9: DXVK writes DDDA_d3d9.log (riftstone\\logs when the loader chains it, the game
+    folder when ENB loads it)."""
+    from .graphics import ini_values
+
+    it = Item("graphics", "Graphics profile")
+    try:
+        doc = json.loads(_read(root / "riftstone" / "graphics.json"))
+    except ValueError:
+        doc = None
+    doc = doc if isinstance(doc, dict) else {}
+    name, title, since = (" ".join(str(doc.get(k, "")).split()) for k in ("profile", "title", "applied"))
+    it.lines.append(f"{name or 'a profile'}{': ' + title if title else ''}, in the game folder since {since or '?'}")
+    proxy = ini_values(_read(root / "enblocal.ini")).get("proxy", {})
+    wants_dxvk = proxy.get("enableproxylibrary", "").lower() == "true" and "dxvk" in proxy.get("proxylibrary", "").lower()
+    window = _session_window(logs / "loader.log", start)
+    ran = None
+    for log in (root / "DDDA_d3d9.log", logs / "DDDA_d3d9.log"):
+        try:
+            t = log.stat().st_mtime
+        except OSError:
+            continue
+        if window and window[0] <= t <= window[1]:
+            ran = log
+            break
+    if ran:
+        it.lines.append(f"DXVK ran this session: it wrote {ran.name} in "
+                        + ("the game folder (ENB loaded it)" if ran.parent == root else "riftstone\\logs"))
+    if not wants_dxvk:
+        it.status = INFO
+    elif ran:
+        it.status = OK
+    elif ended:
+        it.status = FAIL
+        it.lines.append("enblocal.ini's [PROXY] names DXVK, and DXVK wrote no log this session: ENB did not load it "
+                        "(or ENB itself did not run); 'riftstone graphics apply modern_remaster_d3d9' is the same look "
+                        "on Windows' Direct3D 9")
+    else:
+        it.status = UNTESTED
+    if it.status != FAIL:
+        it.todo = ("Shift+Enter opens ENB's editor while ENB runs; the game's depth of field should be gone in play and "
+                   "back in cutscenes")
+    return it
+
+
+_PC_SAVED = re.compile(r"saved: (\d+) crystal\(s\) placed past the save's ten")
+_PC_LOADED = re.compile(r"loaded: (\d+) crystal\(s\) past the save's ten came back")
+
+
+def _portcrystals_item(text: str) -> Item:
+    """portcrystals.log: patched, then each save of the crystals past ten and each load that brought them back."""
+    it = Item("portcrystals", "More Portcrystals")
+    verdict, why = plugin_verdict("portcrystals", text)
+    it.lines.append(why)
+    saved = [int(m[1]) for m in _PC_SAVED.finditer(text)]
+    loaded = [int(m[1]) for m in _PC_LOADED.finditer(text)]
+    if saved:
+        it.lines.append(f"saved with {max(saved)} crystal(s) past the save's ten ({len(saved)} save(s) that changed them)")
+    if loaded:
+        it.lines.append(f"a load brought back {max(loaded)} crystal(s) past the ten")
+    if verdict == FAIL:
+        it.status = FAIL
+    elif any(n > 0 for n in saved) and any(n > 0 for n in loaded):
+        it.status = OK
+    else:
+        it.status = UNTESTED
+        it.todo = ("place an eleventh Portcrystal (every slot past ten counts), rest at an inn or wait for an autosave, "
+                   "then load that save: the crystal should still be there, on the map and in the Ferrystone's list")
+    return it
+
+
+def check_session(game_root: Path, previous: bool = False, config: Path | None = None) -> list[Item]:
     """Every checklist item for the game's latest session (``previous``: the one before it, from
-    loader.prev.log; the plugins' logs then belong to the latest one and are left out)."""
+    loader.prev.log; the plugins' logs then belong to the latest one and are left out).  ``config``: the game's
+    config.ini (game_config()), read for what shapes the frame rate."""
     root = Path(game_root)
     logs = root / "riftstone" / "logs"
     version, lines = parse_log(_read(logs / ("loader.prev.log" if previous else "loader.log")))
@@ -283,7 +396,9 @@ def check_session(game_root: Path, previous: bool = False) -> list[Item]:
     armed = next((ln.text for ln in tagged("guard") if ln.text.startswith("missing textures")), "")
     misses = [ln for ln in tagged("guard") if "does not exist" in ln.text]
     summary = next((_SUMMARY.search(ln.text) for ln in tagged("summary") if _SUMMARY.search(ln.text)), None)
-    standins = int(summary[13]) if summary else len(misses)
+    served = [ln for ln in tagged("guard") if "was not read in yet" in ln.text]
+    # the summary's stand-ins count the archive guard's too: then the texture guard's own lines tell
+    standins = int(summary[13]) if summary and not served else len(misses)
     if "stop the game" in armed:
         it.status = INFO
         it.lines.append("off this session ([guard] missing_textures = 0): a missing texture stops the game as usual")
@@ -298,6 +413,31 @@ def check_session(game_root: Path, previous: bool = False) -> list[Item]:
         it.todo = ("'riftstone playtest guard-mod --mod \"Texture guard test\"', install that mod, find goblins "
                    "(they draw grey where their skin was), then uninstall it")
     items.append(it)
+
+    # 5b. the archive guard (loader 1.0.1): a resource asked for loose before its archive was read
+    arc_armed = next((ln.text for ln in tagged("guard") if ln.text.startswith("a resource the game asks for loose")), "")
+    unwritten = [ln for ln in tagged("guard") if "could not be written under" in ln.text]
+    if arc_armed or served or unwritten:
+        it = Item("archives", "Archive guard")
+        if arc_armed and "gets its own bytes" not in arc_armed:
+            it.status = INFO
+            it.lines.append("off this session: " + arc_armed)
+        elif unwritten:
+            it.status = FAIL
+            it.lines.append("a resource was found in its archive, but its copy could not be written: the game stopped")
+            it.lines.extend(f"{_clock(ln.at)} {ln.text}" for ln in unwritten[:5])
+        elif served:
+            it.status = OK
+            it.lines.append(f"{len(served)} resource(s) the game asked for before their archive was read got their "
+                            "own bytes; the game kept running")
+            it.lines.extend(f"{_clock(ln.at)} {ln.text}" for ln in served[:5])
+        else:
+            it.status = UNTESTED
+            it.lines.append("armed; the game never asked for a resource before its archive was read this session")
+            it.todo = ("skip cutscenes as soon as they start (players met 'Failed open file' at the ending's, "
+                       "credit2_01_99.gmd); a 'was not read in yet' line in loader.log is the guard at work")
+        it.lines.extend(ln.text for ln in tagged("guard") if ln.text.startswith("read the directories of"))
+        items.append(it)
 
     # 6. safe mode and start-up crashes
     it = Item("safe_mode", "Safe mode")
@@ -341,10 +481,50 @@ def check_session(game_root: Path, previous: bool = False) -> list[Item]:
         it.status = FAIL if verdict == "bound" else OK
         if verdict:
             it.lines.append(runtime.memory_verdict(int(commit or 0), int(free_min or 0))[2])
+        if summary[15]:
+            it.lines.append(f"Direct3D 9 {summary[15]}" +
+                            (f", managed textures and buffers peak {summary[16]} MB" if summary[16] else ""))
+        if summary[17]:
+            it.lines.append(f"memory pressure {summary[17]} time(s) (the loader's [memory] watch)")
     else:
         it.status = UNTESTED
         it.lines.append("no exit summary: the session is running, or it did not end through the game's own exit")
     items.append(it)
+
+    # 8b. the game's own settings (config.ini), which shape the frame rate more than anything the loader does
+    if config and not previous and Path(config).is_file():
+        cfg = config_values(_read(Path(config)))
+        gfx, disp = cfg.get("GRAPHICS", {}), cfg.get("DISPLAY", {})
+        view, vsync = gfx.get("viewrange", "").upper(), disp.get("vsync", "").upper()
+        hz = re.match(r"\s*([\d.]+)", disp.get("refreshrate", ""))
+        hz = float(hz[1]) if hz else 0.0
+        cap = re.match(r"\s*([\d.]+)", gfx.get("maxfps", ""))
+        it = Item("settings", "The game's own settings")
+        it.status = INFO
+        it.lines.append(", ".join(x for x in (
+            disp.get("resolution", ""), f"{hz:g} Hz" if hz else "", f"VSync {vsync.lower()}" if vsync else "",
+            f"frame-rate ceiling {float(cap[1]):g}" if cap else "", f"ViewRange {view}" if view else "") if x))
+        if view == "FARTHEST":
+            far_lod = "FARTHEST picks levels of detail" in _read(logs / "lod_tuner.log")
+            if far_lod:
+                it.lines.append("ViewRange FARTHEST, with levels of detail from lod_tuner's Farthest = lod (x3)")
+            else:
+                it.lines.append("ViewRange FARTHEST draws every regular model at full detail at any distance, the "
+                                "heaviest setting" +
+                                ("; lod_tuner's Farthest = lod gives it levels of detail (x3)"
+                                 if "lod_tuner.asi" in loaded else "") +
+                                ("; with draw_distance loaded, FAR keeps FARTHEST's distances for objects and grass and "
+                                 "lets models use their levels of detail again (lod_tuner then works everywhere)"
+                                 if "draw_distance.asi" in loaded else ""))
+        if vsync == "ON" and hz:
+            it.lines.append(f"VSync at {hz:g} Hz: each frame waits for the screen, so the frame rate moves in steps "
+                            f"({hz:.0f}, {hz / 2:.0f}, {hz / 3:.0f} fps): a frame that takes a little over "
+                            f"{1000 / hz:.1f} ms shows at {hz / 2:.0f}")
+        items.append(it)
+
+    # 8c. a graphics profile (riftstone graphics): did the Direct3D 9 its ENB chains run this session
+    if not previous and (root / "riftstone" / "graphics.json").is_file():
+        items.append(_graphics_item(root, logs, start, bool(summary)))
 
     # 9. free_sprint
     if not previous and (logs / "free_sprint.log").is_file():
@@ -362,6 +542,10 @@ def check_session(game_root: Path, previous: bool = False) -> list[Item]:
         elif not battle:
             it.todo = "sprint during a fight too: stamina should drain as usual there"
         items.append(it)
+
+    # 9b. portcrystals: the crystals past ten, saved and brought back with the save
+    if not previous and (logs / "portcrystals.log").is_file():
+        items.append(_portcrystals_item(_read(logs / "portcrystals.log")))
 
     # 10. how it ended
     it = Item("end", "How the session ended")

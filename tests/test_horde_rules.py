@@ -24,7 +24,10 @@ def before(total: int, points: int, story) -> tuple[dict, bool]:
     else:
         new["mSetCountMax"] = -1
     if story:
-        new["mAppearBgn"], new["mAppearEnd"] = {"any": (0, 0), "pre": (0, 7799), "post": (7800, 0)}[story]
+        # The hand-written code wrote "any" 0..0 and "post" 7800..0, reading an end of 0 as "no end".  The game reads
+        # the window as it stands (its whole story is 0..27999, its post-Dragon groups 7800..27999), so those groups
+        # loaded only at a new game's very start, or never: the oracle keeps its fields and takes the game's windows.
+        new["mAppearBgn"], new["mAppearEnd"] = {"any": (0, 27999), "pre": (0, 7799), "post": (7800, 27999)}[story]
     return new, horde_
 
 
@@ -48,6 +51,15 @@ class HordeRules(unittest.TestCase):
                         self.assertIs(type(v), int)
                     cases += 1
         self.assertGreater(cases, 5000)
+
+    def test_the_story_windows_are_the_games_own(self):
+        # measured 2026-09-27 over the game's enemy group lists (scenario condition on): 218 groups 0..27999 (the whole
+        # story), 184 groups 0..7799 (before the Dragon), 41 groups 7800..27999 (after it), none ending at 0
+        windows = {story: (after(1, 1, story)[0]["mAppearBgn"], after(1, 1, story)[0]["mAppearEnd"])
+                   for story in ("any", "pre", "post")}
+        self.assertEqual(windows, {"any": (0, 27999), "pre": (0, 7799), "post": (7800, 27999)})
+        for bgn, end in windows.values():
+            self.assertLessEqual(bgn, end)
 
     def test_constants_the_rest_of_encounter_uses(self):
         self.assertEqual(encounter.HORDE_RESPAWN, 5)

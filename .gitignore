@@ -42,3 +42,7 @@ native/**/*.lib
 # Editors
 .vscode/
 .idea/
+
+# Graphics profiles (riftstone graphics): profile.json -- the settings and each file's SHA-256 -- is kept; the files
+# are their authors' (ENBSeries forbids republishing its binaries; a preset is its author's), so they stay on disk.
+profiles/**/files/

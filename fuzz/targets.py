@@ -2949,7 +2949,10 @@ def t_package_plugins(data: bytes) -> None:
             names = tuple(x for x in spec[3:].split(",") if x and x.isascii() and "\0" not in x)[:8]
             ninput.write_bytes(helpers.pe_file(exports=names))            # (export names are ASCII C strings)
         else:
-            ninput.write_bytes(spec.encode("utf-8", "surrogateescape"))
+            try:
+                ninput.write_bytes(spec.encode("utf-8", "surrogateescape"))
+            except (OSError, ValueError):            # a lone surrogate is not bytes we can write: skip the ninput
+                ninput = None
     out_name = case.get("out") if isinstance(case.get("out"), str) else "x.zip"
     if not out_name or any(c in out_name for c in '\\/:*?"<>|\0') or out_name.strip(". ") != out_name:
         raise RiftError("not a usable file name")
@@ -3432,13 +3435,19 @@ def _ini_view(raw: bytes) -> tuple[list, int]:
     return raw.splitlines(keepends=True), raw.count(b"\r\r")
 def t_playtest(data: bytes) -> None:
     """A play session's logs as text of any shape: loader.log, then after "#cap" enemy_cap.log, after "#sprint"
-    free_sprint.log, after "#state" runtime-state.ini.  Every item gets a verdict, every line stays one line."""
+    free_sprint.log, after "#state" runtime-state.ini, after "#config" the game's config.ini, after "#graphics" a
+    graphics profile's graphics.json and after "#enblocal" the game folder's enblocal.ini (with a DXVK log beside
+    them).  Every item gets a verdict, every line stays one line; the game's settings are only a note."""
     from riftstone import playtest
 
     text = data.decode("utf-8", "replace")
     loader, _, rest = text.partition("\n#cap\n")
     cap, _, rest = rest.partition("\n#sprint\n")
-    sprint, _, state = rest.partition("\n#state\n")
+    sprint, _, rest = rest.partition("\n#state\n")
+    state, _, config = rest.partition("\n#config\n")
+    config, has_graphics, rest = config.partition("\n#graphics\n")
+    graphics_json, _, enblocal = rest.partition("\n#enblocal\n")
+    enblocal, has_pc, pc_log = enblocal.partition("\n#portcrystals\n")
     with _workdir() as tmp:
         root = Path(tmp)
         logs = root / "riftstone" / "logs"
@@ -3447,8 +3456,19 @@ def t_playtest(data: bytes) -> None:
                            ("free_sprint.log", sprint)):
             (logs / name).write_text(body, encoding="utf-8")
         (root / "riftstone" / "runtime-state.ini").write_text(state, encoding="utf-8")
+        (root / "config.ini").write_text(config, encoding="utf-8")
+        if has_graphics:
+            (root / "riftstone" / "graphics.json").write_text(graphics_json, encoding="utf-8")
+            (root / "enblocal.ini").write_text(enblocal, encoding="utf-8")
+            (root / "DDDA_d3d9.log").write_text("info:  DXVK\n", encoding="utf-8")
+        if has_pc:
+            (logs / "portcrystals.log").write_text(pc_log, encoding="utf-8")
         for previous in (False, True):
-            items = playtest.check_session(root, previous=previous)
+            items = playtest.check_session(root, previous=previous, config=root / "config.ini")
+            if has_graphics and not previous and len(items) > 1:      # no loader.log: only the loader's item
+                assert any(it.key == "graphics" for it in items), "a graphics profile with no item"
+            settings = [it for it in items if it.key == "settings"]
+            assert all(it.status == playtest.INFO for it in settings), "the game's settings graded"
             assert items and items[0].key == "loader", "the loader comes first"
             for it in items:
                 assert it.status in (playtest.OK, playtest.FAIL, playtest.UNTESTED, playtest.INFO), it.status
@@ -3458,6 +3478,157 @@ def t_playtest(data: bytes) -> None:
             assert len(keys) == len(set(keys)), "an item twice"
             if previous:
                 assert not {"enemy_cap", "free_sprint"} & set(keys), "the latest session's plugin logs in the one before"
+
+
+def t_portcrystals(data: bytes) -> None:
+    """The portcrystals plugin's sidecar (any bytes).  Refused with FormatError, or at most 32 records of at most 22
+    slots each that rebuild to exactly the same bytes (the plugin reads the same layout just as strictly)."""
+    from riftstone import portcrystals
+    from riftstone.errors import FormatError
+
+    try:
+        records = portcrystals.parse(data)
+    except FormatError:
+        return
+    assert len(records) <= portcrystals.MAX_RECORDS, len(records)
+    assert all(len(r.slots) <= portcrystals.MAX_EXTRA for r in records)
+    assert all(0 <= r.placed <= len(r.slots) for r in records)
+    assert portcrystals.build(records) == data, "the sidecar does not rebuild byte for byte"
+
+
+def t_portcrystals_save(data: bytes) -> None:
+    """A save's XML (any bytes) read for its ten Portcrystal slots.  Refused with FormatError, or exactly ten
+    (area, x, y, z) with a u32 area and finite float positions, whose fingerprint (the plugin's key) is computable."""
+    import math
+
+    from riftstone import portcrystals
+    from riftstone.errors import FormatError
+
+    try:
+        ten = portcrystals.save_slots(data)
+    except FormatError:
+        return
+    assert len(ten) == 10
+    for area, *xyz in ten:
+        assert 0 <= area <= 0xFFFFFFFF, area
+        assert all(math.isfinite(c) for c in xyz), xyz
+    assert 0 <= portcrystals.fingerprint(ten) < 1 << 64
+
+
+def t_portcrystals_names(data: bytes) -> None:
+    """portcrystals.ini's text (any bytes as UTF-8) and its [names].  Every name read is a key of three 8-digit hex
+    words and a message 0..65535; setting one name keeps every other name and every line outside [names] exactly, and
+    taking it out again leaves the other names as they were."""
+    from riftstone import portcrystals
+
+    text = data.decode("utf-8", errors="replace")
+    names = portcrystals.read_names(text)
+    for key, message in names.items():
+        assert len(key) == 26 and all(len(p) == 8 for p in key.split(",")), key
+        assert 0 <= message <= 0xFFFF, message
+    key = portcrystals.name_key(1539.0, 3911.5, 1593.0)
+    one = portcrystals.write_names(text, {key: 277})
+    after = portcrystals.read_names(one)
+    assert after.get(key) == 277, after
+    assert {k: v for k, v in after.items() if k != key} == {k: v for k, v in names.items() if k != key}, (names, after)
+    kept = [ln for ln in one.splitlines() if not ln.strip().upper().startswith(key)]
+    assert all(ln in kept for ln in text.splitlines() if not ln.strip().upper().startswith(key)), \
+        "a line outside the name was lost"
+    back = portcrystals.read_names(portcrystals.write_names(one, {key: None}))
+    assert back == {k: v for k, v in names.items() if k != key}, (names, back)
+
+
+def t_minidump(data: bytes) -> None:
+    """A loader's minidump (any bytes).  Refused with FormatError, or every thread says where it is (a module and an
+    offset inside it, or a bare address) with at most MAX_FRAMES callers, each in a module and past its first page;
+    the summary counts every thread exactly once."""
+    from riftstone import minidump
+    from riftstone.errors import FormatError
+
+    try:
+        ts = minidump.threads(data)
+        mods = minidump.modules(data)
+    except FormatError:
+        return
+    names = {name for _, _, name in mods}
+    for t in ts:
+        assert isinstance(t.where, str) and t.where, "a thread with no place"
+        assert len(t.frames) <= minidump.MAX_FRAMES, f"{len(t.frames)} frames"
+        for f in t.frames:
+            name, _, off = f.rpartition("+0x")
+            assert name in names and int(off, 16) >= 0x1000, f
+            assert name.lower() not in minidump.SYSTEM, f"Windows' own module {f} kept"
+    lines = minidump.summary(ts)
+    counted = sum(int(line.split(" ", 1)[0]) for line in lines)
+    assert counted == len(ts), f"the summary counts {counted} of {len(ts)} threads"
+
+
+def t_graphics_profile(data: bytes) -> None:
+    """A graphics profile's profile.json (any bytes).  Refused with RiftError, or every file it names is a plain path
+    inside the game folder that is none of the game's, Steam's or Riftstone's own and a graphics tool's kind of file;
+    its .ini settings name only its own .ini files; its config.ini values are ones the game reads; and the profile
+    written back reads back the same."""
+    from riftstone import graphics
+    from riftstone.errors import RiftError
+
+    try:
+        p = graphics.parse_profile(data, "fuzz")
+    except RiftError:
+        return
+    lowered = set()
+    for rel in p.files:
+        assert graphics.safe_rel(rel) == rel, f"{rel!r} is not in its own written form"
+        parts = rel.split("/")
+        assert ".." not in parts and ":" not in rel and "\\" not in rel, rel
+        assert parts[0].lower() not in graphics.PROTECTED_DIRS, rel
+        assert not (len(parts) == 1 and parts[0].lower() in graphics.PROTECTED), rel
+        assert rel.lower() not in lowered, f"{rel} twice"
+        lowered.add(rel.lower())
+    for rel in p.ini:
+        assert rel in p.files and rel.lower().endswith(".ini"), f"ini names {rel}"
+    for sec, keys in p.config.items():
+        assert sec.lower() in graphics.CONFIG_SECTIONS, sec
+        for k, v in keys.items():
+            graphics.check_game_value(sec, k, v)
+    again = graphics.parse_profile(graphics.dump_profile(p), "fuzz")
+    assert (again.title, again.notes, again.files, again.origins, again.ini, again.config, again.loader) == \
+        (p.title, p.notes, p.files, p.origins, p.ini, p.config, p.loader), "profile.json does not read back"
+
+
+def t_graphics_ini(data: bytes) -> None:
+    """An .ini a graphics profile sets keys in (any bytes: UTF-16 behind its mark, else a byte a character), then after
+    a line "#set" the section, key and value (NUL-separated).  Refused with RiftError and nothing written; or the file
+    keeps every line but the one key's, that line keeps its key's spelling and the spacing before the value, the value
+    reads back (ini_values), and the text encodes back to bytes."""
+    from riftstone import graphics
+    from riftstone.errors import RiftError
+
+    body, sep, tail = data.partition(b"\n#set\n")
+    if not sep:
+        return
+    parts = tail.decode("utf-8", "replace").split("\0")
+    if len(parts) != 3:
+        return
+    sec, key, value = parts
+    try:
+        text, enc = graphics.decode_ini(body)
+        values = graphics._settings({sec: {key: value}}, "fuzz")
+        new, before = graphics.set_ini(text, values, "fuzz")
+        out = graphics.encode_ini(new, enc)
+    except RiftError:
+        return
+    old_lines, new_lines = text.splitlines(keepends=True), new.splitlines(keepends=True)
+    assert len(old_lines) == len(new_lines), "a line came or went"
+    changed = [i for i, (a, b) in enumerate(zip(old_lines, new_lines)) if a != b]
+    assert len(changed) <= 1, f"{len(changed)} lines changed"
+    for i in changed:
+        a, b = old_lines[i], new_lines[i]
+        assert a.partition("=")[0] == b.partition("=")[0], "the key's spelling changed"
+        assert a[len(a.rstrip("\r\n")):] == b[len(b.rstrip("\r\n")):], "the line ending changed"
+    got = graphics.ini_values(new).get(sec.lower(), {}).get(key.lower())
+    assert got == value.strip(), f"{key} reads back {got!r}, not {value!r}"
+    assert before.get(sec.lower(), {}).get(key.lower()) is not None, "no value before"
+    assert graphics.decode_ini(out)[0] == new, "the text does not encode back"
 
 
 def t_plugin_ini(data: bytes) -> None:
@@ -4105,6 +4276,12 @@ TARGETS = {
     "report": (t_report, True, 1 << 14),
     "session": (t_session, True, 1 << 13),
     "plugin_ini": (t_plugin_ini, True, 1 << 12),
+    "minidump": (t_minidump, False, 1 << 14),
+    "portcrystals": (t_portcrystals, False, 1 << 13),
+    "portcrystals_save": (t_portcrystals_save, False, 1 << 12),
+    "portcrystals_names": (t_portcrystals_names, False, 1 << 12),
+    "graphics_profile": (t_graphics_profile, True, 1 << 13),
+    "graphics_ini": (t_graphics_ini, True, 1 << 12),
     "playtest": (t_playtest, True, 1 << 14),
     "nav": (t_nav, False, 1 << 18),
     "mission": (t_mission, True, 1 << 12),

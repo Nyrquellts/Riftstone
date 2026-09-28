@@ -88,6 +88,60 @@ class CheckSessionTest(unittest.TestCase):
         self.assertIn("one in battle was charged as usual", items["free_sprint"].lines[1])
         self.assertIn("Alt+F4 was pressed", items["end"].lines[0])
 
+    def test_a_graphics_profile_and_whether_dxvk_ran_under_enb(self):
+        import json
+        import os
+
+        def session(tmp, proxy="true", dxvk_age=None, ended=True):
+            root = game(tmp, loader=LOADER_LOG if ended else LOADER_LOG.rsplit("22:29:29.483", 1)[0])
+            (root / "riftstone" / "graphics.json").write_text(json.dumps(
+                {"schema": "riftstone-graphics-state/1", "profile": "modern_remaster", "title": "ENB over DXVK",
+                 "applied": "2026-09-27T18:40:00", "files": {}}), encoding="utf-8")
+            (root / "enblocal.ini").write_text(f"[PROXY]\nEnableProxyLibrary={proxy}\nProxyLibrary=riftstone\\dxvk\\"
+                                               "d3d9.dll\n", encoding="latin-1")
+            if dxvk_age is not None:
+                end = (root / "riftstone" / "logs" / "loader.log").stat().st_mtime
+                log = root / "DDDA_d3d9.log"
+                log.write_text("info:  DXVK: v3.1.1\n", encoding="utf-8")
+                os.utime(log, (end - dxvk_age, end - dxvk_age))
+            return by_key(playtest.check_session(root))["graphics"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            it = session(tmp, dxvk_age=1)
+        self.assertEqual(it.status, "ok")
+        self.assertIn("modern_remaster: ENB over DXVK, in the game folder since 2026-09-27T18:40:00", it.lines[0])
+        self.assertIn("DXVK ran this session: it wrote DDDA_d3d9.log in the game folder (ENB loaded it)", it.lines[1])
+        with tempfile.TemporaryDirectory() as tmp:          # the log is from a session a day before
+            it = session(tmp, dxvk_age=86400 + 3600)
+        self.assertEqual(it.status, "fail")
+        self.assertIn("ENB did not load it", "\n".join(it.lines))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(session(tmp, ended=False).status, "untested")
+        with tempfile.TemporaryDirectory() as tmp:          # ENB on Windows' own Direct3D 9: nothing to grade
+            self.assertEqual(session(tmp, proxy="false").status, "info")
+        with tempfile.TemporaryDirectory() as tmp:          # no profile: no item
+            self.assertNotIn("graphics", by_key(playtest.check_session(game(tmp))))
+
+    def test_more_portcrystals(self):
+        patched = ("portcrystals: 15 Portcrystals placed at once (the game allows 10); 46 sites, 4 runs and 3 hooks "
+                   "patched (game); the sidecar keeps 0 save(s)' crystals past ten\n")
+        saved = ("20:01:02  saved: 1 crystal(s) placed past the save's ten (slots 11-15), kept in the sidecar for this "
+                 "save (6ec3e69c2e0662e5)\n")
+        loaded = "20:05:00  loaded: 1 crystal(s) past the save's ten came back from the sidecar (6ec3e69c2e0662e5)\n"
+        for log, status in ((patched, "untested"), (patched + saved, "untested"), (patched + saved + loaded, "ok"),
+                            ("refused: the game's sGameSys already exists (the plugin was loaded too late); nothing "
+                             "patched\n", "fail")):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = game(tmp)
+                (root / "riftstone" / "logs" / "portcrystals.log").write_text(log, encoding="utf-8")
+                it = by_key(playtest.check_session(root))["portcrystals"]
+            with self.subTest(log=log[:40]):
+                self.assertEqual(it.status, status)
+                if status == "untested":
+                    self.assertIn("place an eleventh Portcrystal", it.todo)
+                if status == "ok":
+                    self.assertIn("a load brought back 1 crystal(s) past the ten", "\n".join(it.lines))
+
     def test_a_panel_that_disagrees_with_enemy_cap_fails(self):
         log = LOADER_LOG.replace("enemy pool 40 / 40 slots (peak 40)", "enemy pool 12 / 40 slots (peak 40)")
         with tempfile.TemporaryDirectory() as tmp:
@@ -120,6 +174,92 @@ class CheckSessionTest(unittest.TestCase):
         self.assertIn("press the key while the game is in front", items["panel"].todo)
         self.assertIn("playtest guard-mod", items["textures"].todo)
         self.assertIn("sprint outside a fight", items["free_sprint"].todo)
+
+    def test_a_1_0_1_session(self):
+        # 1.0.x's summary carries the Direct3D part (and memory pressure) before "ended by"; 1.0.1 arms the archive
+        # guard, whose serves count among the summary's stand-ins
+        log = LOADER_LOG.replace("0.3.3", "1.0.1").replace(
+            "22:22:12.467  guard    missing textures get a neutral stand-in (riftstone\\standin)\n",
+            "22:22:12.467  guard    missing textures get a neutral stand-in (riftstone\\standin)\n"
+            "22:22:12.467  guard    a resource the game asks for loose before its archive is read gets its own bytes "
+            "from that archive (riftstone\\standin\\nativePC)\n"
+            "22:27:01.000  guard    read the directories of 4113 archives (71910 resources) in 850 ms, to find "
+            "resources the game asks for loose\n"
+            "22:27:01.900  guard    C:\\Games\\DDDA\\nativePC\\ui\\credit\\credit2_01_99.gmd was not read in yet; the game "
+            "gets its own bytes from C:\\Games\\DDDA\\nativePC\\rom\\stage\\stage802\\stage802.arc (5120 bytes) instead "
+            "of stopping\n").replace(
+            "1 stand-ins, 0 fatal errors; ended by: Alt+F4",
+            "2 stand-ins, 0 fatal errors; Direct3D 9 Windows' own, managed textures and buffers peak 295 MB; "
+            "memory pressure 2 times; ended by: Alt+F4")
+        with tempfile.TemporaryDirectory() as tmp:
+            items = by_key(playtest.check_session(game(tmp, loader=log)))
+        self.assertEqual((items["memory"].status, items["archives"].status, items["textures"].status),
+                         ("ok", "ok", "ok"))
+        memory = "\n".join(items["memory"].lines)
+        self.assertIn("142.8 fps on average", memory)
+        self.assertIn("Direct3D 9 Windows' own, managed textures and buffers peak 295 MB", memory)
+        self.assertIn("memory pressure 2 time(s)", memory)
+        archives = "\n".join(items["archives"].lines)
+        self.assertIn("1 resource(s) the game asked for before their archive was read", archives)
+        self.assertIn("credit2_01_99.gmd was not read in yet", archives)
+        self.assertIn("read the directories of 4113 archives", archives)
+        self.assertIn("1 stand-in(s) served", items["textures"].lines[0])     # the texture guard's own, not 2
+        self.assertIn("Alt+F4 was pressed", items["end"].lines[0])
+
+        # armed, never needed: not exercised, with what to do; a copy it could not write: failed; off: said so
+        quiet = "\n".join(s for s in log.splitlines() if "was not read in yet" not in s and "read the directories" not in s)
+        broke = log.replace("was not read in yet; the game gets its own bytes from", "is in").replace(
+            " (5120 bytes) instead of stopping", ", but its copy could not be written under riftstone\\standin (error 5)")
+        off = log.replace("gets its own bytes from that archive (riftstone\\standin\\nativePC)", "stops the game as usual")
+        off = "\n".join(s for s in off.splitlines() if "was not read in yet" not in s)
+        for text, status, needle in ((quiet, "untested", "armed; the game never asked"),
+                                     (broke, "fail", "could not be written"),
+                                     (off, "info", "off this session")):
+            with tempfile.TemporaryDirectory() as tmp:
+                it = by_key(playtest.check_session(game(tmp, loader=text)))["archives"]
+            self.assertEqual(it.status, status, text)
+            self.assertIn(needle, "\n".join(it.lines))
+            if status == "untested":
+                self.assertIn("skip cutscenes", it.todo)
+
+        # an older loader says nothing of it: no item
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertNotIn("archives", by_key(playtest.check_session(game(tmp))))
+
+    def test_the_games_own_settings(self):
+        # config.ini, read only when given: FARTHEST with draw_distance loaded says what FAR gives; VSync its steps
+        cfg = ("[GRAPHICS]\nMaxFPS=150.000000\nViewRange=FARTHEST\n[DISPLAY]\nResolution=2560x1440\n"
+               "RefreshRate=165.00Hz\nVSYNC=ON\n")
+        log = LOADER_LOG.replace("22:22:14.938  plugin   free_sprint.asi loaded at 0x613C0000\n",
+                                 "22:22:14.938  plugin   free_sprint.asi loaded at 0x613C0000\n"
+                                 "22:22:14.940  plugin   draw_distance.asi loaded at 0x613A0000\n"
+                                 "22:22:14.941  plugin   lod_tuner.asi loaded at 0x61390000\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.ini"
+            config.write_text(cfg, encoding="utf-8")
+            root = game(tmp, loader=log)
+            it = by_key(playtest.check_session(root, config=config))["settings"]
+            self.assertEqual(it.status, "info")
+            self.assertEqual(it.lines[0], "2560x1440, 165 Hz, VSync on, frame-rate ceiling 150, ViewRange FARTHEST")
+            self.assertIn("full detail at any distance", it.lines[1])
+            self.assertIn("lod_tuner's Farthest = lod gives it levels of detail (x3)", it.lines[1])
+            self.assertIn("with draw_distance loaded, FAR keeps FARTHEST's distances", it.lines[1])
+            self.assertIn("(165, 82, 55 fps): a frame that takes a little over 6.1 ms shows at 82", it.lines[2])
+
+            # lod_tuner gave FARTHEST levels of detail this session
+            (root / "riftstone" / "logs" / "lod_tuner.log").write_text(
+                "lod_tuner: FARTHEST picks levels of detail at x3: 10 ViewRange tests changed\n", encoding="utf-8")
+            it = by_key(playtest.check_session(root, config=config))["settings"]
+            self.assertEqual(it.lines[1], "ViewRange FARTHEST, with levels of detail from lod_tuner's Farthest = lod (x3)")
+
+            # FAR, no VSync, no draw_distance: just the settings
+            config.write_text(cfg.replace("FARTHEST", "FAR").replace("VSYNC=ON", "VSYNC=OFF"), encoding="utf-8")
+            it = by_key(playtest.check_session(game(Path(tmp) / "b"), config=config))["settings"]
+            self.assertEqual(it.lines, ["2560x1440, 165 Hz, VSync off, frame-rate ceiling 150, ViewRange FAR"])
+
+            # not given, missing, or the session before: no item
+            self.assertNotIn("settings", by_key(playtest.check_session(game(Path(tmp) / "c"))))
+            self.assertNotIn("settings", by_key(playtest.check_session(game(Path(tmp) / "d"), config=Path(tmp) / "none.ini")))
 
     def test_a_panel_seen_only_with_few_enemies_asks_for_load(self):
         log = LOADER_LOG.replace("enemy pool 40 / 40 slots (peak 40)", "enemy pool 7 / 40 slots (peak 7)") \

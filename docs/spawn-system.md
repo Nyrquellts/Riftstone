@@ -68,6 +68,37 @@ fact (`docs/world-map.md`). In game for an enemy new to a stage: UNKNOWN until p
 layouts `st<S>_<X>m<Z>n_<t>N` (the engine builds that name, 0x01562268); group numbers are slots
 0..294 of the 295-entry table.
 
+## What keeps a group from appearing (measured on PC, 2026-09-27)
+
+`cGroupParam::load` (`0x00CC4690`) packs a group's conditions into bit words. The load word `+0x20` gets
+`mLoadCondition.mScenario` as bit 0x01, `mLotFlag` 0x02, `mLotFlag2` 0x08 (and `Next_Normal` 0x10,
+`Next_Special` 0x20, `HighPriorityEvenIfNotDrawn` 0x40, `HeldItem` 0x80). The set word `+0x34` gets, in file
+order, `mSetCondition.mTime` 0x01, `mAreaHit` 0x02, `mFsm` 0x04 (`03 C9 03 C9 33 4F 34 83 E1 04 31 4F 34` at
+`0x00CC4C9D`), `mRequest` 0x08, `mChArea` 0x10, `mSimpleEv` 0x20, `mTimeKA` 0x40, `mIsEmGroupLink` 0x80 and
+`mLinkEmGroup` in bits 8-16. `mAppearBgn`/`mAppearEnd` sit at `+0x24`/`+0x28`, the lot flags' numbers at
+`+0x2C`/`+0x2E`, the set hours at `+0x38`/`+0x3A`.
+
+When a stage builds a group's runtime entry (the code from `0x004A3AF4`; the bytes `+0x30` and `+0x31` it sets are
+read elsewhere, not traced here; `+0x31` looks like "may be set now"):
+
+- **The story window:** with `mScenario`, the story value (`sGameSys+0x30`, the save's `mScenarioNo`) at or
+  past `mAppearEnd` sets the entry's `+0x30` byte: `F6 46 20 01 74 1A 8B 15 BC A4 8F 01 8B 42 30 3B 46 28 7C 06
+  C6 47 30 01` at `0x004A3AF4`. The live check (`0x004A9A70`, which the per-frame update calls at `0x004A9619`)
+  wants `mAppearBgn` <= story < `mAppearEnd`: `F6 C3 01 74 0D 8B 45 30 3B 46 24 7C 4B 3B 46 28 7D 46` at
+  `0x004A9ABC`. So the end is excluded and a window that ends at 0 is never open. Of the game's 631 groups with `mScenario`, 218 use 0..27999 and 626 end above
+  their start.
+- **A script's group:** `mFsm` clears both "may be set" bytes, `F6 46 34 04 74 06 66 C7 47 31 00 00` at
+  `0x004A3B52`, and the live check refuses the group outright, `F6 46 34 04 74 04 32 C0` at `0x004A9A7C` (the
+  same test at `0x0075FAAD`). Such a group is set only when something names its number (a state machine's
+  order); 45 of the game's 1,175 enemy groups have it. `mRequest` (10 groups) clears `+0x31` too
+  (`0x004A3B32`); `mSimpleEv` (20) is read only by the event code around `0x00760494`.
+
+`riftstone encounter` copies a nearby group, so it clears `mFsm`, `mRequest` and `mSimpleEv` on the copy
+(`encounter.SCRIPTED`): nothing names the copy's new number, and with one of them it would never appear. The Tower
+Arena Test (2026-09-27) copied stage 370's script-set group 1 into three groups that never could have appeared.
+Two of the Gran Soren Horde's groups had the window 0..0 from the old story rule. Both are fixed: every group a
+mod adds on stages 100 and 370 now passes these checks; in game UNKNOWN until played.
+
 ## Still being traced (do not ship as fact yet)
 
 - **The exact count packing:** the bit-packing of the count at `cOmGroupData+8` → record `+0x128`

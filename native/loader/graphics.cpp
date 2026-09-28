@@ -16,7 +16,10 @@
 // The pool counters patch the device's function table (CreateTexture, CreateVolumeTexture,
 // CreateCubeTexture, CreateVertexBuffer, CreateIndexBuffer) and Release in the table of each kind of
 // object they count, so they work the same on Windows' Direct3D 9 and on DXVK.  What the loader itself
-// creates (the F10 panel) is not counted.
+// creates (the F10 panel) is not counted.  Their lock is never held across a call into Direct3D: a
+// Release runs the runtime's own Release first and takes the lock only when the object is gone, and each
+// counted object carries a creation stamp, so an address the runtime hands out again meanwhile is never
+// taken for the released one.  Readers on the loader's own threads never wait for the lock.
 #include "runtime.h"
 #include <d3d9.h>
 #include <intrin.h>
@@ -88,7 +91,9 @@ struct PoolEntry {
     uintptr_t key;                               // the object (0: empty)
     uint32_t bytes;
     uint8_t pool, kind;
+    uint32_t stamp;                              // when it was counted (g_stamp)
 };
+static volatile LONG g_stamp = 0;               // one more for every object counted
 static PoolEntry* g_table = NULL;
 static const uint32_t TABLE_BITS = 16, TABLE_SIZE = 1u << TABLE_BITS, TABLE_MASK = TABLE_SIZE - 1;
 static uint32_t g_tableUsed = 0;
@@ -130,18 +135,21 @@ static void Remember(void* object, uint8_t kind, D3DPOOL pool, uint64_t bytes) {
         g_table[i].bytes = (uint32_t)bytes;
         g_table[i].pool = (uint8_t)pool;
         g_table[i].kind = kind;
+        g_table[i].stamp = (uint32_t)InterlockedIncrement(&g_stamp);
         Count((uint8_t)pool, (uint32_t)bytes, +1);
     }
     LeaveCriticalSection(&g_lock);
 }
 
-// Under g_lock.
-static void Forget(void* object) {
+// Under g_lock.  `before`: g_stamp as the Release began.  An entry counted later is another object the runtime
+// has already placed at the same address (Remember took the released one out then), and stays.
+static void Forget(void* object, uint32_t before) {
     if (!g_table) return;
     uintptr_t key = (uintptr_t)object;
     uint32_t i = Slot(key);
     while (g_table[i].key && g_table[i].key != key) i = (i + 1) & TABLE_MASK;
     if (g_table[i].key != key) return;          // not one we counted (the loader's own, or untracked)
+    if ((int32_t)(g_table[i].stamp - before) > 0) return;
     Count(g_table[i].pool, g_table[i].bytes, -1);
     g_tableUsed--;
     for (uint32_t j = i;;) {                     // close the gap so every later entry stays reachable
@@ -181,13 +189,16 @@ static ULONG STDMETHODCALLTYPE Hook_Release(IUnknown* self) {
     for (LONG i = 0; i < g_releaseCount && i < (LONG)_countof(g_releases); i++)
         if (g_releases[i].table == table) real = g_releases[i].real;
     if (!real) return 0;                        // not reachable: this hook sits only in tables it recorded
-    // Held across the real Release: no other thread can get the same address back from the runtime and
-    // count it before this one is forgotten.  The runtime takes its own lock inside; ours is never taken
-    // the other way round (the create hooks count after the real call has returned).
-    EnterCriticalSection(&g_lock);
+    // The runtime's Release runs outside our lock (it takes the device's own lock on a multithreaded device,
+    // and ours is never held around a call into the runtime).  Only a release that ends the object takes
+    // the lock, and forgets the entry only if it is at least as old as this call.
+    uint32_t before = (uint32_t)g_stamp;        // this object was counted before its pointer reached this thread
     ULONG left = real(self);
-    if (left == 0) Forget(self);
-    LeaveCriticalSection(&g_lock);
+    if (left == 0) {
+        EnterCriticalSection(&g_lock);
+        Forget(self, before);
+        LeaveCriticalSection(&g_lock);
+    }
     return left;
 }
 
@@ -285,7 +296,12 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateIndexBuffer(IDirect3DDevice9* dev, U
 }
 
 void GraphicsDeviceCreated(IDirect3DDevice9* dev) {
-    if (!g_poolStats || !dev) return;
+    if (!dev) return;
+    // Bound a raised sun shadow map to what this GPU can actually create ([guard] shadow_buffers, fixes.cpp).
+    // Done first, before the pool counters' gate below, so it holds even when frame stats/counting are off.
+    D3DCAPS9 caps;
+    if (SUCCEEDED(dev->GetDeviceCaps(&caps))) FixesDeviceCreated(caps.MaxTextureWidth, caps.MaxTextureHeight);
+    if (!g_poolStats) return;
     void** table = *(void***)dev;
     if (g_poolDevTable) {
         if (table != g_poolDevTable)

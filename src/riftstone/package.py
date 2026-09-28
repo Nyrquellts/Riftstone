@@ -56,7 +56,7 @@ PLUGIN_SUFFIXES = (".asi", ".dll")
 RESERVED = ("dinput8.dll", "riftstone_loader.dll")
 # Riftstone's own plugins (native/plugins, MIT); any other plugin in a package keeps its author's terms.
 OWN_PLUGINS = ("enemy_cap", "enemy_skins", "lod_tuner", "inclination_lock", "save_backup", "free_sprint",
-               "draw_distance", "six_skill_warrior")
+               "draw_distance", "six_skill_warrior", "stage_enemies")
 MAX_MEMBER = 256 * 1024 * 1024          # a package member, unpacked
 MAX_TOTAL = 1024 * 1024 * 1024          # everything in a package, unpacked
 MAX_MEMBERS = 50_000

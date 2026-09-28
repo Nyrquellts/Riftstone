@@ -29,7 +29,7 @@ LIVE_NAME = "Local\\RiftstoneLive"
 LIVE_SIZE = 0x1000
 LIVE_MAGIC = b"RSLIVE1\0"
 GAMES = {0: "another program", 1: "Dragon's Dogma: Dark Arisen", 2: "Dragon's Dogma Online"}
-REPORT_KINDS = ("crash", "fatal", "hang")
+REPORT_KINDS = ("crash", "fatal", "hang", "snapshot")
 STATE_FILE = "runtime-state.ini"
 DDDA_APP = "367500"
 
@@ -142,6 +142,81 @@ def _open_mapping(name: str) -> bytes | None:
             k32.UnmapViewOfFile(view)
     finally:
         k32.CloseHandle(h)
+
+
+SNAPSHOT_EVENT = "Local\\RiftstoneSnapshot-{pid}"     # live.cpp creates it (auto-reset); one set, one snapshot
+_DUMP_NOTE = re.compile(r"snapshot\s+(every thread's state written beside it \(\.dmp\)"
+                        r"|the dump of every thread did not finish in 30 s[^\r\n]*)")
+
+
+def _signal_snapshot(pid: int) -> bool:
+    """Set the running game's snapshot event; False when it has none (no live stats, or a loader before 1.0.2)."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenEventW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
+    k32.OpenEventW.restype = wintypes.HANDLE
+    k32.SetEvent.argtypes = (wintypes.HANDLE,)
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    event_modify_state = 0x0002
+    h = k32.OpenEventW(event_modify_state, False, SNAPSHOT_EVENT.format(pid=pid))
+    if not h:
+        return False
+    try:
+        return bool(k32.SetEvent(h))
+    finally:
+        k32.CloseHandle(h)
+
+
+def request_snapshot(logs: Path, pid: int | None = None, timeout: float = 45.0, signal=None, clock=time.monotonic,
+                     sleep=time.sleep) -> dict:
+    """Ask the running game's loader for a snapshot: where its main thread is and, in a .dmp beside the report,
+    every thread, while the game goes on.  Waits for the report and then for the dump (the loader gives the dump
+    30 s).  {"report": Path, "dump": Path | None, "dump_note": the loader's line about it or None}."""
+    if pid is None:
+        live = read_live()
+        if live is None:
+            raise RiftError("no game with the Riftstone loader is running (or its live stats are off: [live] enabled)")
+        pid = live["pid"]
+    before = {r["name"] for r in list_reports(logs, snapshots=True) if r["kind"] == "snapshot"}
+    if not (signal or _signal_snapshot)(pid):
+        raise RiftError(f"process {pid} takes no snapshot requests: its loader is older than snapshots (1.0.2), or its "
+                        "live stats are off ([live] enabled = 0)")
+    deadline = clock() + timeout
+    report = None
+    while clock() < deadline:
+        new = [r for r in list_reports(logs, snapshots=True) if r["kind"] == "snapshot" and r["name"] not in before]
+        if new:
+            report = new[0]["path"]
+            break
+        sleep(0.25)
+    if report is None:
+        raise RiftError(f"the game did not write a snapshot in {timeout:.0f} s (its live thread checks every quarter "
+                        "second; a game that is not responding may take its time)")
+    note = None                       # loader.log's line after the report's: the dump written, or not in 30 s
+    while clock() < deadline:
+        tail = _tail(logs / "loader.log", 64 << 10)
+        at = tail.find(report.name)
+        m = _DUMP_NOTE.search(tail, at) if at >= 0 else None
+        if m:
+            note = m.group(1)
+            break
+        sleep(0.25)
+    dump = report.with_suffix(".dmp")
+    return {"report": report, "dump": dump if dump.is_file() and note and note.startswith("every") else None,
+            "dump_note": note}
+
+
+def _tail(path: Path, limit: int) -> str:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
 
 
 def read_live(pid: int | None = None) -> dict | None:
@@ -281,11 +356,12 @@ def describe_live(live: dict) -> list[str]:
 # reports
 
 # "<kind>-<YYYYMMDD-HHMMSS>.txt", or "-2", "-3" ... before .txt for more reports in the same second
-_REPORT_NAME = re.compile(r"^(crash|fatal|hang)-(\d{8}-\d{6})(?:-(\d{1,2}))?\.txt$")
+_REPORT_NAME = re.compile(r"^(crash|fatal|hang|snapshot)-(\d{8}-\d{6})(?:-(\d{1,2}))?\.txt$")
 
 
-def list_reports(logs: Path) -> list[dict]:
-    """Crash, fatal-error and hang reports in a logs folder, newest first."""
+def list_reports(logs: Path, snapshots: bool = False) -> list[dict]:
+    """Crash, fatal-error and hang reports in a logs folder, newest first; with ``snapshots``, the snapshots asked
+    for while the game ran too (those are not problems: doctor, playtest and Studio leave them out)."""
     out = []
     try:
         entries = list(Path(logs).iterdir())
@@ -293,7 +369,7 @@ def list_reports(logs: Path) -> list[dict]:
         return []
     for p in entries:
         m = _REPORT_NAME.match(p.name)
-        if m and p.is_file():
+        if m and p.is_file() and (snapshots or m.group(1) != "snapshot"):
             out.append({"name": p.name, "kind": m.group(1), "stamp": m.group(2), "path": p,
                         "dump": p.with_suffix(".dmp").is_file(), "_n": int(m.group(3) or 1)})
     out.sort(key=lambda r: (r["stamp"], r["_n"], r["kind"]), reverse=True)
@@ -314,11 +390,11 @@ def _mb(text: str) -> int | None:
 
 
 def parse_report(text: str) -> dict:
-    """A report's text (any of the three kinds) -> its facts.  Tolerates damaged or foreign text."""
+    """A report's text (any of the four kinds) -> its facts.  Tolerates damaged or foreign text."""
     lines = text.replace("\r\n", "\n").split("\n")
     first = lines[0] if lines else ""
     kind = "crash" if "crash report" in first else "fatal" if "fatal-error report" in first else \
-        "hang" if "hang report" in first else "unknown"
+        "hang" if "hang report" in first else "snapshot" if first.startswith("Riftstone snapshot") else "unknown"
     r: dict = {"kind": kind, "loader": None, "time": None, "game": None, "uptime_s": None, "startup": False,
                "safe_mode": False, "exception": None, "access": None, "fault_in": None, "fault_plugin": None,
                "objects": [], "stack": [], "memory": {}, "out_of_memory": False, "plugins": [], "last_files": [],
@@ -547,6 +623,10 @@ def explain(report: dict, game_root: Path | None = None) -> list[str]:
     elif kind == "hang":
         out.append(f"The game stopped drawing frames{when}"
                    + (f"; its main thread was at {report['main_thread']}." if report.get("main_thread") else "."))
+    elif kind == "snapshot":
+        out.append(f"A snapshot asked for while the game ran{when}; the game went on"
+                   + (f". Its main thread was at {report['main_thread']}." if report.get("main_thread") else "."))
+        return out
     else:
         out.append("This does not look like a Riftstone report.")
         return out

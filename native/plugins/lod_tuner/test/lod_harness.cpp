@@ -1,6 +1,6 @@
 // lod_harness_core -- runs the lod_tuner hook inside the real game code, without the game.
 //
-//   lod_stub.exe <DDDA.exe> <lod_tuner.asi> <on|flat|off>   (the stub loads this DLL and calls HarnessMain)
+//   lod_stub.exe <DDDA.exe> <lod_tuner.asi> <on|farlod|flat|off>   (the stub loads this DLL and calls HarnessMain)
 //
 // Maps DDDA.exe's image at its fixed base (0x00400000) over the stub's image, loads the plugin (which
 // verifies and patches the mapped code), then:
@@ -13,9 +13,11 @@
 //     HIGH/MEDIUM/LOW with the same ViewRange arithmetic the draw paths inline, and
 //     cInstancingCulling::updateLODParam, which sets instanced vegetation's LOD and billboard distances.
 // Profiles (run_tests.py writes the matching lod_tuner.ini and a stand-in game config.ini):
-//   on   -- the shipped lod_tuner.ini; the game config says 2560x1440, CameraFov 0, ViewRange FARTHEST
-//   flat -- Scale=3, PopPixels=0, Characters=1.5, ScreenHeight=1080, MaxDistance=100 (m)
-//   off  -- Enabled=0: nothing patched, the game's values reach the readers unchanged
+//   on     -- the shipped lod_tuner.ini; the game config says 2560x1440, CameraFov 0, ViewRange FARTHEST
+//   farlod -- the same with Farthest = lod: each of the ten ViewRange tests' FARTHEST branch now lands on the
+//             store that makes ViewRange the multiplier, and the cloth's LOD choice runs x3 at FARTHEST
+//   flat   -- Scale=3, PopPixels=0, Characters=1.5, ScreenHeight=1080, MaxDistance=100 (m)
+//   off    -- Enabled=0: nothing patched, the game's values reach the readers unchanged
 // Prints "pass"/"FAIL" lines and exits 0 when everything passed, 1 on a failure, 2 when the image
 // cannot be mapped here (reported as a skip by run_tests.py).
 #define WIN32_LEAN_AND_MEAN
@@ -173,19 +175,51 @@ struct Readers {
     }
 };
 
-// The game's choice around both thresholds for ViewRange NORMAL (x1) and FAR (x2), and FARTHEST.
-void CheckLevels(Model& m, int32_t mid, int32_t low, const char* what) {
+// The game's choice around both thresholds for ViewRange NORMAL (x1) and FAR (x2), and FARTHEST: always HIGH, or
+// with Farthest = lod the same thresholds x3.
+void CheckLevels(Model& m, int32_t mid, int32_t low, const char* what, bool farthestLod = false) {
     Readers r(m);
     bool ok = true;
-    for (uint32_t vr = 1; vr <= 2; vr++) {
+    for (uint32_t vr = 1; vr <= (farthestLod ? 3u : 2u); vr++) {
         int32_t a = mid * (int32_t)vr, b = low * (int32_t)vr;
         ok &= r.level(vr, a) == 1 && r.level(vr, a + 1) == 2 && r.level(vr, b) == 2 && r.level(vr, b + 1) == 4;
     }
-    ok &= r.level(3, 2000000000) == 1;
-    char msg[200];
-    _snprintf_s(msg, sizeof msg, _TRUNCATE, "%s: the game picks HIGH to %d, MEDIUM to %d, LOW beyond (x2 at FAR; FARTHEST always HIGH)",
-                what, mid, low);
+    ok &= r.level(3, 2000000000) == (farthestLod ? 4u : 1u);
+    char msg[220];
+    _snprintf_s(msg, sizeof msg, _TRUNCATE, "%s: the game picks HIGH to %d, MEDIUM to %d, LOW beyond (x2 at FAR; FARTHEST %s)",
+                what, mid, low, farthestLod ? "x3" : "always HIGH");
     Check(ok, msg);
+}
+
+// The ten ViewRange tests (lod_tuner's FAR_SITES): the two bytes where FARTHEST branches, the game's own, and the
+// store that makes ViewRange the multiplier.  With Farthest = lod each is a je/jmp that lands on that store.
+struct FarBranch {
+    uintptr_t at;
+    uint8_t orig[2];
+    uintptr_t store;
+};
+const FarBranch FAR_BRANCHES[] = {
+    {0x0083D24D, {0x74, 0x33}, 0x0083D254}, {0x00C6E336, {0x74, 0x2F}, 0x00C6E33D}, {0x00FA77B9, {0x74, 0x33}, 0x00FA77C0},
+    {0x00FFC51C, {0x74, 0x33}, 0x00FFC523}, {0x0084596E, {0xC7, 0x44}, 0x0084597D}, {0x00B898BE, {0xC7, 0x44}, 0x00B898CD},
+    {0x00F1FE44, {0xC7, 0x44}, 0x00F1FE53}, {0x00EA5445, {0x89, 0x5C}, 0x00EA5450}, {0x00F61974, {0x89, 0x5C}, 0x00F6197F},
+    {0x00FA604D, {0x89, 0x5C}, 0x00FA6058},
+};
+
+void CheckFarBranches(bool patched) {
+    int good = 0;
+    for (const FarBranch& b : FAR_BRANCHES) {
+        const uint8_t* p = (const uint8_t*)b.at;
+        bool lands = (p[0] == 0x74 || p[0] == 0xEB) && b.at + 2 + (int8_t)p[1] == b.store;
+        // the store itself: mov eax, edx (8B C2) or mov [esp+m], eax (89 44 24 m)
+        const uint8_t* s = (const uint8_t*)b.store;
+        bool store = (s[0] == 0x8B && s[1] == 0xC2) || (s[0] == 0x89 && s[1] == 0x44 && s[2] == 0x24);
+        good += patched ? (lands && store) : memcmp(p, b.orig, 2) == 0;
+    }
+    char msg[200];
+    _snprintf_s(msg, sizeof msg, _TRUNCATE, patched ? "Farthest = lod: all ten ViewRange tests send FARTHEST to the multiplier's "
+                                                      "store (%d of 10)"
+                                                    : "the ten ViewRange tests are the game's own (%d of 10)", good);
+    Check(good == 10, msg);
 }
 
 void CheckInstancing(Model& m, int32_t mid, int32_t low, const char* what) {
@@ -280,7 +314,7 @@ extern "C" __declspec(dllexport) void HarnessMain() {
 
 static int Run(int argc, wchar_t** argv) {
     if (argc < 4) {
-        printf("usage: lod_stub <DDDA.exe> <lod_tuner.asi> <on|flat|off>\n");
+        printf("usage: lod_stub <DDDA.exe> <lod_tuner.asi> <on|farlod|flat|off>\n");
         return 1;
     }
     const std::wstring profile = argv[3];
@@ -337,6 +371,20 @@ static int Run(int argc, wchar_t** argv) {
         RunSite(m);
         CheckLevels(m, 6099, 10166, "draw-path LOD choice");
         CheckInstancing(m, 6099, 10166, "instanced vegetation");
+        CheckFarBranches(false);
+    } else if (profile == L"farlod") {
+        RunCases({
+            {"small object (r 0.37 m, scenery), the pixel rule", "model\\om\\om5655\\model\\om5655", 0, 37.0f, 3000, 5000, 6099, 10166, {1}},
+            {"enemy (model\\em): Characters=1.0, vanilla", "model\\em\\e54\\e5400\\e5400", 60, 1244.0f, 1000, 3000, 1000, 3000},
+        });
+        CheckFarBranches(true);
+        printf("the game's readers see the new distances, and FARTHEST has levels of detail\n");
+        Model m("model\\om\\om5655\\model\\om5655", 0, 37.0f, 3000, 5000, {1});
+        RunSite(m);
+        CheckLevels(m, 6099, 10166, "cloth LOD choice", true);
+        Model e("model\\em\\e54\\e5400\\e5400", 60, 1244.0f, 1000, 3000);
+        RunSite(e);
+        CheckLevels(e, 1000, 3000, "cloth LOD choice (enemy)", true);
     } else if (profile == L"flat") {
         // Scale 3, PopPixels 0, Characters 1.5, cap 100 m = 10000 units.
         RunCases({
@@ -350,6 +398,7 @@ static int Run(int argc, wchar_t** argv) {
         Model m("model\\em\\e54\\e5400\\e5400", 60, 1244.0f, 1000, 3000);
         RunSite(m);
         CheckLevels(m, 1500, 4500, "draw-path LOD choice (enemy)");
+        CheckFarBranches(false);
     } else {
         RunCases({
             {"scenery untouched", "model\\om\\om5655\\model\\om5655", 0, 37.0f, 3000, 5000, 3000, 5000},
@@ -360,6 +409,7 @@ static int Run(int argc, wchar_t** argv) {
         RunSite(m);
         CheckLevels(m, 3000, 5000, "draw-path LOD choice");
         CheckInstancing(m, 3000, 5000, "instanced vegetation");
+        CheckFarBranches(false);
     }
 
     printf(g_fails ? "\n%d check(s) FAILED\n" : "\nall checks passed\n", g_fails);

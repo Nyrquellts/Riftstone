@@ -19,7 +19,9 @@
 //   with nothing to draw at HIGH (a far-only stand-in) stays vanilla.  Everything else (characters,
 //   enemies, weapons, effects) is multiplied by Characters, 1.0 = vanilla, because their pair also
 //   sets cloth-simulation detail (uSimSoftBody::getTargetLODLevel).  A distance is never lowered and
-//   never pushed past MaxDistance.  Settings: lod_tuner.ini next to this file.
+//   never pushed past MaxDistance.  Farthest = lod gives ViewRange FARTHEST levels of detail too: the ten
+//   ViewRange tests that skip the distance test at FARTHEST store 3 as the multiplier instead, the way FAR
+//   stores 2 (FAR_SITES; a branch retargeted at each, nothing else).  Settings: lod_tuner.ini next to this file.
 //
 // Safety
 //   DDDA.exe build 2364871 only.  The patched bytes, the code around them, rModel's vtable and two
@@ -65,6 +67,43 @@ const Expect CONTEXT[] = {
     {"cInstancingCulling::updateLODParam", 0x0113D430, {0x8B, 0x44, 0x24, 0x04, 0x0F, 0x57, 0xC0, 0xF3, 0x0F, 0x11, 0x41, 0x08}, 12},
 };
 
+// FARTHEST's "always HIGH".  Ten LOD choices (the draw paths and the cloth's) read ViewRange ([0x018D1D20]+0x38)
+// with the multiplier at 1: 3 (FARTHEST) skips the distance test and takes HIGH, 2 (FAR) stores 2 as the multiplier.
+// Farthest = lod sends 3 to that same store, so FARTHEST picks HIGH up to middist x 3, MEDIUM up to lowdist x 3 and
+// LOW beyond, the way NORMAL (x1) and FAR (x2) do; NORMAL and FAR run exactly as before.  Each site: the run checked
+// first (from `cmp reg, 3` to the end of the store) and the bytes written, a branch that now lands on the store.
+struct FarSite {
+    uintptr_t from;
+    uint8_t run[24];
+    uint8_t len;
+    uintptr_t at;
+    uint8_t put[2];
+    uint8_t putLen;
+};
+#define FAR_JE(slot) {0x83, 0xFA, 0x03, 0x74, slot, 0x83, 0xFA, 0x02, 0x75, 0x02, 0x8B, 0xC2}
+#define FAR_JNE10(m) {0x83, 0xF8, 0x03, 0x75, 0x0A, 0xC7, 0x44, 0x24, 0x14, 0x01, 0x00, 0x00, 0x00, 0xEB, 0x39, \
+                      0x83, 0xF8, 0x02, 0x75, 0x04, 0x89, 0x44, 0x24, m}
+#define FAR_JNE6(l, m) {0x83, 0xF8, 0x03, 0x75, 0x06, 0x89, 0x5C, 0x24, l, 0xEB, 0x39, 0x83, 0xF8, 0x02, 0x75, 0x04, \
+                        0x89, 0x44, 0x24, m}
+const FarSite FAR_SITES[] = {
+    // `mov eax, 1; cmp edx, 3; je <level store>; cmp edx, 2; jne +2; mov eax, edx`: the je goes to `mov eax, edx`
+    {0x0083D24A, FAR_JE(0x33), 12, 0x0083D24E, {0x05}, 1},   // uSimSoftBody::getTargetLODLevel (cloth)
+    {0x00C6E333, FAR_JE(0x2F), 12, 0x00C6E337, {0x05}, 1},
+    {0x00FA77B6, FAR_JE(0x33), 12, 0x00FA77BA, {0x05}, 1},
+    {0x00FFC519, FAR_JE(0x33), 12, 0x00FFC51D, {0x05}, 1},   // uModel::drawModel
+    // `cmp eax, 3; jne; mov [esp+14h], 1; jmp; cmp eax, 2; jne +4; mov [esp+m], eax`: the FARTHEST block jumps there
+    {0x00845969, FAR_JNE10(0x24), 24, 0x0084596E, {0xEB, 0x0D}, 2},
+    {0x00B898B9, FAR_JNE10(0x24), 24, 0x00B898BE, {0xEB, 0x0D}, 2},
+    {0x00F1FE3F, FAR_JNE10(0x14), 24, 0x00F1FE44, {0xEB, 0x0D}, 2},
+    // `cmp eax, 3; jne; mov [esp+l], ebx; jmp; cmp eax, 2; jne +4; mov [esp+m], eax`: likewise
+    {0x00EA5440, FAR_JNE6(0x14, 0x14), 20, 0x00EA5445, {0xEB, 0x09}, 2},
+    {0x00F6196F, FAR_JNE6(0x14, 0x14), 20, 0x00F61974, {0xEB, 0x09}, 2},
+    {0x00FA6048, FAR_JNE6(0x30, 0x10), 20, 0x00FA604D, {0xEB, 0x09}, 2},
+};
+#undef FAR_JE
+#undef FAR_JNE10
+#undef FAR_JNE6
+
 constexpr uintptr_t RMODEL_VTABLE = 0x01438618;
 constexpr uint32_t SLOT_LOAD = 10;
 constexpr uintptr_t RMODEL_LOAD = 0x00FA8FE0;
@@ -84,6 +123,7 @@ struct Settings {
     double fov = 0;           // vertical degrees; 0: auto, 40 (uCamera's default) + config CameraFov
     double characters = 1.0;
     double maxMeters = 10000;
+    bool farthestLod = false; // Farthest = lod: levels of detail at FARTHEST too (x3)
 };
 
 Settings g_set;
@@ -264,6 +304,24 @@ bool Verify() {
     return true;
 }
 
+// Farthest = lod: every site checked first, then all written, or none.
+bool PatchFarthest() {
+    for (const FarSite& s : FAR_SITES) {
+        if (!Readable(s.from, s.len) || memcmp((const void*)s.from, s.run, s.len) != 0)
+            return Log("refused: Farthest = lod: the ViewRange test at 0x%08X is not the expected code; FARTHEST stays "
+                       "at full detail", (unsigned)s.from), false;
+    }
+    for (const FarSite& s : FAR_SITES) {
+        DWORD old;
+        if (!VirtualProtect((void*)s.at, s.putLen, PAGE_EXECUTE_READWRITE, &old))
+            return Log("failed: VirtualProtect at 0x%08X (%lu)", (unsigned)s.at, GetLastError()), false;
+        memcpy((void*)s.at, s.put, s.putLen);
+        VirtualProtect((void*)s.at, s.putLen, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void*)s.at, s.putLen);
+    }
+    return true;
+}
+
 bool Patch() {
     g_back = BACK;
     DWORD old;
@@ -333,6 +391,11 @@ void LoadSettings(HMODULE self) {
     s.characters = Clamp(ReadNumber(ini, L"Characters", 1.0), 1.0, 16.0);  // never lowers a distance
     s.maxMeters = ReadNumber(ini, L"MaxDistance", 10000);
     if (s.maxMeters <= 0) s.maxMeters = 10000;
+    wchar_t farthest[16];
+    GetPrivateProfileStringW(L"lod", L"Farthest", L"high", farthest, 16, ini);
+    const wchar_t* f = farthest;
+    while (*f == L' ' || *f == L'\t') f++;
+    s.farthestLod = _wcsnicmp(f, L"lod", 3) == 0;
 
     GameConfig game = ReadGameConfig();
     if (s.height <= 0) s.height = game.height > 0 ? game.height : 1080;
@@ -351,14 +414,17 @@ void LoadSettings(HMODULE self) {
                     s.popPixels, s.height, s.fov);
     else
         _snprintf_s(pixels, sizeof pixels, _TRUNCATE, "no pixel rule");
-    Log("settings: %s; scenery at least x%.2f%s, %s; others x%.2f; cap %.0f m",
+    Log("settings: %s; scenery at least x%.2f%s, %s; others x%.2f; cap %.0f m; FARTHEST %s",
         haveIni ? "lod_tuner.ini" : "no lod_tuner.ini, defaults", g_k, s.scale > 0 ? "" : " (screen height / 720)",
-        pixels, s.characters, g_cap / 100.0);
+        pixels, s.characters, g_cap / 100.0,
+        s.farthestLod ? "with levels of detail at x3 (Farthest = lod)" : "at full detail, the game's own (Farthest = high)");
     if (game.viewRange[0])
         Log("config.ini ViewRange=%S%s", game.viewRange,
             _wcsicmp(game.viewRange, L"FARTHEST") == 0
-                ? ": the game draws every regular model at full detail at any distance, so this plugin changes only "
-                  "instanced vegetation there; FAR (distances x2) or NORMAL let it work everywhere"
+                ? (s.farthestLod ? ": Farthest = lod gives regular models levels of detail there, at these distances x3"
+                                 : ": the game draws every regular model at full detail at any distance, so this plugin "
+                                   "changes only instanced vegetation there; Farthest = lod in lod_tuner.ini gives it "
+                                   "levels of detail at x3, and FAR (x2) or NORMAL let the plugin work everywhere")
                 : _wcsicmp(game.viewRange, L"FAR") == 0 ? ": the game doubles these distances again for regular models" : "");
 }
 
@@ -392,6 +458,8 @@ void Start(HMODULE self) {
         return;
     }
     if (!Verify() || !Patch()) return;
+    if (g_set.farthestLod && PatchFarthest())
+        Log("lod_tuner: FARTHEST picks levels of detail at x3: %u ViewRange tests changed", (unsigned)_countof(FAR_SITES));
     Log("lod_tuner: rModel::load patched at 0x%08X (%s); first changes:", (unsigned)SITE, harness ? "harness" : "game");
 }
 

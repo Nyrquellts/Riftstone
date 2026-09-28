@@ -337,7 +337,39 @@ def _synthetic() -> dict[str, list[bytes]]:
             "delta": __import__("targets").delta_seeds(),
             "playtest": [(test_playtest.LOADER_LOG + "\n#cap\n" + test_playtest.CAP_LOG + "\n#sprint\n"
                           + test_playtest.SPRINT_LOG + "\n#state\n" + test_playtest.STATE).encode(),
-                         test_playtest.LOADER_LOG.encode(), b"#cap\n\n#sprint\n\n#state\n"],
+                         test_playtest.LOADER_LOG.encode(), b"#cap\n\n#sprint\n\n#state\n",
+                         (test_playtest.LOADER_LOG + "\n#cap\n\n#sprint\n\n#state\n\n#config\n[GRAPHICS]\nHDR=FLOAT\n"
+                          "\n#graphics\n" + json.dumps({"schema": "riftstone-graphics-state/1", "profile": "modern_remaster",
+                                                        "title": "ENB over DXVK", "applied": "2026-09-27T18:40:00",
+                                                        "files": {}})
+                          + "\n#enblocal\n[PROXY]\nEnableProxyLibrary=true\nProxyLibrary=riftstone\\dxvk\\d3d9.dll\n"
+                          + "\n#portcrystals\nportcrystals: 15 Portcrystals placed at once (the game allows 10); 46 sites, "
+                          "4 runs and 3 hooks patched (game)\n20:01:02  saved: 1 crystal(s) placed past the save's ten "
+                          "(slots 11-15)\n20:05:00  loaded: 1 crystal(s) past the save's ten came back from the sidecar\n"
+                          ).encode()],
+            "minidump": [__import__("test_minidump").dump([__import__("test_minidump").RENDER,
+                                                           __import__("test_minidump").WORKER,
+                                                           __import__("test_minidump").CAP])],
+            "portcrystals": [__import__("riftstone.portcrystals", fromlist=["x"]).build(
+                [__import__("test_portcrystals").record(n, fp=k) for k, n in enumerate((5, 0, 22))]),
+                __import__("riftstone.portcrystals", fromlist=["x"]).build([])],
+            "portcrystals_save": [__import__("test_portcrystals").save_xml(
+                [(100, -10661.911133, 33612.117188, 157458.890625)] * 10)],
+            "portcrystals_names": [b"; how many\r\n[portcrystals]\r\nslots = 15\r\n[names]\r\n"
+                                   b"44C06000,45747800,44C72000 = 277\r\n0,1,2 = 5\r\n; note\r\n[other]\r\nx=1\r\n",
+                                   b"[portcrystals]\nslots = 12\n"],
+            "graphics_profile": [json.dumps(c).encode() for c in (
+                {"schema": "riftstone-graphics/1", "title": "Modern Remaster", "notes": ["ENB over DXVK"],
+                 "files": {"d3d9.dll": {"sha256": "0" * 64, "from": "enb.zip: WrapperVersion/d3d9.dll"},
+                           "enblocal.ini": {"sha256": "1" * 64}, "enbseries/Shader Functions/ENB PP.fxh": {"sha256": "2" * 64}},
+                 "ini": {"enblocal.ini": {"PROXY": {"EnableProxyLibrary": "true", "ProxyLibrary": "riftstone\\dxvk\\d3d9.dll"}}},
+                 "config": {"GRAPHICS": {"HDR": "FLOAT", "AltAntiAlias": "NONE"}, "DISPLAY": {"VSYNC": "OFF"}},
+                 "loader": {"d3d9": {"chain": ""}}},
+                {"schema": "riftstone-graphics/1", "files": {"../d3d9.dll": {"sha256": "0" * 64}}},
+                {"schema": "riftstone-graphics/1", "files": {}, "config": {"GRAPHICS": {"HDR": "HIGH"}}})],
+            "graphics_ini": [b"[PROXY]\r\nEnableProxyLibrary=false\r\nProxyLibrary=\r\n#set\nPROXY\0ProxyLibrary\0riftstone\\dxvk\\d3d9.dll",
+                             b"[GRAPHICS]\nHDR=DEFAULT\n[DISPLAY]\nVSYNC = ON\n#set\ndisplay\0vsync\0OFF",
+                             "﻿[A]\r\nK=1\r\n".encode("utf-16-le") + b"\n#set\nA\0K\x002"],
             "plugin_ini": [b"; enemy_cap -- more enemies\n[enemy_cap]\nslots = 30\nrecord = 1\n#set\nenemy_cap\0enemy_cap\0slots\x0048",
                            b"[lod]\n; on\nEnabled = 1\nPopPixels = 24\nScale = auto\n#set\nlod_tuner\0lod\0Scale\0auto",
                            b"[fps]\nmax_fps = 165\n[overlay]\nkey = F10\n#set\nloader\0overlay\0key\0f7",

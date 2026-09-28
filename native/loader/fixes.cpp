@@ -28,6 +28,12 @@
 //                      sun shadows at this size instead of 2048 (one table entry, byte-verified).
 //   the game's exit    (DDDA build 2364871, byte-verified: exit_sites.h) sApp's quit flag and sMain's
 //                      exit request, read for "why the game closed" (session.cpp).
+//   ragdolls           [guard] ragdoll_bodies (DDDA build 2364871): the "walk a ragdoll's bodies" idiom
+//                      reads the packed count [bodydata+0x68] (>>8) through bodydata = [holder+0x38] with no
+//                      null-check; the game's own accessor 0x010805D0 answers 0 without data.  Four bespoke
+//                      sites (two enemy setter functions + two inline walks), then the whole family that a
+//                      scan of the exe found (55 more, byte-verified) trampolined to that same answer.  Live
+//                      goblin-horde crashes: 0x00794942 (the four) and 0x007945B4 (the family), 2026-09-27.
 #include "runtime.h"
 #include "exit_sites.h"
 #include <stdio.h>
@@ -303,19 +309,143 @@ int GameQuitFlag() { return ObjectFlag(DDDA_SAPP, DDDA_SAPP_VTABLE, DDDA_SAPP_QU
 int GameExitRequested() { return ObjectFlag(DDDA_SMAIN, DDDA_SMAIN_VTABLE, DDDA_SMAIN_EXIT); }
 
 // ---------------------------------------------------------------------------
+// the stability membrane: one registry for every guard (docs/stability-membrane.md)
+//
+// A guard counts where it acts: an interlocked increment, the game's address, and for the rare ones a detail
+// (a file name).  GuardsReport, run by the live thread four times a second and once at exit, writes the new hits
+// to riftstone\logs\riftstone_error.log: at most one line per guard per report, and past 50 lines for a guard one
+// every 10 s, so a guard acting every frame cannot fill the disk.  The file is made at the first hit of a session;
+// the previous session's becomes riftstone_error.prev.log.
+
+struct GuardState {
+    const wchar_t* key;                          // [guard] key
+    const char* keyA;
+    const wchar_t* what;                         // what one hit means
+    BOOL on;
+    volatile LONG hits;
+    volatile LONG where;                         // the game's address of the last hit (0: none known)
+    LONG reported, lines;                        // GuardsReport's
+    ULONGLONG lastLine;
+    wchar_t detail[MAX_PATH];                    // the last hit's detail (under g_guardLock)
+};
+static GuardState g_guards[GUARD_COUNT] = {
+    {L"missing_textures", "missing_textures", L"a texture that does not exist got the stand-in"},
+    {L"from_archives", "from_archives", L"a resource asked for before its archive was read got its own bytes"},
+    {L"ragdoll_bodies", "ragdoll_bodies", L"a ragdoll walked before its bodies were set up: none walked"},
+    {L"particles", "particles", L"an effect generator's update faulted in the game's code: that generator is off"},
+    {L"shadow_buffers", "shadow_buffers", L"a shadow map size past a safe bound was bounded"},
+    {L"broken_textures", "broken_textures", L"a loose texture that does not fit its file was answered as missing"},
+    {L"gui_text", "gui_text", L"a GUI text field whose looked-up string was missing showed empty instead of crashing"},
+};
+static CRITICAL_SECTION g_guardLock;             // the details and the error log
+static BOOL g_guardLockReady = FALSE;
+static wchar_t g_errorLog[MAX_PATH];
+static BOOL g_errorLogStarted = FALSE;
+
+BOOL GuardOn(int id) { return id >= 0 && id < GUARD_COUNT && g_guards[id].on; }
+LONG GuardHits(int id) { return id >= 0 && id < GUARD_COUNT ? g_guards[id].hits : 0; }
+DWORD GuardLastWhere(int id) { return id >= 0 && id < GUARD_COUNT ? (DWORD)g_guards[id].where : 0; }
+const char* GuardKeyA(int id) { return id >= 0 && id < GUARD_COUNT ? g_guards[id].keyA : ""; }
+static void GuardMark(int id, BOOL on) { if (id >= 0 && id < GUARD_COUNT) g_guards[id].on = on; }
+
+void GuardHit(int id, DWORD_PTR where, const wchar_t* detail) {
+    if (id < 0 || id >= GUARD_COUNT) return;
+    GuardState& g = g_guards[id];
+    InterlockedExchange(&g.where, (LONG)where);
+    if (detail && g_guardLockReady) {
+        EnterCriticalSection(&g_guardLock);
+        wcsncpy_s(g.detail, _countof(g.detail), detail, _TRUNCATE);
+        LeaveCriticalSection(&g_guardLock);
+    }
+    InterlockedIncrement(&g.hits);
+}
+
+void GuardsInit() {
+    if (!g_guardLockReady) {
+        InitializeCriticalSection(&g_guardLock);
+        g_guardLockReady = TRUE;
+    }
+    for (int i = 0; i < GUARD_COUNT; i++) g_guards[i].on = IniInt(L"guard", g_guards[i].key, 1) != 0;
+    if (!g_logDir[0]) return;
+    _snwprintf_s(g_errorLog, _countof(g_errorLog), _TRUNCATE, L"%s\\riftstone_error.log", g_logDir);
+    wchar_t prev[MAX_PATH];
+    _snwprintf_s(prev, _countof(prev), _TRUNCATE, L"%s\\riftstone_error.prev.log", g_logDir);
+    if (GetFileAttributesW(g_errorLog) != INVALID_FILE_ATTRIBUTES) MoveFileExW(g_errorLog, prev, MOVEFILE_REPLACE_EXISTING);
+}
+
+// One UTF-8 line appended to the error log (under g_guardLock).
+static void ErrorLine(const wchar_t* fmt, ...) {
+    if (!g_errorLog[0]) return;
+    wchar_t line[1400];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnwprintf_s(line, _countof(line), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    char utf8[2800];
+    int n = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof utf8 - 2, NULL, NULL);
+    if (n <= 0) return;
+    utf8[n - 1] = '\r';
+    utf8[n] = '\n';
+    HANDLE h = Real_CreateFileW(g_errorLog, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(h, utf8, (DWORD)n + 1, &w, NULL);
+    CloseHandle(h);
+}
+
+void GuardsReport() {
+    if (!g_guardLockReady) return;
+    EnterCriticalSection(&g_guardLock);
+    ULONGLONG now = GetTickCount64();
+    for (int i = 0; i < GUARD_COUNT; i++) {
+        GuardState& g = g_guards[i];
+        LONG h = g.hits;
+        if (h == g.reported || (g.lines >= 50 && now - g.lastLine < 10000)) continue;
+        if (!g_errorLogStarted) {
+            wchar_t stamp[32];
+            Stamp(stamp, _countof(stamp));
+            ErrorLine(L"Riftstone guards, session of %s (%s): what the loader caught instead of letting the game stop. "
+                      L"Each line: time, guard, hits so far, where in the game, what it means, the last detail.",
+                      stamp, g_exeName);
+            g_errorLogStarted = TRUE;
+        }
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        DWORD where = (DWORD)g.where;
+        wchar_t at[64] = L"";
+        if (where && InImage(where))
+            _snwprintf_s(at, _countof(at), _TRUNCATE, L" at 0x%08lx (%s+0x%lx)", where, g_exeName,
+                         (unsigned long)(where - g_imageBase));
+        else if (where)
+            _snwprintf_s(at, _countof(at), _TRUNCATE, L" at 0x%08lx", where);
+        ErrorLine(L"%02u:%02u:%02u  %-16s %ld%s: %s%s%s", t.wHour, t.wMinute, t.wSecond, g.key, h, at, g.what,
+                  g.detail[0] ? L"; last: " : L"", g.detail);
+        if (g.reported == 0) LogLine(L"guard    %s: %s (riftstone_error.log has each)", g.key, g.what);
+        g.reported = h;
+        g.lines++;
+        g.lastLine = now;
+    }
+    LeaveCriticalSection(&g_guardLock);
+}
+
+// ---------------------------------------------------------------------------
 // missing textures
 
-// A 4x4 BC1 texture of middle grey with 3 mips (52 bytes).  Grey reads as a neutral colour and, in
-// a normal map's red/green, as a flat surface.  DDDA's header is revision 0x99, DDO's 0x9D.
+// A 4x4 BC1 texture with 3 mips (52 bytes): middle grey (neutral, and a flat surface in a normal map's red/green),
+// or magenta ([guard] missing_texture_look = magenta: easy to spot while making a mod).  DDDA's header is revision
+// 0x99, DDO's 0x9D.
 static BYTE g_standIn[52];
+static BOOL g_standInMagenta = FALSE;
 static void BuildStandIn() {
     const DWORD w1 = g_game == GAME_DDO ? 0x2000209Du : 0x20000099u;
     const DWORD words[4] = {0x00584554u /* TEX\0 */, w1, 3u | (4u << 6) | (4u << 19), 1u | (20u << 8) | (1u << 16)};
     memcpy(g_standIn, words, 16);
     const DWORD offsets[3] = {28, 36, 44};
     memcpy(g_standIn + 16, offsets, 12);
-    const BYTE block[8] = {0x10, 0x84, 0x10, 0x84, 0, 0, 0, 0};   // colour0 = colour1 = RGB565 grey
-    for (int i = 0; i < 3; i++) memcpy(g_standIn + 28 + 8 * i, block, 8);
+    const BYTE grey[8] = {0x10, 0x84, 0x10, 0x84, 0, 0, 0, 0};        // colour0 = colour1 = RGB565 grey
+    const BYTE magenta[8] = {0x1F, 0xF8, 0x1F, 0xF8, 0, 0, 0, 0};     // RGB565 (31, 0, 31)
+    for (int i = 0; i < 3; i++) memcpy(g_standIn + 28 + 8 * i, g_standInMagenta ? magenta : grey, 8);
 }
 
 static BOOL g_guard = FALSE;
@@ -341,7 +471,8 @@ static BOOL CALLBACK MakeStandIn(PINIT_ONCE, PVOID, PVOID*) {
     wchar_t dir[MAX_PATH], path[MAX_PATH], temp[MAX_PATH];
     _snwprintf_s(dir, _countof(dir), _TRUNCATE, L"%s\\standin", g_stateDir);
     CreateDirectoryW(dir, NULL);
-    _snwprintf_s(path, _countof(path), _TRUNCATE, L"%s\\missing-texture-%s.tex", dir, g_game == GAME_DDO ? L"ddo" : L"ddda");
+    _snwprintf_s(path, _countof(path), _TRUNCATE, L"%s\\missing-texture-%s%s.tex", dir, g_game == GAME_DDO ? L"ddo" : L"ddda",
+                 g_standInMagenta ? L"-magenta" : L"");
     if (!StandInOnDisk(path)) {
         _snwprintf_s(temp, _countof(temp), _TRUNCATE, L"%s.%lu.tmp", path, GetCurrentProcessId());
         HANDLE h = Real_CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -364,7 +495,10 @@ HANDLE GuardOpen(const wchar_t* fullPath, DWORD access, DWORD share, LPSECURITY_
                  DWORD flags, HANDLE templ) {
     (void)share; (void)disposition; (void)templ; (void)access;
     HANDLE own = ArchiveOpen(fullPath, sa, flags);      // the resource's own bytes, when an archive holds it
-    if (own != INVALID_HANDLE_VALUE) return own;
+    if (own != INVALID_HANDLE_VALUE) {
+        GuardHit(GUARD_FROM_ARCHIVES, 0, fullPath);
+        return own;
+    }
     if (!g_guard) return INVALID_HANDLE_VALUE;
     const wchar_t* dot = wcsrchr(fullPath, L'.');
     if (!dot || _wcsicmp(dot, L".tex") != 0) return INVALID_HANDLE_VALUE;
@@ -373,9 +507,51 @@ HANDLE GuardOpen(const wchar_t* fullPath, DWORD access, DWORD share, LPSECURITY_
                                 flags & ~(DWORD)FILE_FLAG_DELETE_ON_CLOSE, NULL);
     if (h == INVALID_HANDLE_VALUE) return h;
     LONG k = InterlockedIncrement(&g_fallbacks);
-    if (k <= 200) LogLine(L"guard    %s does not exist; the game gets a neutral stand-in texture instead of stopping", fullPath);
+    GuardHit(GUARD_MISSING_TEXTURES, 0, fullPath);
+    if (k <= 200) LogLine(L"guard    %s does not exist; the game gets a %s stand-in texture instead of stopping", fullPath,
+                          g_standInMagenta ? L"magenta" : L"neutral");
     LiveNote("last_fallback", fullPath);
     return h;
+}
+
+// A loose .tex that does not fit its own file (docs/stability-membrane.md, [guard] broken_textures): only
+// unambiguous breakage is caught, never a valid texture, so a good mod texture is never replaced.  rTexture's
+// header (tex.py): u32 magic "TEX\0", u32 (revision in the low 12 bits, 0x099 Dark Arisen / 0x09D Online),
+// u32 mip:6|width:13|height:13, u32 depth:8|..., then mip*depth absolute file offsets.  The file hook answers a
+// broken one as if it were missing (the archive's own copy, else the stand-in).
+BOOL TextureFileBroken(const wchar_t* path, wchar_t* why, size_t cap) {
+    HANDLE h = Real_CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;                 // unreadable: not this guard's call
+    LARGE_INTEGER size;
+    BYTE hdr[16];
+    DWORD got = 0;
+    BOOL haveSize = GetFileSizeEx(h, &size);
+    BOOL haveHdr = ReadFile(h, hdr, 16, &got, NULL) && got == 16;
+    auto say = [&](const wchar_t* msg) { if (why && cap) wcsncpy_s(why, cap, msg, _TRUNCATE); CloseHandle(h); return TRUE; };
+    if (!haveSize) { CloseHandle(h); return FALSE; }
+    if (!haveHdr) return say(L"shorter than a texture header");
+    DWORD magic = *(DWORD*)hdr, w1 = *(DWORD*)(hdr + 4), w2 = *(DWORD*)(hdr + 8), w3 = *(DWORD*)(hdr + 12);
+    if (magic != 0x00584554u) return say(L"not a TEX texture");
+    DWORD version = w1 & 0xFFF;
+    if (version != 0x099 && version != 0x09D) return say(L"an unknown texture revision");
+    DWORD mip = w2 & 0x3F, depth = w3 & 0xFF, width = (w2 >> 6) & 0x1FFF, height = (w2 >> 19) & 0x1FFF;
+    if (mip == 0 || depth == 0 || width == 0 || height == 0) return say(L"zero mips, depth or size");
+    uint64_t need = 16ULL + 4ULL * mip * depth;                 // the header and the offset table
+    if ((uint64_t)size.QuadPart < need) return say(L"truncated: no room for its mip offsets");
+    // Only a flat 2D texture (shape 0x20000) has its mips as one run of offsets that must sit inside the file;
+    // a cube (0x60000) stores six faces and a volume (0x30000) lays its mips out differently, so tex.py checks
+    // offsets only for flat textures.  Doing otherwise flags a valid cubemap as broken (seen in game 2026-09-28,
+    // DefaultCube_CM.tex), which would swap the game's reflections for the stand-in.
+    BOOL flat = ((w1 >> 12) & 0x70000) == 0x20000;
+    DWORD n = mip * depth;
+    if (flat && n <= 384) {
+        DWORD offs[384];
+        if (ReadFile(h, offs, 4 * n, &got, NULL) && got == 4 * n)
+            for (DWORD i = 0; i < n; i++)
+                if (offs[i] < 16 || (uint64_t)offs[i] > (uint64_t)size.QuadPart) return say(L"truncated: a mip is past the file's end");
+    }
+    CloseHandle(h);
+    return FALSE;
 }
 
 // ---------------------------------------------------------------------------
@@ -520,10 +696,21 @@ static BOOL WINAPI Hook_SetCursorPos(int x, int y) {
 }
 
 void FixesInstallHooks() {
+    GuardsInit();
+    wchar_t look[32];
+    IniStr(L"guard", L"missing_texture_look", L"grey", look, _countof(look));
+    g_standInMagenta = _wcsicmp(look, L"magenta") == 0;
     BuildStandIn();
     g_guard = IniInt(L"guard", L"missing_textures", 1) != 0 && (g_game == GAME_DDDA || g_game == GAME_DDO ||
                                                                  IniInt(L"loader", L"any_program", 0));
-    LogLine(L"guard    missing textures %s", g_guard ? L"get a neutral stand-in (riftstone\\standin)" : L"stop the game as usual");
+    GuardMark(GUARD_MISSING_TEXTURES, g_guard);
+    LogLine(L"guard    missing textures %s", !g_guard ? L"stop the game as usual"
+                                             : g_standInMagenta ? L"get a magenta stand-in (riftstone\\standin)"
+                                                                : L"get a neutral stand-in (riftstone\\standin)");
+    BOOL broken = IniInt(L"guard", L"broken_textures", 1) != 0 &&
+                  (g_game == GAME_DDDA || g_game == GAME_DDO || IniInt(L"loader", L"any_program", 0));
+    GuardMark(GUARD_BROKEN_TEXTURES, broken);
+    if (broken) LogLine(L"guard    a loose texture that does not fit its file is answered as missing (a good copy or the stand-in)");
     ResourcesInit();
     g_borderless = IniInt(L"window", L"borderless", 0) != 0;
     g_fill = IniInt(L"window", L"borderless_fill", 1) != 0;
@@ -600,6 +787,7 @@ static void ApplyFpsCeiling() {
 
 static const DWORD_PTR SHADOW_TABLE = 0x014292BC;
 static const CodeSite SHADOW_READER = {0x00DA97DA, {0x8B, 0x04, 0x85, 0xBC, 0x92, 0x42, 0x01, 0x85}, L"getShadowMapSize"};
+static DWORD g_shadowSet = 0;                    // the HIGH sun shadow size ApplyShadowSize wrote (0 = table untouched)
 
 static void ApplyShadowSize() {
     int size = IniInt(L"render", L"shadow_map_size", 0);
@@ -623,12 +811,537 @@ static void ApplyShadowSize() {
     if (!VirtualProtect(high, 4, PAGE_READWRITE, &old)) return;
     *high = (DWORD)size;
     VirtualProtect(high, 4, old, &old);
+    g_shadowSet = (DWORD)size;                    // FixesDeviceCreated bounds this to the GPU once the device exists
     LogLine(L"shadows  ShadowQuality=HIGH now draws %d px sun shadows (%d px for lamps and torches); was 2048", size, size / 2);
+}
+
+// The device the game created (graphics.cpp calls this once, before the first frame, with the GPU's texture
+// limits).  ApplyShadowSize raised the sun shadow map at start-up, before any device existed; a size past what
+// this GPU can create fails the shadow buffer's CreateTexture and takes the frame's depth pass down.  [guard]
+// shadow_buffers (on unless 0) bounds the raised size to the device's largest texture here -- the lamp maps are
+// half the sun, so they follow.  Vanilla (2048) is under every real device's limit, so this only ever touches a
+// size the loader itself raised, and never below what the GPU allows.
+void FixesDeviceCreated(DWORD maxTextureWidth, DWORD maxTextureHeight) {
+    if (g_shadowSet == 0 || !g_knownBuild) return;              // only a size we raised can exceed the GPU
+    if (IniInt(L"guard", L"shadow_buffers", 1) == 0) return;
+    DWORD maxDim = maxTextureWidth < maxTextureHeight ? maxTextureWidth : maxTextureHeight;
+    if (maxDim == 0) return;                                    // limits unknown: leave the raised size alone
+    if (!SiteMatches(SHADOW_READER) || !Readable((const void*)SHADOW_TABLE, 12)) return;
+    DWORD* tbl = (DWORD*)SHADOW_TABLE;
+    if (tbl[0] != 512 || tbl[1] != 1024 || tbl[2] != g_shadowSet) return;   // only our own, still-untouched raise
+    if (tbl[2] <= maxDim) return;                              // the GPU can make it
+    DWORD safe = maxDim & ~31u;                                // the largest multiple of 32 the GPU allows
+    if (safe == 0 || safe >= tbl[2]) return;
+    DWORD was = tbl[2], old;
+    if (!VirtualProtect(tbl + 2, 4, PAGE_READWRITE, &old)) return;
+    tbl[2] = safe;
+    VirtualProtect(tbl + 2, 4, old, &old);
+    g_shadowSet = safe;                                        // the bounded value is ours now
+    GuardHit(GUARD_SHADOW_BUFFERS, SHADOW_TABLE, NULL);
+    LogLine(L"shadows  this GPU's largest texture is %lu px; the %lu px sun shadow was bounded to %lu (lamps %lu)",
+            maxDim, was, safe, safe / 2);
+}
+
+// Whether the owner asked for a raised sun shadow map ([render] shadow_map_size).  Read straight from the ini, so
+// it is answerable before ApplyShadowSize runs -- live.cpp needs the device hook installed for the bound above.
+BOOL FixesShadowSizeSet() { return IniInt(L"render", L"shadow_map_size", 0) != 0; }
+
+// ---------------------------------------------------------------------------
+// ragdolls (DDDA build 2364871): a ragdoll's bodies live in a container (uRagdollExt and its kin) whose body data
+// (+0x38) holds the count at +0x68 >> 8, and whose +0x4C lists the bodies.  The game's own count (0x010805D0) is 0
+// while that data is not there yet; four walks read the count inline without that check, after checking only that
+// the container exists.  A goblin whose ragdoll was not set up yet stopped the game in the first of them (2026-09-27
+// 20:53, 0x00794942 reading 0x68, a horde of 50 at Gran Soren).  [guard] ragdoll_bodies (on unless 0): such a ragdoll has
+// no bodies, the game's own answer, so the walk sets nothing instead of stopping the game.
+//   0x00794930, 0x007949E0  every body of an enemy's ragdoll and its collision set gets a value (+8, +0xC): replaced
+//                           by the same walk that counts the game's way (and leaves in eax what the game's code does)
+//   0x008CF2D8, 0x00C2BAE0  the same count read inline for a character's ragdoll (+0x1EFC, +0x1EF8): a jump to a
+//                           check that skips the walk when the data or the body list is not there
+
+struct GuardSite {
+    DWORD_PTR va;
+    BYTE expect[18];
+    int len;                                     // bytes checked; the first ones are replaced by a jump
+    const wchar_t* what;
+};
+static const GuardSite RAGDOLL_SITES[] = {
+    {0x00794930, {0x8B, 0x47, 0x24, 0x53, 0x8B, 0x5C, 0x24, 0x08, 0x56, 0x85, 0xC0, 0x74, 0x4F, 0x8B, 0x48, 0x38, 0x33, 0xF6},
+     18, L"an enemy's ragdoll: every body's +8"},
+    {0x007949E0, {0x8B, 0x47, 0x24, 0x53, 0x8B, 0x5C, 0x24, 0x08, 0x56, 0x85, 0xC0, 0x74, 0x4F, 0x8B, 0x48, 0x38, 0x33, 0xF6},
+     18, L"an enemy's ragdoll: every body's +0xC"},
+    {0x008CF2D8, {0x8B, 0x48, 0x38, 0x33, 0xF6, 0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF, 0x76, 0x28, 0x85, 0xC0, 0x74, 0x0F},
+     18, L"a character's ragdoll (+0x1EFC)"},
+    {0x00C2BAE0, {0x8B, 0x48, 0x38, 0x33, 0xF6, 0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF, 0x89, 0x44, 0x24, 0x0C, 0x76, 0x1D},
+     18, L"a character's ragdoll (+0x1EF8)"},
+    // the game's own accessors, whose layout the walks below follow: the count (0 without data) and a body
+    {0x010805D0, {0x8B, 0x41, 0x38, 0x85, 0xC0, 0x74, 0x07, 0x8B, 0x40, 0x68, 0xC1, 0xE8, 0x08, 0xC3},
+     14, L"the ragdoll body count"},
+    {0x01080610, {0x8B, 0x41, 0x4C, 0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x04, 0x88, 0xC2, 0x04, 0x00},
+     13, L"a ragdoll body"},
+    // where the two inline walks go on (the loop) and where they go when there is nothing to walk
+    {0x008CF30E, {0x80, 0xBB, 0x6C, 0x2D, 0x00, 0x00, 0x00}, 7, L"after a character's walk (+0x1EFC)"},
+    {0x00C2BAF2, {0x8B, 0x50, 0x4C, 0x8B, 0x0C, 0xB2}, 6, L"a character's walk (+0x1EF8)"},
+    {0x00C2BB0F, {0x8B, 0x8F, 0xF8, 0x1E, 0x00, 0x00}, 6, L"after a character's walk (+0x1EF8)"},
+};
+static const int RAGDOLL_JUMPS = 4;              // the first four sites get a jump; the rest are only checked
+
+// The game's count (0x010805D0): 0 while the ragdoll's body data is not there.
+static DWORD RagdollCount(const BYTE* c) {
+    const BYTE* data = c ? *(BYTE* const*)(c + 0x38) : NULL;
+    return data ? *(const DWORD*)(data + 0x68) >> 8 : 0;
+}
+// A body (0x01080610, for i below the count): NULL when the list is not there either.
+static BYTE* RagdollBody(const BYTE* c, DWORD i) {
+    BYTE* const* list = *(BYTE* const* const*)(c + 0x4C);
+    return list ? list[i] : NULL;
+}
+// A container the game's own inline walks would read through a null pointer: no body data, or a count with no
+// body list.  (One with data and no bodies is the game's own "none" and is not counted.)
+static BOOL RagdollBroken(const BYTE* c) {
+    const BYTE* data = *(BYTE* const*)(c + 0x38);
+    return !data || ((*(const DWORD*)(data + 0x68) >> 8) && !*(BYTE* const* const*)(c + 0x4C));
+}
+static void RagdollGive(BYTE* body, DWORD field, DWORD value) {
+    if (!body) return;
+    BYTE* part = *(BYTE**)(body + 0x18);
+    if (part) *(DWORD*)(part + field) = value;
+}
+
+// 0x00794930 / 0x007949E0 with the game's count: the ragdoll's bodies (with the set's alongside), then the set's
+// (with the ragdoll's alongside), each index below its own container's count.  Returns what the game's code
+// leaves in eax: the set's count, or the ragdoll container when there is no set.
+extern "C" DWORD __stdcall RagdollSetBodies(BYTE* self, DWORD field, DWORD value) {
+    BYTE* ragdoll = *(BYTE**)(self + 0x24);
+    BYTE* set = *(BYTE**)(self + 0x20);
+    if ((ragdoll && RagdollBroken(ragdoll)) || (set && RagdollBroken(set)))
+        GuardHit(GUARD_RAGDOLL_BODIES, field == 8 ? 0x00794930 : 0x007949E0, NULL);
+    DWORD n = RagdollCount(ragdoll), m = RagdollCount(set);
+    for (DWORD i = 0; i < n; i++) {
+        RagdollGive(RagdollBody(ragdoll, i), field, value);
+        if (set && i < m) RagdollGive(RagdollBody(set, i), field, value);
+    }
+    if (!set) return (DWORD)(DWORD_PTR)ragdoll;
+    for (DWORD i = 0; i < m; i++) {
+        if (ragdoll && i < n) RagdollGive(RagdollBody(ragdoll, i), field, value);
+        RagdollGive(RagdollBody(set, i), field, value);
+    }
+    return m;
+}
+
+// Entered in place of the two functions (edi = the object, [esp+4] = the value, ret 4).
+__declspec(naked) static void RagdollSet08() {
+    __asm {
+        push dword ptr [esp + 4]
+        push 8
+        push edi
+        call RagdollSetBodies
+        ret 4
+    }
+}
+__declspec(naked) static void RagdollSet0C() {
+    __asm {
+        push dword ptr [esp + 4]
+        push 0x0C
+        push edi
+        call RagdollSetBodies
+        ret 4
+    }
+}
+
+// Entered in place of the inline count reads (eax = the ragdoll container, which the game checked or trusts): the
+// game's own instructions, then the walk only when the data and the body list are there.
+DWORD_PTR g_ragdollOn1 = 0x008CF2E6, g_ragdollOff1 = 0x008CF30E, g_ragdollOn2 = 0x00C2BAF2, g_ragdollOff2 = 0x00C2BB0F;
+// A walk that would have read through a null pointer: counted, every register and flag kept.
+extern "C" void __stdcall RagdollInlineHit(DWORD site) { GuardHit(GUARD_RAGDOLL_BODIES, site, NULL); }
+__declspec(naked) static void RagdollWalk1() {   // 0x008CF2D8
+    __asm {
+        mov ecx, [eax + 0x38]
+        xor esi, esi
+        test ecx, ecx
+        jz broken
+        test dword ptr [ecx + 0x68], 0xFFFFFF00
+        jbe nothing                             // no bodies: the game's own way out
+        cmp dword ptr [eax + 0x4C], 0
+        je broken
+        jmp dword ptr [g_ragdollOn1]
+    broken:
+        pushfd
+        pushad
+        push 0x008CF2D8
+        call RagdollInlineHit
+        popad
+        popfd
+    nothing:
+        jmp dword ptr [g_ragdollOff1]
+    }
+}
+__declspec(naked) static void RagdollWalk2() {   // 0x00C2BAE0
+    __asm {
+        mov ecx, [eax + 0x38]
+        xor esi, esi
+        mov [esp + 0x0C], eax
+        test ecx, ecx
+        jz broken
+        test dword ptr [ecx + 0x68], 0xFFFFFF00
+        jbe nothing
+        cmp dword ptr [eax + 0x4C], 0
+        je broken
+        jmp dword ptr [g_ragdollOn2]
+    broken:
+        pushfd
+        pushad
+        push 0x00C2BAE0
+        call RagdollInlineHit
+        popad
+        popfd
+    nothing:
+        jmp dword ptr [g_ragdollOff2]
+    }
+}
+
+static BOOL g_ragdollGuard = FALSE;              // for the reports
+
+static void ApplyRagdollGuard() {
+    g_ragdollGuard = FALSE;
+    GuardMark(GUARD_RAGDOLL_BODIES, FALSE);
+    if (IniInt(L"guard", L"ragdoll_bodies", 1) == 0 || g_game != GAME_DDDA) return;
+    if (!g_knownBuild) {
+        LogLine(L"ragdoll  guard not applied: this is not DDDA build 2364871");
+        return;
+    }
+    for (const GuardSite& s : RAGDOLL_SITES) {
+        if (!Readable((const void*)s.va, s.len) || memcmp((const void*)s.va, s.expect, s.len) != 0) {
+            LogLine(L"ragdoll  the code at 0x%08lx (%s) is not what build 2364871 has; nothing patched", (DWORD)s.va, s.what);
+            return;
+        }
+    }
+    void* const to[RAGDOLL_JUMPS] = {(void*)RagdollSet08, (void*)RagdollSet0C, (void*)RagdollWalk1, (void*)RagdollWalk2};
+    const int len[RAGDOLL_JUMPS] = {5, 5, 14, 18};     // the whole functions: a jump at the top; inline: the reads
+    for (int i = 0; i < RAGDOLL_JUMPS; i++) {
+        BYTE* at = (BYTE*)RAGDOLL_SITES[i].va;
+        DWORD old;
+        if (!VirtualProtect(at, len[i], PAGE_EXECUTE_READWRITE, &old)) {
+            LogLine(L"ragdoll  0x%08lx could not be made writable; the guard is partly in", (DWORD)(DWORD_PTR)at);
+            return;
+        }
+        at[0] = 0xE9;
+        *(int32_t*)(at + 1) = (int32_t)((BYTE*)to[i] - (at + 5));
+        for (int k = 5; k < len[i]; k++) at[k] = 0x90;
+        VirtualProtect(at, len[i], old, &old);
+    }
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    g_ragdollGuard = TRUE;
+    GuardMark(GUARD_RAGDOLL_BODIES, TRUE);
+    LogLine(L"ragdoll  guard on: a ragdoll whose bodies are not set up yet has none to walk (4 sites), instead of "
+            L"stopping the game");
+}
+
+// ---------------------------------------------------------------------------
+// the ragdoll body-count family (DDDA build 2364871): the four sites above are hand-written because each
+// does more than read the count (two set a field on every body, two are inline walks with their own loop).
+// A scan of DDDA.exe for the same idiom -- read [bodydata+0x68] through bodydata = [holder+0x38] with no
+// null-check -- found 55 more copies the compiler inlined across the enemy, physics and character update
+// code (tools were used to list them; docs/stability-membrane.md).  Two shapes, told apart by their bytes:
+//   'T'  test dword [reg+0x68], 0xFFFFFF00     (7 bytes: the "any bodies?" test before a walk; 47 sites)
+//   'C'  mov reg2,[reg+0x68] ; shr reg2, 8     (6 bytes: a count read feeding a loop; 8 sites)
+// Each site keeps its exact bytes, so the guard reproduces the game's own instruction when bodydata is set
+// and its "0 without data" answer when it is null, without needing to know the site's skip target: for 'T'
+// the null case leaves the flags an all-zero count would (test reg,reg on a null reg == test 0,imm), so
+// whatever branch follows takes its no-bodies path; for 'C' the null case leaves the count register 0.
+struct FamilySite {
+    DWORD_PTR va;
+    char kind;                                   // 'T' or 'C'
+    BYTE bytes[8];                               // the game's own instruction(s): 7 for 'T', 6 for 'C'
+};
+static const FamilySite FAMILY_SITES[] = {
+    {0x004C8ECB, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x004C8F06, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00794132, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x0079415F, 'C', {0x8B, 0x51, 0x68, 0xC1, 0xEA, 0x08}},
+    {0x0079419D, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x007941CF, 'C', {0x8B, 0x51, 0x68, 0xC1, 0xEA, 0x08}},
+    {0x0079421D, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x0079427C, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x007942ED, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00794354, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00794581, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x007945B4, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x0079469F, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x007946EA, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x007948CD, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00857323, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x0088D149, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x0088D179, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x0088D1B2, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x0088D2D5, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x0088D665, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x0088D6D6, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x009C0977, 'C', {0x8B, 0x70, 0x68, 0xC1, 0xEE, 0x08}}, {0x009C0B8D, 'C', {0x8B, 0x51, 0x68, 0xC1, 0xEA, 0x08}},
+    {0x009CA2EE, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x009CC086, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x009D53FF, 'C', {0x8B, 0x78, 0x68, 0xC1, 0xEF, 0x08}}, {0x00A1D58A, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00A1D5CB, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00A20147, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00A20186, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00A2358A, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00A235C2, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00A23D53, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00A23D8F, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00A2E0BA, 'C', {0x8B, 0x42, 0x68, 0xC1, 0xE8, 0x08}},
+    {0x00A2E14D, 'C', {0x8B, 0x42, 0x68, 0xC1, 0xE8, 0x08}}, {0x00A2E181, 'C', {0x8B, 0x42, 0x68, 0xC1, 0xE8, 0x08}},
+    {0x00AA951D, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00AA9554, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00BADF6C, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C1E100, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00C293AF, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C29A51, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00C2A20D, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C2A2CB, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00C2A330, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C2B785, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00C2CF16, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C2D3D4, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00C446F9, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C45E3D, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00C46698, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C524C8, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+    {0x00C52755, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
+};
+
+// A body walk that would have read through a null bodydata: counted (any thread, cheap), like the four above.
+extern "C" void __stdcall RagdollFamilyHit(DWORD site) { GuardHit(GUARD_RAGDOLL_BODIES, site, NULL); }
+
+// Emit one trampoline into `cur` (advanced) and return its entry.  `orig`/`len` are the site's own bytes;
+// `back` is where both paths continue (the site just past `orig`); `hit` is called only in the null case.
+//   test R,R ; jz null ; <orig> ; jmp back ; null: pushad;pushfd; push siteVA; call hit; popfd;popad;
+//   ['C' only] xor reg2,reg2 ; jmp back
+// R is the base of the read (orig[1] & 7); for 'C' reg2 is the count register ((orig[1] >> 3) & 7).
+static BYTE* EmitFamilyStub(BYTE*& cur, char kind, const BYTE* orig, int len, DWORD_PTR siteVA, DWORD_PTR back,
+                            void* hit) {
+    BYTE R = orig[1] & 7;
+    BYTE* entry = cur;
+    *cur++ = 0x85; *cur++ = (BYTE)(0xC0 + R * 9);                              // test R, R
+    *cur++ = 0x74; BYTE* jz = cur++;                                          // jz null (rel8, filled below)
+    memcpy(cur, orig, len); cur += len;                                       // the game's own instruction(s)
+    *cur++ = 0xE9; { int32_t r = (int32_t)(back - ((DWORD_PTR)cur + 4)); memcpy(cur, &r, 4); cur += 4; }  // jmp back
+    *jz = (BYTE)(cur - (jz + 1));                                             // null:
+    *cur++ = 0x60; *cur++ = 0x9C;                                             // pushad; pushfd
+    *cur++ = 0x68; memcpy(cur, &siteVA, 4); cur += 4;                         // push siteVA
+    *cur++ = 0xE8; { int32_t r = (int32_t)((DWORD_PTR)hit - ((DWORD_PTR)cur + 4)); memcpy(cur, &r, 4); cur += 4; }  // call hit
+    *cur++ = 0x9D; *cur++ = 0x61;                                            // popfd; popad
+    if (kind == 'C') { BYTE r2 = (orig[1] >> 3) & 7; *cur++ = 0x33; *cur++ = (BYTE)(0xC0 + r2 * 9); }     // xor reg2,reg2
+    *cur++ = 0xE9; { int32_t r = (int32_t)(back - ((DWORD_PTR)cur + 4)); memcpy(cur, &r, 4); cur += 4; }  // jmp back
+    return entry;
+}
+
+static const int RAG_CAVE_SIZE = 4096;           // 55 stubs of at most 36 bytes fit in one page
+static BYTE* g_ragCave = NULL;
+static int g_ragFamilyCount = 0, g_ragFamilySkipped = 0;
+
+// Applied after the four bespoke sites, under the same [guard] ragdoll_bodies key.  Each site is verified
+// byte-for-byte; a site that differs is left alone and the rest still go in (they are independent reads).
+static void ApplyRagdollFamily() {
+    g_ragFamilyCount = 0;
+    g_ragFamilySkipped = 0;
+    if (IniInt(L"guard", L"ragdoll_bodies", 1) == 0 || g_game != GAME_DDDA || !g_knownBuild) return;
+    if (!g_ragCave) {
+        g_ragCave = (BYTE*)VirtualAlloc(NULL, RAG_CAVE_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!g_ragCave) {
+            LogLine(L"ragdoll  family guard: no code cave available; the four-site guard still stands");
+            return;
+        }
+    }
+    BYTE* cur = g_ragCave;
+    for (const FamilySite& s : FAMILY_SITES) {
+        int len = s.kind == 'T' ? 7 : 6;
+        BYTE* at = (BYTE*)s.va;
+        if (!Readable(at, len) || memcmp(at, s.bytes, len) != 0) {
+            g_ragFamilySkipped++;
+            LogLine(L"ragdoll  family site 0x%08lx is not what build 2364871 has; left unguarded", (DWORD)s.va);
+            continue;
+        }
+        if (cur + 48 > g_ragCave + RAG_CAVE_SIZE) {
+            LogLine(L"ragdoll  family cave full after %d sites", g_ragFamilyCount);
+            break;
+        }
+        BYTE* stub = EmitFamilyStub(cur, s.kind, s.bytes, len, (DWORD_PTR)s.va, s.va + len, (void*)RagdollFamilyHit);
+        DWORD old;
+        if (!VirtualProtect(at, len, PAGE_EXECUTE_READWRITE, &old)) {
+            g_ragFamilySkipped++;
+            continue;
+        }
+        at[0] = 0xE9;
+        *(int32_t*)(at + 1) = (int32_t)(stub - (at + 5));
+        for (int k = 5; k < len; k++) at[k] = 0x90;
+        VirtualProtect(at, len, old, &old);
+        g_ragFamilyCount++;
+    }
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    LogLine(L"ragdoll  family guard: %d more body-count walks made safe%s; a ragdoll whose bodies are not set up "
+            L"yet reads a count of 0 (the game's own answer at 0x010805D0)", g_ragFamilyCount,
+            g_ragFamilySkipped ? L" (some sites differed and were left alone)" : L"");
+}
+
+// ---------------------------------------------------------------------------
+// GUI text fields (DDDA build 2364871): the world map crashed reading a null string (the owner's session of
+// 2026-09-27 22:56, at 0x00606628, with a Portcrystal count past the game's ten).  0x006065E0 sets a GUI text
+// field from a looked-up string: it calls the string lookup 0x00607960 (which returns null when the string is
+// not in sGameSys's table), then walks the result as a C string.  Its own guard tests the wrong pointer --
+// 0x0060661F tests sGameSys+0xA76D0 (the Arisen's cPlayerInfo, an address that is never null) instead of the
+// string -- so a null lookup walks address 0.  [guard] gui_text (on unless 0): a null string becomes the empty
+// string, so the field shows nothing (an unlabelled map icon) instead of stopping the game.  This is the
+// engine's own "no string" case; a mod with a Portcrystal or place name the game has no label for no longer
+// takes the map down.
+static char g_guiEmpty[1] = {0};                 // the empty string the null case reads instead of address 0
+DWORD_PTR g_guiBack = 0x00606626;                // the je the vanilla code reaches after mov ecx,eax; lea esi
+extern "C" void __stdcall GuiTextHit(DWORD site) { GuardHit(GUARD_GUI_TEXT, site, NULL); }
+
+// Entered in place of `mov ecx, eax; lea esi, [ecx+1]` at 0x00606621 (eax = the looked-up string, maybe null):
+// keep the game's two instructions, but when the string is null count it and use the empty string; leave the
+// flags the vanilla code's own `test` did (ecx non-null now, so its je takes the same branch as ever).
+__declspec(naked) static void GuiTextThunk() {
+    __asm {
+        test eax, eax
+        jnz  have
+        pushfd
+        pushad
+        push 0x006065E0
+        call GuiTextHit
+        popad
+        popfd
+        mov  eax, offset g_guiEmpty
+    have:
+        mov  ecx, eax
+        lea  esi, [ecx + 1]
+        test ecx, ecx
+        jmp  dword ptr [g_guiBack]
+    }
+}
+
+static const GuardSite GUI_TEXT_SITE = {0x00606621, {0x8B, 0xC8, 0x8D, 0x71, 0x01}, 5, L"the map's GUI text field"};
+static BOOL g_guiTextGuard = FALSE;
+
+static void ApplyGuiTextGuard() {
+    g_guiTextGuard = FALSE;
+    GuardMark(GUARD_GUI_TEXT, FALSE);
+    if (IniInt(L"guard", L"gui_text", 1) == 0 || g_game != GAME_DDDA || !g_knownBuild) return;
+    if (!Readable((const void*)GUI_TEXT_SITE.va, GUI_TEXT_SITE.len) ||
+        memcmp((const void*)GUI_TEXT_SITE.va, GUI_TEXT_SITE.expect, GUI_TEXT_SITE.len) != 0) {
+        LogLine(L"gui      the code at 0x%08lx (%s) is not what build 2364871 has; nothing patched", (DWORD)GUI_TEXT_SITE.va,
+                GUI_TEXT_SITE.what);
+        return;
+    }
+    BYTE* at = (BYTE*)GUI_TEXT_SITE.va;
+    DWORD old;
+    if (!VirtualProtect(at, 5, PAGE_EXECUTE_READWRITE, &old)) {
+        LogLine(L"gui      0x%08lx could not be made writable; nothing patched", (DWORD)GUI_TEXT_SITE.va);
+        return;
+    }
+    at[0] = 0xE9;
+    *(int32_t*)(at + 1) = (int32_t)((BYTE*)GuiTextThunk - (at + 5));
+    VirtualProtect(at, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    g_guiTextGuard = TRUE;
+    GuardMark(GUARD_GUI_TEXT, TRUE);
+    LogLine(L"gui      guard on: a GUI text field whose string is missing shows empty, instead of stopping the game "
+            L"(the world map's place labels with extra Portcrystals)");
+}
+
+// ---------------------------------------------------------------------------
+// foliage/water/effects streaming window (DDDA build 2364871, docs/re-engine-audit.md).  On stage 100,
+// uStageSplitCtrl loads cells by a window: models and collision use 5x5 (aStage+0x7F0/+0x7F4), but the swaying
+// foliage (updateFmMdl), the split_sub archives (updateArcSub), the effect providers (updateEpv) and the water
+// (updateWater) read the narrower 3x3 layout window (aStage+0x800/+0x804), so they pop in at the 3x3 edge while
+// the terrain is drawn well past it.  [render] wide_foliage (off unless 1) points those four updaters' reads at
+// the 5x5 model counts instead, so they stream about as far as the terrain.  Enemies and objects (updateLot)
+// keep 3x3.  Only the displacement in each `mov` changes (0x800 -> 0x7F0, 0x804 -> 0x7F4); no new code.  The
+// memory cost of the wider window in game is UNKNOWN (5x5 is ~2.8x the cells of 3x3), so it is off by default.
+struct StreamSite {
+    DWORD_PTR va;
+    BYTE expect[6];                              // mov reg, [aStage + 0x800 or 0x804]
+    DWORD newDisp;                               // 0x7F0 or 0x7F4 (the 5x5 model counts)
+    const wchar_t* what;
+};
+static const StreamSite STREAM_SITES[] = {
+    {0x00C5E776, {0x8B, 0x82, 0x00, 0x08, 0x00, 0x00}, 0x7F0, L"split_sub archives (X)"},
+    {0x00C5E77C, {0x8B, 0x92, 0x04, 0x08, 0x00, 0x00}, 0x7F4, L"split_sub archives (Z)"},
+    {0x00C613FE, {0x8B, 0x82, 0x00, 0x08, 0x00, 0x00}, 0x7F0, L"swaying foliage (X)"},
+    {0x00C61404, {0x8B, 0x9A, 0x04, 0x08, 0x00, 0x00}, 0x7F4, L"swaying foliage (Z)"},
+    {0x00C623DF, {0x8B, 0x82, 0x00, 0x08, 0x00, 0x00}, 0x7F0, L"effect providers (X)"},
+    {0x00C623E5, {0x8B, 0xB2, 0x04, 0x08, 0x00, 0x00}, 0x7F4, L"effect providers (Z)"},
+    {0x00C63225, {0x8B, 0x87, 0x00, 0x08, 0x00, 0x00}, 0x7F0, L"water (X)"},
+    {0x00C6322B, {0x8B, 0xBF, 0x04, 0x08, 0x00, 0x00}, 0x7F4, L"water (Z)"},
+};
+static BOOL g_wideFoliage = FALSE;
+
+static void ApplyStreamWindow() {
+    g_wideFoliage = FALSE;
+    if (IniInt(L"render", L"wide_foliage", 0) == 0 || g_game != GAME_DDDA || !g_knownBuild) return;
+    for (const StreamSite& s : STREAM_SITES)
+        if (!Readable((const void*)s.va, 6) || memcmp((const void*)s.va, s.expect, 6) != 0) {
+            LogLine(L"stream   0x%08lx (%s) is not what build 2364871 has; the window is left at 3x3", (DWORD)s.va, s.what);
+            return;
+        }
+    for (const StreamSite& s : STREAM_SITES) {
+        BYTE* disp = (BYTE*)s.va + 2;
+        DWORD old;
+        if (!VirtualProtect(disp, 4, PAGE_EXECUTE_READWRITE, &old)) continue;
+        *(DWORD*)disp = s.newDisp;
+        VirtualProtect(disp, 4, old, &old);
+    }
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    g_wideFoliage = TRUE;
+    LogLine(L"stream   wide_foliage on: swaying foliage, water and effects stream in the 5x5 window (was 3x3); "
+            L"enemies and objects keep 3x3");
+}
+
+// ---------------------------------------------------------------------------
+// effect-system dispatch (DDDA build 2364871): 0x010CBFA0 reads a tag byte at [a1+3] and returns a field by it.
+// When an effect's parameter block is laid out as Online lays it (the compat layer converts Online effects), a1
+// points nowhere and [a1+3] faults (crash 0x010CBFA4, seen three times 2026-09-26).  a1 is not null but garbage,
+// so a null-check would not catch it.  [guard] particles reimplements the function -- traced byte for byte from
+// 0x010CBFA0, with ecx = [a2+4] as both callers set it (0x010CFDCD, 0x010CFE54) -- inside a structured exception
+// frame: a fault in any of its reads is contained and the function returns the game's own default ([a3+0x14]),
+// the same as an unrecognised tag, instead of taking the game down.  Only this one function's reads are wrapped;
+// nothing else's exceptions are touched.
+static uint32_t EffectDispatchImpl(void* a1, void* a2, void* a3) {
+    BYTE tag = (BYTE)(*((BYTE*)a1 + 3)) & 7;                     // the read that faults on a bad a1
+    char* c2 = (char*)a2;
+    switch (tag) {
+        case 1: return *(uint32_t*)(c2 + 0x88);
+        case 2: { char* ecx = *(char**)(c2 + 4); return *(uint32_t*)(ecx + 0x10C); }
+        case 3: {
+            char* ecx = *(char**)(c2 + 4);
+            char* p = *(char**)(ecx + 0x1D0);
+            return p ? *(uint32_t*)(p + 0x10C) : *(uint32_t*)(ecx + 0x10C);
+        }
+        case 4: { char* g = *(char**)0x018D2818; return *(uint32_t*)(g + 0x74); }
+        default: return *(uint32_t*)((char*)a3 + 0x14);
+    }
+}
+extern "C" uint32_t __stdcall EffectDispatchGuarded(void* a1, void* a2, void* a3) {
+    __try {
+        return EffectDispatchImpl(a1, a2, a3);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        GuardHit(GUARD_PARTICLES, 0x010CBFA0, NULL);
+        __try { return *(uint32_t*)((char*)a3 + 0x14); }        // the game's own default, itself guarded
+        __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    }
+}
+static const GuardSite PARTICLE_SITE = {0x010CBFA0,
+    {0x8B, 0x44, 0x24, 0x04, 0x0F, 0xB6, 0x40, 0x03, 0x83, 0xE0, 0x07, 0x48}, 12, L"the effect dispatch"};
+static BOOL g_particleGuard = FALSE;
+
+static void ApplyParticleGuard() {
+    g_particleGuard = FALSE;
+    GuardMark(GUARD_PARTICLES, FALSE);
+    if (IniInt(L"guard", L"particles", 1) == 0 || g_game != GAME_DDDA || !g_knownBuild) return;
+    if (!Readable((const void*)PARTICLE_SITE.va, PARTICLE_SITE.len) ||
+        memcmp((const void*)PARTICLE_SITE.va, PARTICLE_SITE.expect, PARTICLE_SITE.len) != 0) {
+        LogLine(L"particle the code at 0x%08lx (%s) is not what build 2364871 has; nothing patched", (DWORD)PARTICLE_SITE.va,
+                PARTICLE_SITE.what);
+        return;
+    }
+    BYTE* at = (BYTE*)PARTICLE_SITE.va;
+    DWORD old;
+    if (!VirtualProtect(at, 5, PAGE_EXECUTE_READWRITE, &old)) {
+        LogLine(L"particle 0x%08lx could not be made writable; nothing patched", (DWORD)PARTICLE_SITE.va);
+        return;
+    }
+    at[0] = 0xE9;
+    *(int32_t*)(at + 1) = (int32_t)((BYTE*)EffectDispatchGuarded - (at + 5));
+    VirtualProtect(at, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    g_particleGuard = TRUE;
+    GuardMark(GUARD_PARTICLES, TRUE);
+    LogLine(L"particle guard on: a fault reading an effect's parameter block (a converted Online effect) is "
+            L"contained; the dispatch returns the game's default instead of stopping the game");
 }
 
 void FixesApplyPatches() {
     ApplyFpsCeiling();
     ApplyShadowSize();
+    ApplyRagdollGuard();
+    ApplyRagdollFamily();
+    ApplyGuiTextGuard();
+    ApplyStreamWindow();
+    ApplyParticleGuard();
 }
 
 // ---------------------------------------------------------------------------

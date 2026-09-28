@@ -20,11 +20,13 @@ fixes eleven faults a review found in 0.3.2, each reproduced in the harness firs
 |---|---|---|---|
 | Crash reports | `riftstone\logs\crash-<time>.txt` + `.dmp`: the fault, which plugin or module it is in, the **engine class** of each object in the registers and on the stack (`uEm5200`, `sSetManager`...), memory headroom with a verdict when the game ran out of address space, the stage, the last files opened, the files it looked for and did not find. A stack overflow gets one too (written from a helper thread) | on | both |
 | Fatal-error reports | the game's own "Failed open file" box becomes `fatal-<time>.txt` (the missing file, what it means) and the box gains one line naming it | on | both |
-| Hang reports | no frame for 20 s while the game is in front: `hang-<time>.txt` with where the main thread waits. The game is not touched | on | both |
+| Hang reports | no frame for 20 s while the game is in front, or while Windows calls it not responding (since 1.0.2: a frozen fullscreen game is usually behind the desktop by the time its player got out, and one ended at shutdown on 2026-09-27 left no report): `hang-<time>.txt` with where the main thread waits, and with `minidump = 1` every thread's state in `hang-<time>.dmp`, written on a thread of its own that the watch gives 30 s. The game is not touched | on | both |
+| **Snapshots** (1.0.2) | `riftstone snapshot` sets `Local\RiftstoneSnapshot-<pid>` (the live thread creates it and checks it every quarter second): the same report as a hang, `snapshot-<time>.txt`, and every thread in `snapshot-<time>.dmp` while the game goes on (its main thread is paused only while its registers and stack are read, and every thread while the dump is written); `riftstone threads` reads any of the loader's dumps and groups the threads by what they are in. Snapshots are not problems: `doctor`, `playtest` and Studio leave them out | with live stats | both |
 | **Why the game closed** | a normal exit leaves no report, so the loader watches it happen: Alt+F4 (and whether the key came from the keyboard or a program), the close button or window menu, a close message from another program, Windows ending the session, the game's own exit menu, its fatal error. `loader.log` gets an `exit` line and the exit summary ends `ended by: ...`; `runtime-state.ini` keeps it; `Riftstone.cmd crash`, `doctor` and Studio's Game tab say it, and whether it was a crash | on | both (the exit menu: DDDA 2364871) |
 | Report rotation | the newest 10 of each kind; `loader.prev.log` keeps the last session's log | on | both |
 | **Missing-texture guard** | a texture the game needs and cannot find gets a neutral 4x4 grey stand-in instead of stopping the game; `loader.log` names it | on | both |
 | **Archive guard** (1.0.1) | a resource the game asks for as a loose file before its archive was read (a skipped cutscene, a slow drive) gets its own bytes from that archive instead of stopping the game; `loader.log` names it and the archive | on | DDDA |
+| **Ragdoll guard** (1.0.2) | `[guard] ragdoll_bodies`: a ragdoll whose bodies are not set up yet (an enemy just spawned in a big horde) counts as having none, the game's own answer, in four walks that read the count through a null pointer instead (the crash of 2026-09-27: 50 goblins at Gran Soren) | on | DDDA 2364871 |
 | **Safe mode** | two crashes in a row during start-up that no plugin explains: the next runs start without plugins and without the overlay (vanilla), with one notice box, until a mod or plugin changes or `Riftstone.cmd loader safe-mode off` | on | both |
 | **Plugin quarantine** | a plugin whose code was at fault in two start-up crashes in a row is skipped until its file changes (`Riftstone.cmd loader plugin release <name>`) | on | both |
 | Live stats | shared memory `Local\RiftstoneLive`: address space used and the largest free block, peak commit and a memory verdict (headroom/tight/bound), frame times (Present), stutters, overlay/missing/stand-in counters, plugins, the stage, enemy slots in use, the resource table's fill, what Direct3D holds by pool and which Direct3D 9 it is, the pressure watch | on | both (stage, enemies, resources: DDDA) |
@@ -179,6 +181,20 @@ safe mode and the window fixes need no engine address at all.
   `0x99`, then succeeds when the texture can be created from its header; the stand-in is a valid 4x4 BC1
   texture with 3 mips (DDO's gets revision `0x9D`).
   Intercepting the box alone could not help: `exit(1)` follows it regardless.
+- **The ragdoll guard** (1.0.2, `fixes.cpp`, `[guard] ragdoll_bodies = 1`). A ragdoll's bodies live in a container
+  (`uRagdollExt` and its kin) whose body data at `+0x38` holds the count (`+0x68 >> 8`) and whose `+0x4C` lists the
+  bodies. The game's own count is 0 while that data is not there: `8B 41 38 85 C0 74 07 8B 40 68 C1 E8 08 C3` at
+  `0x010805D0`. Four walks read the count inline after checking only the container:
+  `8B 48 38 33 F6 F7 41 68 00 FF FF FF` at `0x0079493D` (and at `0x007949ED`, `0x008CF2D8`, `0x00C2BAE0`). The owner's
+  session of 2026-09-27 ended there: an access violation at `0x00794942` reading `0x68`, a goblin's `uRagdollExt` in
+  `eax` and its data pointer 0, with about 50 enemies at Gran Soren. The first two walks (every body of an enemy's
+  ragdoll and its collision set gets a value at `+8` or `+0xC`; `0x00794930`, `0x007949E0`) are replaced by the same
+  walk counting the game's way; the two inline reads (a character's ragdoll, `+0x1EFC` and `+0x1EF8`) jump to a
+  check that skips the walk when the data or the body list is missing. Every site, the two accessors and the
+  inline walks' continuations are byte-verified first; one differing byte patches nothing. The engine harness runs
+  the game's own code: unguarded, a ragdoll without its data faults at `0x00794942`; guarded, complete ragdolls get
+  the same values and leave the same `eax`, and the one without data walks nothing. Whether a goblin whose
+  ragdoll was not set up in time falls right in game: UNKNOWN.
 - **The archive guard** (1.0.1, `resources.cpp`, `[guard] from_archives = 1`). The same path stops the game
   for any resource, not only a texture, whenever the game asks for it before the archive that holds it has
   been read. Players report it at the ending's cutscenes: `"Failed open file.
@@ -458,7 +474,14 @@ overlay over a chained DXVK (Steam hooks Windows' own `d3d9.dll`), DDO with it (
 Release: CreateTexture, CreateVolumeTexture, CreateCubeTexture, CreateVertexBuffer and CreateIndexBuffer in the
 device's function table, and Release in the table of each kind of object (every level as the object reports
 them; block-compressed formats by their 4x4 blocks). What the loader creates itself (the F10 panel) is not
-counted. The live page, `Riftstone.cmd live`, crash reports and the exit summary carry it, for example
+counted. Since 1.0.2 the counters' lock is never held across a call into Direct3D: a Release runs the runtime's
+own Release first and takes the lock only when the object is gone, and a creation stamp on each counted object
+keeps an address the runtime hands out again meanwhile from being taken for the released one. Before, the lock
+was held across the runtime's Release, which takes the device's own lock on DDDA's multithreaded device, so every
+texture the game created waited behind every release: in the loader harness (`d3d9race`, four threads releasing
+textures and their surfaces while one creates and one draws) creation ran 3.7 times faster after the change, and
+the counters stayed exact. The loader's own threads (the live page, the hang watch) never wait for this lock;
+a busy lock keeps the last numbers. The live page, `Riftstone.cmd live`, crash reports and the exit summary carry it, for example
 *Direct3D 9: Windows' own (C:\WINDOWS\SYSTEM32\d3d9.dll); managed textures and buffers 1,234 MB*. The
 runtime is named by where the game's Direct3DCreate9 went: the chained DLL when it answered, else the
 `d3d9.dll` the game loaded; not by the import's target, where Windows' compatibility shims (`apphelp.dll`) can
