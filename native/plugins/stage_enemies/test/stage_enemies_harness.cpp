@@ -189,8 +189,10 @@ static int Run(int argc, wchar_t** argv) {
     Check(g_resolve("173") == 173, "a raw number is taken as the tag");
     Check(g_resolve("em9999") == 0, "an enemy with no archive resolves to 0 (skipped, not queued)");
 
-    if (profile == L"off") {
-        Check(memcmp((const void*)SITE, SITE_BYTES, sizeof SITE_BYTES) == 0, "Enabled=0: the stage loader is left as it is");
+    if (profile == L"off" || profile == L"shipped") {
+        Check(memcmp((const void*)SITE, SITE_BYTES, sizeof SITE_BYTES) == 0,
+              profile == L"off" ? "Enabled=0: the stage loader is left as it is"
+                                : "the shipped ini lists no stage: the stage loader is left as it is");
         printf(g_fails ? "\n%d check(s) FAILED\n" : "\nall checks passed\n", g_fails);
         return g_fails ? 1 : 0;
     }

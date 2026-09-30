@@ -703,6 +703,22 @@ def _closest_in_triangle(corners, x: float, z: float) -> tuple:
     return qx + (mx - qx) * 1e-3, qz + (mz - qz) * 1e-3
 
 
+def backdrop(mesh: "Mesh") -> dict:
+    """The mesh as a picture, for a map seen from above: ``verts`` is x, z, x, z ... in whole game units, ``tris``
+    three vertex numbers each.  Only the vertices the triangles use, renumbered from 0."""
+    order: dict[int, int] = {}
+    verts: list[int] = []
+    tris: list[int] = []
+    for corners in mesh.tris:
+        for c in corners:
+            if c not in order:
+                order[c] = len(verts) // 2
+                p = mesh.positions[c]
+                verts += [round(p[0]), round(p[2])]
+            tris.append(order[c])
+    return {"verts": verts, "tris": tris}
+
+
 # -- a stage's mesh and its doors --------------------------------------------------------------------------
 _MESHES: dict = {}
 

@@ -2904,6 +2904,7 @@ def t_package_plugins(data: bytes) -> None:
     cleanly with nothing written, or one zip for the game folder -- the loader, each plugin and each plugin's .ini
     once, one README, a manifest listing exactly its members, no game data (every member audited) -- that writes
     nothing else."""
+    import re
     import shutil
     import zipfile
 
@@ -2973,19 +2974,32 @@ def t_package_plugins(data: bytes) -> None:
     with zipfile.ZipFile(out) as z:
         names = z.namelist()
         assert len(names) == len(set(names)), "a path is in the zip twice"
-        assert {"dinput8.dll", "riftstone_loader.ini", "riftstone/package.json"} <= set(names)
+        assert {"dinput8.dll", "riftstone_loader.ini", "riftstone/package.json", package.START_HERE} <= set(names)
         assert sum(1 for n in names if n.startswith("README - ") and n.endswith(".txt")) == 1, "one README"
         assert not [n for n in names if n.startswith(("riftstone/overlay/", "mods/"))], "game data in the zip"
         found = [f for n in names for f in ipaudit.scan_bytes(n, z.read(n))]
         assert not found, f"the zip carries {found[:3]}"
         man = json.loads(z.read("riftstone/package.json"))
         assert set(man["files"]) == set(names) - {"riftstone/package.json"}, "the manifest does not list the zip"
+        def home(stem: str) -> str:                     # Riftstone's own features start off (1.0.3), the rest on
+            own_off = stem.lower() in package.OWN_PLUGINS and stem.lower() not in package.DEFAULT_ON
+            return "riftstone/plugins/off/" if own_off else "riftstone/plugins/"
+
         assert sorted(n for n in names if n.startswith("riftstone/plugins/") and n.endswith((".asi", ".dll"))) == \
-            sorted(f"riftstone/plugins/{p.name}" for p in plugins), "the plugins are not what was asked"
-        want_inis = {p.with_suffix(".ini").name.lower() for p in plugins if p.with_suffix(".ini").is_file()}
-        got_inis = [n[len("riftstone/plugins/"):].lower() for n in names
-                    if n.startswith("riftstone/plugins/") and n.endswith(".ini")]
-        assert sorted(got_inis) == sorted(want_inis), "each plugin's settings go in once"
+            sorted(home(p.stem) + p.name for p in plugins), "the plugins are not what was asked"
+        want_inis = {home(p.stem) + p.with_suffix(".ini").name.lower() for p in plugins if p.with_suffix(".ini").is_file()}
+        got_inis = [n.lower() for n in names if n.startswith("riftstone/plugins/") and n.endswith(".ini")]
+        assert sorted(got_inis) == sorted(want_inis), "each plugin's settings go in once, beside their plugin"
+        text = z.read(package.START_HERE).decode("ascii")   # the batch file: ASCII, CRLF, nothing cmd.exe would act on
+        assert "\n" not in text.replace("\r\n", ""), "the Start Here file is not CRLF throughout"
+        assert "@VERSION@" not in text and "@PLUGIN_NAMES@" not in text and "@DESCRIPTIONS@" not in text, "an unfilled part"
+        known = re.search(r'^set "KNOWN=([^"]*)"', text, re.M)
+        assert known is not None and all(re.fullmatch(r"[A-Za-z0-9_]+", n) for n in known.group(1).split()), "KNOWN"
+        flat = text.replace("\r\n", "\n")               # the generated labels: a name, its title and its line, no more
+        labels = re.findall(r'^:desc_(\w+)\nset "TITLE=([^\n]*)"\nset "WHAT=([^\n]*)"\nexit /b 0$', flat, re.M)
+        assert sorted(n for n, _, _ in labels) == sorted(known.group(1).split()), "a label per name"
+        for _, title, what in labels:
+            assert not set('%!"^&|<>') & set(title + what), f"a description cmd.exe would act on: {title!r} {what!r}"
         optional = [n for n in names if n.startswith("optional/")]
         assert "xinput1_3.dll" not in names, "Ninput where the game would load it"
         if ninput is None:

@@ -22,6 +22,8 @@ reads and rewrites files in the copy of the game *you own*, on your own machine.
 **1. Modernizes Dark Arisen** — a drop-in loader (`dinput8.dll`) plus native plugins that lift old engine
 limits. **The loader and plugins never modify your game files** — your mods load from an overlay folder,
 and `nativePC` is left untouched: since 1.0.1 Dark Arisen mods install only through that overlay.
+Since 1.0.3 the player package ships every gameplay feature below **switched off** (the crash guards and the
+save backup are on); `Riftstone - Start Here.cmd` turns each one on when you want it.
 
 - **Bigger battles** — the engine's hard 10-enemy limit becomes **30 by default, up to 64**.
 - **Pawn inclination lock** — Come! / Help! / Go! stop dragging your main pawn toward Guardian.
@@ -32,12 +34,16 @@ and `nativePC` is left untouched: since 1.0.1 Dark Arisen mods install only thro
 - **Archive guard** (1.0.1) — when the game asks for a file before its archive has been read (a skipped
   cutscene, a slow drive), it gets that file's own bytes from the archive instead of stopping with
   "Failed open file".
-- **F10 diagnostics panel** — active enemies, frame rate, memory headroom, plugin status.
+- **Diagnostics panel** (press **Insert**) — active enemies, frame rate, memory headroom, plugin status.
+  For about 12 seconds after the game starts, a small **RUNNING** notice in the top-right corner shows that
+  Riftstone is loaded.
 - **DXVK integration** — chains DXVK's `d3d9.dll` to relieve the 32-bit game's address-space pressure.
 
 > **Honesty:** every plugin is verified in a test harness against the *real* game code; their *in-game
 > feel* is still being playtested. The file-format toolkit below, by contrast, is byte-for-byte proven
-> across the entire game.
+> across the entire game. The start-up notice and the Insert panel (1.0.3) are drawn and read back in the
+> loader's test harness; in the actual game they have not been seen yet, and `riftstone\logs\loader.log`
+> records whether they were.
 
 **2. A full modding toolkit (Studio)** — a local browser app (sends nothing anywhere), or the CLI:
 
@@ -65,16 +71,21 @@ dyes, all generated from *your own* DDO files. See [docs/ddo-solo.md](docs/ddo-s
 
 ## Install (players)
 
-Download the player package, unzip it into your game folder (where `DDDA.exe` is), and launch. Press
-**F10** in-game for the diagnostics panel. To uninstall, delete `dinput8.dll`, `riftstone_loader.ini` and
-the `riftstone` folder. `optional\ninput` holds Ninput, an experimental plugin host: it stays off unless you
+Download the player package and unzip everything into your game folder (where `DDDA.exe` is). Then
+double-click **`Riftstone - Start Here.cmd`** (it needs no Python): **1** checks the install and says what
+to fix, **2** turns features on, one at a time (they start off; only the save backup is on). Start the
+game: for about 12 seconds a small **RUNNING** notice shows in the top-right corner, and **Insert** opens
+the diagnostics panel. To uninstall, delete `dinput8.dll`, `riftstone_loader.ini`, the `riftstone` folder
+and the Start Here file. `optional\ninput` holds Ninput, an experimental plugin host: it stays off unless you
 copy its `xinput1_3.dll` next to `DDDA.exe` (its README says more).
 
 ## Use the toolkit
 
 ```
+Riftstone.cmd             # a double-click works too: a menu (Studio, check my setup, features, logs)
 Riftstone.cmd studio      # the browser app
 Riftstone.cmd doctor      # check your setup
+Riftstone.cmd plugins     # turn Riftstone's features on and off
 ```
 
 New here? Start with **[docs/tutorial.md](docs/tutorial.md)**. Format details are in

@@ -145,3 +145,11 @@ updates. Removal: `riftstone loader plugin remove inclination_lock.asi`.
   hotkey layer (`input_register_hotkey`).
 - The save's `mInfo[...]` values could be read and set by a save tool (`src/riftstone/saves.py`
   unpacks the XML) instead of by elixirs.
+- **Does the lock stop pawns looting?** A player asked (Nexus, 2026-09-27) whether it can. What is measured is the
+  drift: `calcGather` (`0x00411E40`) feeds the Acquisitor value (`GATHER`, elixir 1528), and the lock stops that value,
+  and every other, from moving. What that value changes in play (which item pick-ups, chest openings or house visits
+  belong to Acquisitor, and whether any pawn does them at any value) is **not measured**: the game's text and resource
+  names hold nothing about looting (searches for loot, gather, collect, pick up and steal find only stage and room
+  names), so the behaviour is in the AI code or its tables, not yet located. Until it is, the honest answer is "reset
+  the inclination, freeze it, and tell us what you see", not "it stops looting". The reset and the lock together are
+  what exists today; a switch that zeroes the value each frame would need the reader of `GATHER` found first.

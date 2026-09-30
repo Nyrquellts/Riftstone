@@ -78,6 +78,31 @@ class PluginTest(unittest.TestCase):
         self.assertEqual(loader.list_plugins(self.game), [])
         self.assertTrue((self.game.root / "DDDA.exe").is_file())
 
+    def test_the_panel_key_default_is_insert_and_an_old_f10_default_moves(self):
+        """1.0.3: the panel key was F10 (a system key in the game's window; a player's F10 only hid the HUD).  A
+        settings file that still holds it takes Insert when the loader updates; any other key stays."""
+        ini = self.game.root / "riftstone_loader.ini"
+        self.assertEqual(loader.panel_key(self.game), "Insert")                       # no settings file yet
+        ini.write_text("[fps]\nmax_fps = 165\n[overlay]\nkey = F10\nposition = bottom-left\n", encoding="utf-8")
+        self.assertEqual(loader.panel_key(self.game), "F10")
+        loader._write_ini(self.game, "")
+        values = loader._ini_values(ini.read_text(encoding="utf-8"))
+        self.assertEqual(values["overlay"]["key"], "Insert")
+        self.assertEqual((values["overlay"]["position"], values["fps"]["max_fps"]), ("bottom-left", "165"))   # kept
+        self.assertEqual(loader.panel_key(self.game), "Insert")
+        ini.write_text("[overlay]\nkey = F7\n", encoding="utf-8")                     # the owner's own choice stays
+        loader._write_ini(self.game, "")
+        self.assertEqual(loader.panel_key(self.game), "F7")
+        ini.write_text("[overlay]\nkey = f10\n", encoding="utf-8")                    # any spelling of the old default
+        loader._write_ini(self.game, "")
+        self.assertEqual(loader.panel_key(self.game), "Insert")
+
+    def test_the_shipped_settings_name_the_new_key_and_the_banner(self):
+        text = (Path(__file__).resolve().parents[1] / "native" / "loader" / "riftstone_loader.ini").read_text(
+            encoding="utf-8")
+        values = loader._ini_values(text)["overlay"]
+        self.assertEqual((values["key"], values["banner"], values["banner_seconds"]), ("Insert", "1", "12"))
+
 
 if __name__ == "__main__":
     unittest.main()

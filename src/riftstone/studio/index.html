@@ -715,9 +715,9 @@ pre.code { padding: 14px 18px; white-space: pre; }
           <div class="card gtext">
             <h2 class="gtitle display"><span class="g-en">What Riftstone is</span><span class="g-ja">リフトストーンとは</span></h2>
             <p class="g-en">Riftstone is a fan-made modding suite for <b>Dragon's Dogma: Dark Arisen</b> and <b>Dragon's Dogma Online</b>. It reads the games' own files and lets you change them — enemies, spawns, skins, items, text, textures and more — then rebuilds them <b>byte for byte</b>, so nothing else in a file changes. Every format is checked against every matching file in the game.</p>
-            <p class="g-en">The Riftstone loader runs your mods without overwriting the game's files, loads plugins (more enemies at once, less pop-in, enemy skins, save copies) and explains any crash. Press <b>F10</b> in game for the diagnostics panel.</p>
+            <p class="g-en">The Riftstone loader runs your mods without overwriting the game's files, loads plugins (more enemies at once, less pop-in, enemy skins, save copies) and explains any crash. A small RUNNING notice shows when the game starts; press <b>Insert</b> in game for the diagnostics panel.</p>
             <p class="g-ja">リフトストーンは<b>『ドラゴンズドグマ:ダークアリズン』</b>と<b>『ドラゴンズドグマ オンライン』</b>のためのファン製 MOD ツールです。ゲーム自身のファイルを読み込み、敵・出現・スキン・アイテム・テキスト・テクスチャなどを編集し、<b>バイト単位でそのまま</b>組み直します。編集した箇所以外は一切変わりません。</p>
-            <p class="g-ja">リフトストーンのローダーはゲーム本体のファイルを上書きせずに MOD を読み込み、プラグイン（同時に出現する敵の増加、ポップインの軽減、敵スキン、セーブのコピー）を読み込み、クラッシュの原因を説明します。ゲーム中に <b>F10</b> で診断パネルを表示します。</p>
+            <p class="g-ja">リフトストーンのローダーはゲーム本体のファイルを上書きせずに MOD を読み込み、プラグイン（同時に出現する敵の増加、ポップインの軽減、敵スキン、セーブのコピー）を読み込み、クラッシュの原因を説明します。ゲーム開始時に小さな「RUNNING」表示が出ます。ゲーム中に <b>Insert</b> キーで診断パネルを表示します。</p>
           </div>
         </div>
 
@@ -1051,7 +1051,9 @@ const QUICK = {
   six_skill_warrior: [["warrior", "Mode", "Warrior skills", "choice", ["six", "off"], 0, 0, "six: a Warrior (you or a pawn) equips six skills like a staff; the second row fires with the secondary-weapon skill button. off: the game's three."]],
   loader: [["fps", "max_fps", "Frame-rate limit", "stepper", 0, 360, 5, "The options menu's Variable frame rate becomes this many fps (0: the game's 150)."],
            ["render", "shadow_map_size", "Sun shadows", "choice", ["0", "2048", "4096", "8192"], 0, 0, "Shadow map size with ShadowQuality HIGH (0: the game's 2048). Bigger is sharper and costs video memory."],
-           ["overlay", "key", "Diagnostics panel key", "choice", ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"], 0, 0, "Shows and hides the in-game panel."],
+           ["overlay", "key", "Diagnostics panel key", "choice", ["Insert", "Delete", "Home", "End", "PageUp", "PageDown", "Pause", "ScrollLock", "PrintScreen", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"], 0, 0, "Shows and hides the in-game panel. Insert unless you change it; the game's window treats F10 as a system key."],
+           ["overlay", "banner", "Startup notice", "switch", 0, 0, 0, "A small notice for a few seconds after the game starts: Riftstone is running, which key opens the panel, how many plugins loaded. If you never see it, Riftstone is not loaded (run Riftstone.cmd, choice 2)."],
+           ["overlay", "banner_seconds", "Startup notice length", "stepper", 3, 60, 1, "How many seconds the notice stays."],
            ["window", "borderless", "Borderless window", "switch", 0, 0, 0, "With the game set to windowed: no frame, covering the monitor."],
            ["window", "background_run", "Keep running when alt-tabbed", "switch", 0, 0, 0, "Windowed or borderless only."]],
 };
@@ -1221,7 +1223,7 @@ function renderInspector(it) {
   const tabs = isLoader ? [["overview", "Overview"], ["settings", "Settings"]] : [["overview", "Overview"], ["settings", "Settings"], ["log", "Log"]];
   if (!tabs.some(t => t[0] === L.tab)) L.tab = "overview";
   const title = isLoader ? "Riftstone loader" : (p.title || p.name), sub = isLoader
-    ? "Serves your mods without touching the game's files, loads the plugins, draws the F10 diagnostics panel and explains crashes."
+    ? "Serves your mods without touching the game's files, loads the plugins, draws the diagnostics panel and explains crashes."
     : (p.summary || "A native plugin the loader loads when the game starts.");
   html = `<div class="ititle">${esc(title)}</div><div class="isub">${esc(sub)}</div>${subtabs(tabs)}`;
   if (L.tab === "overview") {
@@ -1466,7 +1468,33 @@ async function worldFind() {
 async function loadStage(n) {
   const r = await api("world/stage?n=" + n);
   W.st = r; W.hl = null; W.sel = null; W.plan = null; W.spot = null; W.view = null; W.dungeon = null;
+  W.backPath = null; W.backKind = "";
   renderStageList(); renderStage();
+  loadBackdrop(r.stage);
+}
+// The ground behind the dots: the stage's navigation mesh (where the game's walkers stand), or for the open field
+// the terrain cells that hold something.  It arrives after the dots and is drawn under them; no picture is no error.
+async function loadBackdrop(stage) {
+  try {
+    const b = await api("world/backdrop?n=" + stage);
+    if (!W.st || W.st.stage !== stage) return;
+    W.backKind = b.kind; W.backPath = backdropPath(b);
+    if (W.backPath) drawWorld();
+  } catch (e) { /* the dots alone */ }
+}
+function backdropPath(b) {
+  const p = new Path2D();
+  if (b.kind === "nav") {
+    const v = b.verts, t = b.tris;
+    for (let i = 0; i < t.length; i += 3) {
+      const a = t[i] * 2; let c = t[i + 1] * 2, d = t[i + 2] * 2;
+      if ((v[c] - v[a]) * (v[d + 1] - v[a + 1]) - (v[d] - v[a]) * (v[c + 1] - v[a + 1]) < 0) { const x = c; c = d; d = x; }   // one winding, so overlapping floors never cancel
+      p.moveTo(v[a], v[a + 1]); p.lineTo(v[c], v[c + 1]); p.lineTo(v[d], v[d + 1]); p.closePath();
+    }
+    return p;
+  }
+  if (b.kind === "cells") { for (const [x, z] of b.cells) p.rect(x, z, b.size, b.size); return p; }
+  return null;
 }
 function renderStage() {
   const r = W.st, counts = {};
@@ -1576,6 +1604,11 @@ function drawWorld() {
   for (let x = Math.ceil((v.cx - Wd / 2 / v.k) / step) * step; x < v.cx + Wd / 2 / v.k; x += step) { g.moveTo(sx(x), 0); g.lineTo(sx(x), Hd); }
   for (let z = Math.ceil((v.cz - Hd / 2 / v.k) / step) * step; z < v.cz + Hd / 2 / v.k; z += step) { g.moveTo(0, sz(z)); g.lineTo(Wd, sz(z)); }
   g.stroke();
+  if (W.backPath) {                                      // the ground, under the dots (world units scaled to the canvas)
+    g.save(); g.translate(Wd / 2 - v.cx * v.k, Hd / 2 - v.cz * v.k); g.scale(v.k, v.k);
+    g.fillStyle = W.backKind === "nav" ? "rgba(127,248,255,.11)" : "rgba(148,157,175,.10)";
+    g.fill(W.backPath); g.restore();
+  }
   const r = W.st, nameIx = W.name ? r.names.findIndex(n => n.id === W.name) : -1;
   const pts = worldPoints(), size = Math.max(2.5, Math.min(7, v.k * 80));
   for (const p of pts) {
@@ -1611,7 +1644,7 @@ function drawWorld() {
     });
     g.textAlign = "start"; g.textBaseline = "alphabetic";
   }
-  $("#wlegend").textContent = `${pts.length.toLocaleString()} placements shown, seen from above · grid ${step.toLocaleString()} units · scroll to zoom, drag to pan · click a dot to see it, open ground to pick a spot`;
+  $("#wlegend").textContent = `${pts.length.toLocaleString()} placements shown, seen from above${W.backPath ? (W.backKind === "nav" ? " over the ground the game's walkers can stand on (shaded)" : " over the terrain cells that hold something (shaded)") : ""} · grid ${step.toLocaleString()} units · scroll to zoom, drag to pan · click a dot to see it, open ground to pick a spot`;
 }
 function nearestPoint(mx, my, radius = 7) {
   const v = W.view, c = $("#wcanvas"), Wd = c.clientWidth, Hd = c.clientHeight;
@@ -2210,7 +2243,7 @@ function renderGame() {
   if (!g) { $("#tiles").innerHTML = tile("Game", "Not found", "bad", "Start Studio with --game \"C:\\...\\DDDA\""); $("#dterm").innerHTML = ""; return; }
   $("#tiles").innerHTML = tile("Game folder", g.title, "ok", g.root)
     + tile("Executable", g.build_verified ? g.build : "Different build", g.build_verified ? "ok" : "warn", g.build_verified ? "the build Riftstone is tested on" : "formats likely match; engine patches will not apply")
-    + (g.loader_supported ? tile("Loader", g.loader ? (g.loader_version.installed || "Installed") : "Not installed", g.loader ? "ok" : "", g.loader ? "overlay, plugins, crash reports, F10 panel" : "needed for mods: they are served from riftstone\\overlay, never written into the game's files")
+    + (g.loader_supported ? tile("Loader", g.loader ? (g.loader_version.installed || "Installed") : "Not installed", g.loader ? "ok" : "", g.loader ? "overlay, plugins, crash reports, diagnostics panel" : "needed for mods: they are served from riftstone\\overlay, never written into the game's files")
                           : tile("Loader", "Not needed", "", "Online mods replace client archives (originals kept): the loader has not run in its client yet"))
     + tile("Install mode", g.mode === "overlay" ? "Overlay" : g.loader_supported ? "Needs the loader" : "Direct", g.mode !== "overlay" && g.loader_supported ? "warn" : "", g.mode === "overlay" ? "riftstone\\overlay serves your archives" : g.loader_supported ? "Dark Arisen mods are served only through the loader" : "originals kept in riftstone\\vanilla")
     + tile("Archives changed", String(g.archives_changed), g.drift.length ? "bad" : "ok", g.drift.length ? g.drift.length + " changed by something else" : "all verified")
@@ -2248,7 +2281,7 @@ const GB = n => (n / 1073741824).toFixed(2);
 function renderPanel(r) {
   const g = S.state && S.state.game, box = $("#dpanel");
   if (!box || !g) { if (box) box.innerHTML = ""; return; }
-  const live = r && r.running ? r : null, key = ((g.plugins || []).length || g.loader) ? "F10" : "";
+  const live = r && r.running ? r : null, key = ((g.plugins || []).length || g.loader) ? (g.panel_key || "Insert") : "";
   const ver = (live && live.loader_version) || (g.loader_version && g.loader_version.installed) || "";
   let pool = { text: "UNKNOWN", pct: 0, peak: null, cls: "unknown",
                note: !g.loader_supported ? "Online has no enemy pool reading" : live ? "no reading from this game build" : "game closed" };

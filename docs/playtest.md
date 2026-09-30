@@ -34,7 +34,7 @@ It launches nothing and changes nothing. Useful options:
 | Loader and hooks | Start the game. | `loader.log` names the version and the build. Every hook is installed, including the ones put back after the DRM wrapper reset them. |
 | Plugins | Nothing extra. | Each plugin loaded, and its own log says it patched, or why it refused. |
 | More enemies at once (`enemy_cap`) | Go where many enemies spawn, for example the Gran Soren horde mod (stage 100, cell 56m52n). | `enemy_cap.log`: the most enemies at once and how long the pool was full. OK when more than 10 were active. |
-| F10 panel under load | With 20 or more enemies active, press **F10**. Keep it open for a few seconds, then close it. Open it again somewhere quiet. | Each opening is noted in `loader.log` (loader 0.3.3). The panel's enemy count and slots are compared with `enemy_cap`'s own record at the same second. Frame rate, address space and stage are shown. |
+| In-game panel under load | With 20 or more enemies active, press **Insert** (your `[overlay] key`). Keep it open for a few seconds, then close it. Open it again somewhere quiet. | Each opening is noted in `loader.log` (loader 0.3.3). The panel's enemy count and slots are compared with `enemy_cap`'s own record at the same second. Frame rate, address space and stage are shown. |
 | Missing-texture guard | Run `Riftstone.cmd playtest guard-mod --mod "Texture guard test"`, then `Riftstone.cmd install "Texture guard test"`. Find goblins: their skin draws grey. Afterwards run `Riftstone.cmd uninstall "Texture guard test"`. | `loader.log` names the texture that was missing, and the exit summary counts the stand-ins. The game kept running. |
 | Archive guard (loader 1.0.1) | Skip cutscenes as soon as they start. Players met "Failed open file" at the ending's (`credit2_01_99.gmd`). | `loader.log` names each resource the game asked for before its archive was read, and the archive the loader read it from. The game kept running. A session where the game never asked early leaves it not exercised. |
 | Free sprint (`free_sprint`) | Sprint across a field: the stamina bar holds. Sprint during a fight: it drains as usual. | `free_sprint.log` says once when a sprint went free and once when one was charged in battle. |
@@ -77,7 +77,7 @@ for anything that came from Online (`docs/legal.md`). To test it on a clean inst
    mods from that machine's own game files and checks every file by SHA-256. Then install them as
    usual with `Riftstone.cmd install "<mod>"`.
 4. Start the game.
-5. Check `riftstone\logs\loader.log`: it exists, the plugins load, and F10 shows the panel. Then run
+5. Check `riftstone\logs\loader.log`: it exists, the plugins load, and the panel key shows the panel. Then run
    `Riftstone.cmd playtest`.
 
 All of the above stays UNKNOWN in the docs until someone plays it.

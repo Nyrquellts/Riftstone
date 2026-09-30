@@ -283,5 +283,19 @@ class QueryTest(unittest.TestCase):
         self.assertGreater(len(self.mesh.walls()[0]), 0)
 
 
+class BackdropTest(unittest.TestCase):
+    """The mesh as a picture for the World map's ground (1.0.3)."""
+
+    def test_every_triangle_is_where_the_mesh_has_it(self):
+        mesh = nav.Mesh(nav_fixture.corridor_with_island())
+        b = nav.backdrop(mesh)
+        self.assertEqual(len(b["tris"]), 3 * len(mesh.tris))
+        self.assertEqual(set(b["tris"]), set(range(len(b["verts"]) // 2)))          # only the vertices in use, from 0
+        for i, corners in enumerate(mesh.tris):
+            for k, c in enumerate(corners):
+                v = b["tris"][3 * i + k]
+                self.assertEqual(b["verts"][2 * v:2 * v + 2], [round(mesh.positions[c][0]), round(mesh.positions[c][2])])
+
+
 if __name__ == "__main__":
     unittest.main()

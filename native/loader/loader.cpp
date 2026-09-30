@@ -21,7 +21,7 @@
 //             riftstone\dxvk, and its textures and buffers counted by pool ([d3d9], graphics.cpp)
 //   exit      why the game closed: Alt+F4, its close button, another program, Windows ending the
 //             session, its own exit menu (session.cpp)
-//   panel     the in-game diagnostics panel, F10: enemy slots, address space, plugins, frame rate,
+//   panel     the in-game diagnostics panel, Insert (a startup banner too): enemy slots, address space, plugins, frame rate,
 //             stage, drawn at Present ([overlay], overlay.cpp)
 //   fixes     missing-texture guard, borderless window, keep running when alt-tabbed, the
 //             frame-rate ceiling, save backups (fixes.cpp)
