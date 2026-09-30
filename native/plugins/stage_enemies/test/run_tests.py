@@ -25,7 +25,8 @@ OUT = PLUGIN / "out"
 sys.path.insert(0, str(HERE.parents[3] / "src"))
 
 PROFILES = {
-    "on": None,  # the shipped stage_enemies.ini (370 = em5301)
+    "on": "[stage_enemies]\nEnabled = 1\n370 = em5301\n",   # a stage listed (the shipped ini lists none)
+    "shipped": None,  # the shipped stage_enemies.ini: no stage listed, so nothing is patched
     "off": "[stage_enemies]\nEnabled = 0\n370 = em5301\n",
 }
 

@@ -746,7 +746,7 @@ static SIZE_T ReserveAddressSpace(ULONGLONG leave) {
 
 static int OverlayMode(int argc, char** argv) {
     UINT w = 1920, h = 1080, w2 = 0, h2 = 0;
-    bool critical = false, engine = false;
+    bool critical = false, engine = false, early = false;
     for (int i = 2; i < argc; i++) {
         unsigned a = 0, b = 0;
         if (sscanf_s(argv[i], "then=%ux%u", &a, &b) == 2) {
@@ -757,6 +757,7 @@ static int OverlayMode(int argc, char** argv) {
             h = b;
         } else if (strcmp(argv[i], "critical") == 0) critical = true;
         else if (strcmp(argv[i], "engine") == 0) engine = true;
+        else if (strcmp(argv[i], "early") == 0) early = true;   // also save the 8th frame (overlay-early.bmp)
     }
     if (engine) {
 #ifdef HARNESS_DDDA_LAYOUT
@@ -813,6 +814,7 @@ static int OverlayMode(int argc, char** argv) {
         if (engine && i == 45) StandInEngine(3, 100);   // the peak (7) stays
 #endif
         OverlayFrame(dev, r);
+        if (early && i == 8) SaveBmp(dev, r, "overlay-early.bmp");
         Sleep(15);
     }
     SaveBmp(dev, r, "overlay-normal.bmp");

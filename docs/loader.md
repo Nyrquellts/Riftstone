@@ -12,7 +12,7 @@ This page covers the base: the overlay, plugins, the log and installing. **`docs
 everything the loader does to keep the game running and explain what went wrong: crash, fatal-error
 and hang reports with engine class names, why the game closed when it was not a crash, the
 missing-texture guard, the archive guard (a resource asked for before its archive was read gets its own bytes), safe mode and plugin quarantine, live stats for Studio, the in-game diagnostics
-panel (F10), save backups, the window fixes, the frame-rate ceiling, the shadow map size, the game's
+panel (Insert), save backups, the window fixes, the frame-rate ceiling, the shadow map size, the game's
 Direct3D 9 from DXVK (`[d3d9] chain`) with what it holds counted by pool, the memory pressure watch and the
 large-address check.
 

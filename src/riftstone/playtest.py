@@ -334,12 +334,15 @@ def check_session(game_root: Path, previous: bool = False, config: Path | None =
     it.status = status
     items.append(it)
 
-    # 3. the F10 panel
-    it = Item("panel", "F10 diagnostics panel")
+    # 3. the in-game panel (and the startup notice that says the loader is in the game)
+    it = Item("panel", "In-game diagnostics panel")
     offered = [ln for ln in tagged("overlay") if "shows the diagnostics panel" in ln.text]
     shown = [ln for ln in tagged("overlay") if ln.text.startswith("panel shown on")]
     opened = [(ln, _OPENED.match(ln.text)) for ln in tagged("overlay") if ln.text.startswith("panel opened:")]
     stopped = [ln for ln in tagged("overlay") if "stopped" in ln.text or "stays off" in ln.text]
+    banner = [ln for ln in tagged("overlay") if ln.text.startswith("startup banner shown on")]
+    pressed = [ln for ln in tagged("overlay") if "pressed with the game in front" in ln.text]
+    wanted = [ln for ln in pressed if ln.text.endswith("the panel is now shown")]
     samples = [] if previous else cap_samples(_read(logs / "enemy_cap.log"), start)
     if stopped:
         it.status = FAIL
@@ -347,10 +350,18 @@ def check_session(game_root: Path, previous: bool = False, config: Path | None =
     elif not offered:
         it.status = UNTESTED
         it.lines.append("the panel was not available this session (see loader.log's 'overlay' lines)")
+    elif wanted and not shown:
+        it.status = FAIL           # the key reached the loader and the panel was asked for, but nothing was drawn
+        it.lines.append(offered[0].text)
+        it.lines.append(f"{_clock(wanted[0].at)} {wanted[0].text}, and no 'panel shown on' line followed: the key "
+                        "arrived but nothing was drawn (send loader.log)")
     elif not shown:
         it.status = UNTESTED
         it.lines.append(offered[0].text)
-        it.todo = "press the key while the game is in front (F10 unless [overlay] key says otherwise)"
+        if banner:
+            it.lines.append(f"{_clock(banner[0].at)} the startup notice was drawn: the loader draws in the game")
+        it.todo = ("press the key while the game is in front (Insert unless [overlay] key says otherwise); "
+                   + ("loader.log notes each press" if pressed else "no key press reached the loader this session"))
     else:
         it.status = OK
         it.lines.append(f"shown at {_clock(shown[0].at)}: {shown[0].text[len('panel shown '):]}")

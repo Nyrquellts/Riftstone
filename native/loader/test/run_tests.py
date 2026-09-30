@@ -979,16 +979,18 @@ PANEL_BASE = (8, 8, 12)                     # the panel's surface, drawn at 92 %
 PANEL_TRACK = (0x28, 0x2D, 0x39)            # a meter's empty track
 
 
-def _panel_rect(w: int, h: int, scale: str = "auto", position: str = "top-right") -> tuple[int, int, int, int]:
+def _panel_rect(w: int, h: int, scale: str = "auto", position: str = "top-right",
+                logical_h: int = 256) -> tuple[int, int, int, int]:
     """Where overlay.cpp puts the panel, worked out here on its own: 416 x 256 at 1080p, 16 px from its corner,
-    times the scale (auto: the height / 1080; 0.75..3; smaller when the back buffer needs it)."""
+    times the scale (auto: the height / 1080; 0.75..3; smaller when the back buffer needs it).  The startup banner
+    is the same 416 wide and 100 tall (logical_h)."""
     s = h / 1080 if scale == "auto" else float(scale)
     s = min(max(s, 0.75), 3.0, w / 448, h / 288)
 
     def px(v: float) -> int:
         return math.floor(v * s + 0.5)
 
-    pw, ph, inset = px(416), px(256), px(16)
+    pw, ph, inset = px(416), px(logical_h), px(16)
     x0 = inset if position.endswith("left") else w - inset - pw
     y0 = inset if position.startswith("top") else h - inset - ph
     return x0, y0, x0 + pw, y0 + ph
@@ -1126,7 +1128,7 @@ def test_overlay(work: Path) -> None:
           "after every Present the game's render target, depth-stencil surface, textures, buffers, viewport, scissor, "
           f"shader constants, transform and states are as it bound them ({r.get('states-kept')})")
     log = log_of(root)
-    check("overlay  F10 shows the diagnostics panel (top-right, scale auto); shown from the first frame" in log,
+    check("overlay  Insert shows the diagnostics panel (top-right, scale auto); shown from the first frame" in log,
           "loader.log says the panel is available and which key shows it")
     check("overlay  panel shown on the 1920x1080 back buffer at scale 1.00 (top-right)" in log and
           "overlay  panel shown on the 2560x1440 back buffer at scale 1.33 (top-right)" in log,
@@ -1225,7 +1227,8 @@ def test_overlay(work: Path) -> None:
     code, r, _ = run(root, "overlay", "1920x1080")
     f = root / "overlay-normal.bmp"
     log = log_of(root)
-    ok = f.is_file() and "key = F13 is not one of F1..F12; F10 it is" in log and "position = middle is not" in log \
+    ok = f.is_file() and ("key = F13 is not F1..F12, Insert, Delete, Home, End, PageUp, PageDown, Pause, ScrollLock "
+                          "or PrintScreen; Insert it is") in log and "position = middle is not" in log \
         and "scale = huge is neither auto nor a number; auto it is" in log
     if ok:
         img = Image.open(f).convert("RGB")
@@ -1233,12 +1236,12 @@ def test_overlay(work: Path) -> None:
         ok = img.crop((0, 0, x0, 1080)).getcolors(1) == [(x0 * 1080, PANEL_CLEAR)] and \
             img.getpixel(((x0 + x1) // 2, y0 + 3)) != PANEL_CLEAR
     check(ok, "settings it cannot read (key = F13, position = middle, scale = huge) are named in loader.log, and "
-          "F10, top-right and auto are used")
+          "Insert, top-right and auto are used")
 
     print("hidden until its key, switched off, Direct3D left alone, and an exception while drawing")
     cases = [
-        ("hidden", "[overlay]\nkey = F7\n", "overlay  F7 shows the diagnostics panel (top-right, scale auto)\n",
-         "show_at_start = 0: nothing is drawn until the key (F7 here) is pressed with the game in front"),
+        ("hidden", "[overlay]\nkey = F7\nbanner = 0\n", "overlay  F7 shows the diagnostics panel (top-right, scale auto)\n",
+         "show_at_start = 0, banner = 0: nothing is drawn until the key (F7 here) is pressed with the game in front"),
         ("off", "[overlay]\nenabled = 0\nshow_at_start = 1\n", "overlay  the diagnostics panel is off ([overlay] enabled = 0)",
          "[overlay] enabled = 0: nothing is drawn"),
         ("no-d3d", "[overlay]\nshow_at_start = 1\n[live]\nframe_stats = 0\n",
@@ -1260,6 +1263,27 @@ def test_overlay(work: Path) -> None:
         if name == "fault":
             ok = ok and not reports(root, "crash") and log.count("overlay  the diagnostics panel stopped") == 1
         check(ok, label)
+
+    print("the startup banner: in the panel's corner from the first frame, two rows tall, gone when its time is up")
+    root = game(work / "panel-banner", ini="[overlay]\nkey = F7\ntest_banner_ms = 1000\n", plugins=("marker_plugin.asi",))
+    code, r, _ = run(root, "overlay", "1920x1080", "early")
+    early, late = root / "overlay-early.bmp", root / "overlay-normal.bmp"
+    log = log_of(root)
+    ok = code == 0 and early.is_file() and late.is_file()
+    if ok:
+        img = Image.open(early).convert("RGB")
+        x0, y0, x1, y1 = _panel_rect(1920, 1080, logical_h=100)
+        px0, py0, px1, py1 = _panel_rect(1920, 1080)
+        drawn = sum(1 for x in range(x0, x1, 3) for y in range(y0, y1, 3) if img.getpixel((x, y)) != PANEL_CLEAR)
+        below = img.crop((px0, y1 + 3, px1, py1))                 # where the panel would reach, under the banner
+        left = img.crop((0, 0, x0 - 1, 1080))
+        ok = drawn > 400 and below.getcolors(1) == [(below.width * below.height, PANEL_CLEAR)] \
+            and left.getcolors(1) == [(left.width * left.height, PANEL_CLEAR)] and _all_clear(Image.open(late).convert("RGB"))
+    check(ok, "banner: drawn in the panel's corner (416 x 100 at 1080p) on an early frame, nothing under it, and the "
+              "frame after its time is up is clear again")
+    check("overlay  a startup banner shows for 12 s after the first frame ([overlay] banner = 0 turns it off)" in log
+          and "overlay  startup banner shown on the 1920x1080 back buffer at scale 1.00 (top-right)" in log,
+          "loader.log says the banner is on and where it drew")
 
 
 # ---- Direct3D 9: the pools, the chain, DXVK (graphics.cpp) ------------------------------------------------------

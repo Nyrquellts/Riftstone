@@ -18,7 +18,8 @@ QUICK = """\
 Start here
   riftstone studio                     the app: your plugins and mods, Launch, every tool
   riftstone doctor                     is everything set up? (game, build, loader, mods, last session)
-  riftstone live                       what the running game is doing (F10 shows it in game)
+  riftstone plugins                    turn Riftstone's features (more enemies, less pop-in...) on and off
+  riftstone live                       what the running game is doing (its in-game panel shows it)
   riftstone crash                      how the last session ended, and any report explained
 
 Archives and parameter files
@@ -820,12 +821,15 @@ def _package_plugins(args, items: list[str]) -> int:
             raise RiftError(f"{cand} does not exist (build it: native\\ninput\\build_msvc.cmd)")
         else:
             ui.warn("Ninput is not built (native\\ninput\\build_msvc.cmd); packaging without it (--no-ninput to silence)")
-    r = package.build_plugins(plugin_paths, out, args.name or "Riftstone plugins", ninput=ninput)
+    start_on = tuple(Path(p).stem for p in plugin_paths) if getattr(args, "all_on", False) else None
+    r = package.build_plugins(plugin_paths, out, args.name or "Riftstone plugins", ninput=ninput, start_on=start_on)
     n = len(r["plugins"])
     ui.ok(f"Packaged the loader and {n} plugin{'s' if n != 1 else ''} (no game data)"
           + (", with Ninput under optional\\ninput (off until a player copies it)" if r["ninput"] else "")
           + f": {ui.human(r['bytes'])}")
     ui.info(f"-> {r['out']}")
+    if r["off"]:
+        ui.info(f"start OFF (riftstone\\plugins\\off; \"{package.START_HERE}\" turns them on): {', '.join(r['off'])}")
     ui.info(f"a player unzips it into the game folder (the one with DDDA.exe); \"{r['readme']}\" inside says how")
     return 0
 
@@ -1249,7 +1253,7 @@ def _doctor_runtime(game: Game, loader_installed: bool, running: bool = False) -
         ui.warn(f"the installed loader is {installed}; this Riftstone has {built}: 'riftstone loader install' updates it "
                 "(your settings are kept)")
     elif installed:
-        ui.ok(f"loader {installed} installed (F10 in the game shows its diagnostics panel)")
+        ui.ok(f"loader {installed} installed ({loader_mod.panel_key(game)} in the game shows its diagnostics panel)")
     if loader_installed:
         problems += _doctor_d3d9(game)
         from . import plugins as plugins_mod
@@ -1289,6 +1293,72 @@ def _doctor_runtime(game: Game, loader_installed: bool, running: bool = False) -
         for line in runtime.describe_live(live)[:3]:
             ui.info("live: " + line)
     return problems
+
+
+def cmd_plugins(args) -> int:
+    """riftstone plugins: Riftstone's features (plugins) on or off -- list them, switch them by name, or pick from a
+    menu (the default in a terminal).  A plugin is on when it is in riftstone\\plugins and off in riftstone\\plugins\\off,
+    where the loader never looks; its settings file moves with it.  The game must be closed."""
+    from . import plugins as pm
+
+    game = _game(args)
+    action = args.action or ("menu" if sys.stdin.isatty() and sys.stdout.isatty() else "list")
+
+    def installed() -> list[dict]:
+        return [r for r in pm.describe(game) if r["installed"]]
+
+    def show() -> list[dict]:
+        rows = installed()
+        if not rows:
+            ui.info(f"no plugins in {pm.plugins_dir(game)}: 'riftstone loader plugin add <name>' installs one, "
+                    "or unzip the Riftstone player zip into the game folder")
+        for i, r in enumerate(rows, 1):
+            named = "" if r["title"] == r["name"] else f"  ({r['name']})"
+            print(f"  {i:2}  [{' ON ' if r['enabled'] else 'off '}]  {r['title']}{named}")
+            if r["summary"]:
+                print(f"              {r['summary']}")
+        return rows
+
+    def switch(name: str, on: bool) -> int:
+        try:
+            res = pm.toggle(game, name, on)
+        except RiftError as e:
+            ui.fail(str(e))
+            return 1
+        ui.ok(f"{name} is {'on' if on else 'off'}" + ("" if res["changed"] else " already")
+              + ("" if not res["changed"] else " (read when the game starts)"))
+        return 0
+
+    if action == "list":
+        show()
+        ui.info("'riftstone plugins on <name>' or 'off <name>' switches one ('all' for every plugin); "
+                "'riftstone plugins' alone opens a menu")
+        return 0
+    if action in ("on", "off"):
+        if not args.names:
+            raise RiftError(f"name the plugin: riftstone plugins {action} <name>  ('all' for every one; "
+                            "'riftstone plugins list' shows them)")
+        names = [r["name"] for r in installed()] if any(n.lower() == "all" for n in args.names) else args.names
+        return 1 if any([switch(n, action == "on") for n in names]) else 0
+    while True:                                   # the menu
+        rows = show()
+        print()
+        try:
+            pick = input("  Number to switch on/off, A = all on, N = all off, Enter = done: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not pick:
+            return 0
+        if pick.lower() in ("a", "n"):
+            for r in rows:
+                switch(r["name"], pick.lower() == "a")
+        elif pick.isdigit() and 1 <= int(pick) <= len(rows):
+            r = rows[int(pick) - 1]
+            switch(r["name"], not r["enabled"])
+        else:
+            ui.warn("type a number from the list, A, N, or just press Enter")
+        print()
 
 
 def cmd_doctor(args) -> int:
@@ -4297,6 +4367,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default on: native\\ninput's own build; --no-ninput leaves it out)")
     p.add_argument("--no-ninput", action="store_true", dest="no_ninput",
                    help="--plugins-only: do not include Ninput in the package")
+    p.add_argument("--all-on", action="store_true", dest="all_on",
+                   help="--plugins-only: switch every plugin on in the zip (by default Riftstone's features start "
+                        "off, in riftstone\\plugins\\off, and only the save backup is on)")
     p.add_argument("--plugin", action="append", help="make: a native plugin to include (.asi; its .ini comes along); "
                                                      "repeat for more")
     p.add_argument("--name", help="make: the package's title (default: the mods' names)")
@@ -4341,6 +4414,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="add: only this file, not its other language versions")
     p = add("info", cmd_info, "describe an archive, parameter file, folder or mod", game=False)
     p.add_argument("files", nargs="+")
+    p = add("plugins", cmd_plugins, "Riftstone's features (plugins): list them, turn them on and off, or pick "
+            "from a menu")
+    p.add_argument("action", nargs="?", choices=["list", "on", "off", "menu"],
+                   help="list, on <name>, off <name> ('all' for every plugin), or menu (the default in a terminal)")
+    p.add_argument("names", nargs="*", metavar="name", help="on / off: the plugins to switch")
     p = add("doctor", cmd_doctor, "check the setup: game, build, loader, installed mods")
     p.add_argument("--verify", action="store_true", help="hash every original archive (takes a minute)")
     p = add("loader", cmd_loader, "the loader (overlay, crash reports, safe mode, plugins): status, install, remove, "
@@ -4388,7 +4466,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--match", help="only the threads in or called from this module (e.g. d3d9.dll, nvoglv32)")
     p.add_argument("--all", action="store_true", help="every thread")
     p = add("playtest", cmd_playtest, "the last play session checked item by item from its logs (the loader, "
-            "plugins, the F10 panel, the texture guard, how it ended); guard-mod: a test mod for the texture guard")
+            "plugins, the in-game panel, the texture guard, how it ended); guard-mod: a test mod for the texture guard")
     p.add_argument("action", nargs="?", choices=["check", "guard-mod"], default="check")
     p.add_argument("--previous", action="store_true", help="check the session before the last one")
     p.add_argument("--mod", help="guard-mod: the mod folder to write (made if it is not a mod yet)")

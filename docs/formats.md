@@ -634,6 +634,22 @@ rNpcLedgerList `.nnl` 1, rArmorModel/PartsOff/Table `.amr`/`.aor`/`.atr` 3/1/2, 
 3, rEquipLvUp `.qlv` 1. `.itemlv` is the 432-byte record measured earlier: per-enhance-level
 stat lists (2/4/6/8/8/8), confirming it is not keyed by item id.
 
+Who an NPC is, and what they wear (read from the game's files, 2026-09-30; asked by a Nexus player: do the Gran
+Soren knights draw their armour through the player's item table, `itemList.itl`?). A placed NPC is a `cSetInfoNpc`
+record in a stage's `_n` layout (`riftstone spawns list scr/st220/etc/st220_00m00n_n140.lot`). Its fields name no
+item: `mNpcId` (127 for Geffrey in stage 220), `mSimpleModelType`, `mPartsVariationNo`, `mClothType`,
+`mHumanEnemyKind` / `mHumanEnemyID` (hostile humans only), `mGoodsOff`, its schedule and AI settings. `mNpcId` is
+an entry of the NPC ledger `etc/item/NpcList.nnl` (727 entries in `rom/bbs_rpg`, `riftstone extract
+etc/item/NpcList.nnl`), and that entry holds the stage, friendship, `mModelType` (0 or 1 in all 727),
+`mIndex` (the model number: 70 for Geffrey), voice, shop type, a small `mLikeItem` (1, 2, 4, 8: a liking, not an item id)
+and names -- no item id and no equipment (its 16 fields are `mNo`, `mStageNo`, `mInitmFriendPoint`, `mModelType`, `mIndex`,
+`mStrayId`, `mShopType`, `mSeType`, `mFlag`, `mChild`, `mTP`, `mTPType`, `mLikeItem`, `mCivilian`, `mName`, `mNameJ`). The
+named knights ("Ser Henning", "Ser Maximilian" ...) are ledger entries like any other (ids 137-143 in stage 220).
+So a town NPC's look is a model chosen by (`mModelType`, `mIndex`) and the placement's parts variation, not a
+list of items from `itemList.itl`, and the item table's unused slots (`Unknown Item`, price 0) hold no NPC-only
+gear as a result. **Not measured:** how (`mModelType`, `mIndex`) becomes a model file, whether those models share
+meshes with the player's armour, and what hostile humans (bandits, adventurers) are dressed from.
+
 AI and quest tables added the same way: enemy-action params `.eap` 54 and stage-action params
 `.sap` 187 (both carry the shared `ActionParam` record: which AI action fires under which status,
 element, flag and study conditions), magic-act timing `.map` 4 (per-spell motion/effect frames and

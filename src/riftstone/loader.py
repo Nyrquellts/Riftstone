@@ -111,6 +111,14 @@ def status(game: Game) -> dict:
             "log": (logs / "loader.log") if (logs / "loader.log").is_file() else None}
 
 
+OVERLAY_KEY_DEFAULT = "Insert"      # [overlay] key: shows the in-game panel (overlay.cpp's DEFAULT_KEY)
+
+
+def panel_key(game: Game) -> str:
+    """The key that shows the in-game panel: [overlay] key of the game's riftstone_loader.ini (Insert without one)."""
+    return _ini_values(_ini_text(game)).get("overlay", {}).get("key", "") or OVERLAY_KEY_DEFAULT
+
+
 def _ini_values(text: str) -> dict[str, dict[str, str]]:
     """{section: {key: value}}, sections and keys lower-cased, first block of a section winning (as
     Windows reads it)."""
@@ -196,7 +204,12 @@ def _write_ini(game: Game, chain: str) -> None:
         owners = b""
     existing = ini_text(owners)
     # A chain the owner set by hand (another name than dinput8_chain.dll) stays unless one was just made.
-    text = merge_ini(_template_ini(), existing, {"loader": {"chain": chain}} if chain or not existing else None)
+    overrides: dict[str, dict[str, str]] = {"loader": {"chain": chain}} if chain or not existing else {}
+    # The panel key was F10 up to 1.0.2; the game's window treats F10 as a system key, so the default is Insert now.
+    # A settings file that still holds the old default takes the new one (any other key the owner chose stays).
+    if _ini_values(existing).get("overlay", {}).get("key", "").upper() == "F10":
+        overrides.setdefault("overlay", {})["key"] = OVERLAY_KEY_DEFAULT
+    text = merge_ini(_template_ini(), existing, overrides or None)
     tmp = target.with_name(target.name + ".riftstone-tmp")
     tmp.write_bytes(ini_bytes(text, like=owners))               # a UTF-16 file stays UTF-16, as Windows keeps it
     os.replace(tmp, target)

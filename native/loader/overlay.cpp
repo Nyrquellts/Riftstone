@@ -1,4 +1,5 @@
-// Riftstone runtime: the in-game diagnostics panel ([overlay]; F10 shows and hides it).
+// Riftstone runtime: the in-game diagnostics panel ([overlay]; Insert shows and hides it, F1 to F12 and a few
+// other keys can be chosen) and its startup banner.
 //
 // A small panel over the game, drawn at Direct3D 9's Present (live.cpp's hook) just before the frame
 // goes out: the loader's version, how many enemy slots are in use and the session's peak (DDDA build
@@ -32,9 +33,21 @@
 enum Corner { TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT };
 static const wchar_t* const CORNERS[] = {L"top-right", L"top-left", L"bottom-right", L"bottom-left"};
 
+// The key that shows and hides the panel.  Insert by default: DDDA's own key bindings (config.ini) use the
+// letters, the digits, Space, Ctrl, Shift, Alt, Caps Lock and F1 to F3, and its window treats F10 and the
+// Alt keys as system keys, so F10 (the original default) was a poor one.  F1 to F12 and these
+// names are accepted in [overlay] key; anything else falls back to Insert.
+struct KeyName { const wchar_t* name; int vk; };
+static const KeyName KEY_NAMES[] = {
+    {L"Insert", VK_INSERT}, {L"Delete", VK_DELETE}, {L"Home", VK_HOME}, {L"End", VK_END},
+    {L"PageUp", VK_PRIOR},  {L"PageDown", VK_NEXT}, {L"Pause", VK_PAUSE}, {L"ScrollLock", VK_SCROLL},
+    {L"PrintScreen", VK_SNAPSHOT},
+};
+static const wchar_t* const DEFAULT_KEY = L"Insert";
+
 static BOOL g_available = FALSE;        // [overlay] enabled, and Present is hooked
-static int g_vk = VK_F10;
-static wchar_t g_keyName[8] = L"F10";
+static int g_vk = VK_INSERT;
+static wchar_t g_keyName[16] = L"Insert";
 static int g_corner = TOP_RIGHT;
 static float g_scaleSetting = 0.0f;     // 0: auto (the back buffer's height / 1080)
 static BOOL g_visible = FALSE;
@@ -47,6 +60,19 @@ static BOOL g_testFault = FALSE;        // [overlay] test_fault = 1: the harness
 static BOOL g_readyLogged = FALSE;
 static CRITICAL_SECTION g_lock;         // Present, Reset and CreateDevice may come from different threads
 static BOOL g_lockReady = FALSE;
+
+// The startup banner: for a few seconds after the first frame the loader draws a small notice in the panel's
+// place ("Riftstone is running, press <key> for the panel, N plugins active"), so a player can see at a glance
+// that the loader is in the game.  Nothing is drawn when [overlay] banner = 0, and the panel replaces it for
+// good the first time it is opened.
+static BOOL g_bannerOn = TRUE;          // [overlay] banner
+static int g_bannerSeconds = 12;        // [overlay] banner_seconds, 3 to 60
+static ULONGLONG g_bannerMs = 12000;    // how long it stays; [overlay] test_banner_ms sets it in milliseconds (the harness)
+static ULONGLONG g_bannerEnd = 0;       // the tick it ends at; 0 until the first frame that can show it
+static BOOL g_bannerDone = FALSE;
+static BOOL g_bannerLogged = FALSE;
+static BOOL g_drawBanner = FALSE;       // this frame's draw is the banner, not the panel
+static int g_keyLogs = 0;               // how many key presses loader.log has been told about (at most 12)
 
 void OverlaySettings(BOOL direct3d) {
     InitializeCriticalSection(&g_lock);
@@ -61,14 +87,36 @@ void OverlaySettings(BOOL direct3d) {
     }
     wchar_t v[64];
     wchar_t* end = NULL;
-    IniStr(L"overlay", L"key", L"F10", v, _countof(v));
+    IniStr(L"overlay", L"key", DEFAULT_KEY, v, _countof(v));
     long n = (v[0] == L'F' || v[0] == L'f') ? wcstol(v + 1, &end, 10) : 0;
+    BOOL keyOk = FALSE;
     if (end && end != v + 1 && !*end && n >= 1 && n <= 12) {
         g_vk = VK_F1 + (int)n - 1;
         _snwprintf_s(g_keyName, _countof(g_keyName), _TRUNCATE, L"F%ld", n);
+        keyOk = TRUE;
     } else {
-        LogLine(L"overlay  [overlay] key = %s is not one of F1..F12; F10 it is", v);
+        for (const KeyName& k : KEY_NAMES) {
+            if (_wcsicmp(v, k.name) == 0) {
+                g_vk = k.vk;
+                wcscpy_s(g_keyName, _countof(g_keyName), k.name);
+                keyOk = TRUE;
+                break;
+            }
+        }
     }
+    if (!keyOk) {
+        g_vk = VK_INSERT;
+        wcscpy_s(g_keyName, _countof(g_keyName), DEFAULT_KEY);
+        LogLine(L"overlay  [overlay] key = %s is not F1..F12, Insert, Delete, Home, End, PageUp, PageDown, Pause, "
+                L"ScrollLock or PrintScreen; %s it is", v, g_keyName);
+    }
+    g_bannerOn = IniInt(L"overlay", L"banner", 1) != 0;
+    g_bannerSeconds = IniInt(L"overlay", L"banner_seconds", 12);
+    if (g_bannerSeconds < 3) g_bannerSeconds = 3;
+    if (g_bannerSeconds > 60) g_bannerSeconds = 60;
+    g_bannerMs = (ULONGLONG)g_bannerSeconds * 1000ULL;
+    int testMs = IniInt(L"overlay", L"test_banner_ms", 0);
+    if (testMs > 0) g_bannerMs = (ULONGLONG)testMs;
     IniStr(L"overlay", L"position", L"top-right", v, _countof(v));
     g_corner = -1;
     for (int i = 0; i < 4; i++)
@@ -100,6 +148,9 @@ void OverlayDeviceReady() {
     if (g_scaleSetting > 0) _snwprintf_s(scale, _countof(scale), _TRUNCATE, L"%.2f", g_scaleSetting);
     LogLine(L"overlay  %s shows the diagnostics panel (%s, scale %s)%s", g_keyName, CORNERS[g_corner], scale,
             g_visible ? L"; shown from the first frame" : L"");
+    if (g_bannerOn && !g_visible)
+        LogLine(L"overlay  a startup banner shows for %d s after the first frame ([overlay] banner = 0 turns it off)",
+                g_bannerSeconds);
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +194,7 @@ static uint32_t ChromeAt(float t) {
 
 // Layout in logical pixels at 1080p (the approved wireframe); everything is multiplied by the scale.
 static const float PANEL_W = 416, PANEL_H = 256, INSET = 16, CUT_TL = 12, CUT_BR = 20;
+static const float BANNER_H = 100;                       // the startup banner: the same chrome, two rows under the heading
 static const float CL = 14, CR = 402;                    // content: 14 px padding on both sides
 static const float HEAD_Y = 14, HEAD_H = 20, DIV1_Y = 42;
 static const float EN_Y = 52, ROW_H = 18, EN_BAR_Y = 76, BAR_H = 4, TICK_H = 8;
@@ -446,6 +498,7 @@ static void RunsRight(float right, float base, const Run* r, int n) { Runs(right
 // the panel's geometry
 
 static float g_s = 1.0f;                                 // the scale it is laid out at
+static float g_layoutH = PANEL_H;                        // its height in logical pixels: the panel's, or the banner's
 static int g_x0, g_y0, g_w, g_h;                         // where it is on the back buffer, in pixels
 static float g_gcx, g_gcy, g_glen;                       // the chrome gradient's centre and length
 
@@ -468,7 +521,7 @@ static float ScaleFor(UINT bw, UINT bh) {
 static void Place(UINT bw, UINT bh, float s) {
     g_s = s;
     g_w = Px(PANEL_W);
-    g_h = Px(PANEL_H);
+    g_h = Px(g_layoutH);
     int inset = Px(INSET);
     g_x0 = g_corner == TOP_LEFT || g_corner == BOTTOM_LEFT ? inset : (int)bw - inset - g_w;
     g_y0 = g_corner == TOP_LEFT || g_corner == TOP_RIGHT ? inset : (int)bh - inset - g_h;
@@ -706,7 +759,7 @@ static int BuildPanel() {
     char a[32], b[32], c[64];
     DrawShape();
 
-    // NryQ // Riftstone v<RIFTSTONE_VERSION_A, runtime.h>                          F10
+    // NryQ // Riftstone v<RIFTSTONE_VERSION_A, runtime.h>                          Insert
     _snprintf_s(c, _countof(c), _TRUNCATE, "NryQ // Riftstone v%s", RIFTSTONE_VERSION_A);
     Text(F_HEAD, X(CL), Base(HEAD_Y, HEAD_H, F_HEAD), c, text);
     char key[8];
@@ -788,6 +841,48 @@ static int BuildPanel() {
     float nw = TextW(F_VALUE, a, 0), lw = TextW(F_LABEL, "STAGE", sp), gap = (float)Px(6);
     Text(F_LABEL, X(CR) - nw - gap - lw, Base(FOOT_Y, FOOT_H, F_LABEL), "STAGE", second, sp);
     Text(F_VALUE, X(CR) - nw, fb, a, r.stage >= 0 ? text : second);
+    return g_nv;
+}
+
+// The startup banner: the panel's chrome and heading, then two rows -- that Riftstone is running and which key
+// opens the panel, and how many plugins loaded.  Safe mode says so instead, with the panel's ruby mark on its edge.
+static int BuildBanner() {
+    g_nv = 0;
+    const DWORD second = Col(C_SECOND), text = Col(C_TEXT), live = Col(C_CYAN, A_DATA);
+    char c[64], key[16], a[16], b[16];
+    DrawShape();
+    _snprintf_s(c, _countof(c), _TRUNCATE, "NryQ // Riftstone v%s", RIFTSTONE_VERSION_A);
+    Text(F_HEAD, X(CL), Base(HEAD_Y, HEAD_H, F_HEAD), c, text);
+    Divider(DIV1_Y);
+    WideCharToMultiByte(CP_ACP, 0, g_keyName, -1, key, sizeof key, NULL, NULL);
+    const float row1 = Base(EN_Y, ROW_H, F_VALUE), row2 = Base(EN_Y + 24, ROW_H, F_LABEL);
+    if (SafeModeActive()) {
+        Run v[] = {{F_VALUE, "SAFE MODE", text, 0}, {F_VALUE, "  plugins and mods are off", second, 0}};
+        Runs(X(CL), row1, v, 2);
+        Rect((float)g_x0, Y(EN_Y), (float)g_x0 + 2, Y(EN_Y + 42), Col(C_RUBY));
+    } else {
+        Run v[] = {{F_VALUE, "RUNNING", live, 0}, {F_VALUE, "  press ", second, 0}, {F_VALUE, key, text, 0},
+                   {F_VALUE, " for the panel", second, 0}};
+        Runs(X(CL), row1, v, 4);
+    }
+    int active = 0, failed = 0;
+    for (int i = 0; i < g_pluginCount; i++) {
+        if (g_pluginInfo[i].state == 1) active++;
+        else if (g_pluginInfo[i].state == 0) failed++;
+    }
+    _snprintf_s(a, _countof(a), _TRUNCATE, "%d", active);
+    _snprintf_s(b, _countof(b), _TRUNCATE, "%d", failed);
+    if (g_pluginCount == 0) {
+        Run p[] = {{F_LABEL, "no plugins loaded", second, 0}};
+        Runs(X(CL), row2, p, 1);
+    } else if (failed) {
+        Run p[] = {{F_LABEL, a, live, 0}, {F_LABEL, " active, ", second, 0}, {F_LABEL, b, Col(C_RUBY), 0},
+                   {F_LABEL, " failed to load", second, 0}};
+        Runs(X(CL), row2, p, 4);
+    } else {
+        Run p[] = {{F_LABEL, a, live, 0}, {F_LABEL, active == 1 ? " plugin active" : " plugins active", second, 0}};
+        Runs(X(CL), row2, p, 2);
+    }
     return g_nv;
 }
 
@@ -985,9 +1080,10 @@ static void DrawUnsafe(IDirect3DDevice9* dev) {
         Restore(dev);
         return;
     }
-    Refresh();
+    if (!g_drawBanner) Refresh();
+    g_layoutH = g_drawBanner ? BANNER_H : PANEL_H;
     Place(d.Width, d.Height, s);
-    int n = BuildPanel();
+    int n = g_drawBanner ? BuildBanner() : BuildPanel();
     // Keep the game's state, then draw into the back buffer with nothing else bound.
     s_captured = SUCCEEDED(g_sb->Capture());
     if (!s_captured) {
@@ -1011,6 +1107,14 @@ static void DrawUnsafe(IDirect3DDevice9* dev) {
         s_inScene = FALSE;
     }
     Restore(dev);
+    if (g_drawBanner) {
+        if (!g_bannerLogged) {
+            g_bannerLogged = TRUE;
+            LogLine(L"overlay  startup banner shown on the %ux%u back buffer at scale %.2f (%s)", d.Width, d.Height, s,
+                    CORNERS[g_corner]);
+        }
+        return;
+    }
     if (s != g_loggedScale || d.Width != g_loggedW || d.Height != g_loggedH) {
         g_loggedScale = s;
         g_loggedW = d.Width;
@@ -1061,6 +1165,12 @@ static void PollKey() {
             g_noteOpen = TRUE;
             g_openAt = 0;
         }
+        // A player who says "the key does nothing" can be told from this line whether it ever arrived.
+        if (g_keyLogs < 12) {
+            g_keyLogs++;
+            LogLine(L"overlay  %s pressed with the game in front: the panel is now %s", g_keyName,
+                    g_visible ? L"shown" : L"hidden");
+        }
     }
     g_keyHeld = down;
 }
@@ -1068,7 +1178,17 @@ static void PollKey() {
 void OverlayPresent(IDirect3DDevice9* dev) {
     if (!g_available || g_dead) return;
     PollKey();
-    if (!g_visible) {
+    // The banner runs for [overlay] banner_seconds from the first frame; the panel replaces it for good.
+    BOOL banner = FALSE;
+    if (g_visible) {
+        g_bannerDone = TRUE;
+    } else if (g_bannerOn && !g_bannerDone) {
+        ULONGLONG now = GetTickCount64();
+        if (!g_bannerEnd) g_bannerEnd = now + g_bannerMs;
+        if (now >= g_bannerEnd) g_bannerDone = TRUE;
+        else banner = TRUE;
+    }
+    if (!g_visible && !banner) {
         if (g_tex || g_sb) {                                 // hidden holds no Direct3D object
             EnterCriticalSection(&g_lock);
             ReleaseObjects();
@@ -1077,7 +1197,9 @@ void OverlayPresent(IDirect3DDevice9* dev) {
         return;
     }
     EnterCriticalSection(&g_lock);
+    g_drawBanner = banner;
     DrawGuarded(dev);
+    g_drawBanner = FALSE;
     LeaveCriticalSection(&g_lock);
 }
 

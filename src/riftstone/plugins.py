@@ -25,6 +25,8 @@ from .runtime import INI_UTF16, ini_bytes, ini_text, ini_value
 SUFFIXES = (".asi", ".dll")
 OFF = "off"
 LOADER = "loader"
+# The named keys [overlay] key takes besides F1 to F12 (overlay.cpp's KEY_NAMES).
+PANEL_KEYS = ("Insert", "Delete", "Home", "End", "PageUp", "PageDown", "Pause", "ScrollLock", "PrintScreen")
 
 # What each known plugin is, in a line a player understands.  "own": written for Riftstone (its
 # source is in native/plugins); anything else is shown as it is, by file name.
@@ -73,6 +75,12 @@ CATALOG: dict[str, dict] = {
     "six_skill_warrior": {
         "title": "Six-skill Warrior",
         "summary": "A Warrior gets six skills like a staff: three more on the secondary-weapon skill button.",
+        "own": True,
+    },
+    "stage_enemies": {
+        "title": "Enemies in any stage",
+        "summary": "For mod makers: loads an enemy's model in a stage the game never uses it in, so a mod can put an "
+                   "Archydra in the Tower. Does nothing until a stage is listed in its .ini.",
         "own": True,
     },
     "portcrystals": {
@@ -129,6 +137,8 @@ _RULES: dict[tuple[str, str, str], tuple] = {
     (LOADER, "saves", "keep"): ("int", 1, 500),
     (LOADER, "loader", "keep_reports"): ("int", 1, 100),
     (LOADER, "overlay", "key"): ("fkey",),
+    (LOADER, "overlay", "banner"): ("int", 0, 1),
+    (LOADER, "overlay", "banner_seconds"): ("int", 3, 60),
     (LOADER, "overlay", "position"): ("choice", "top-right", "top-left", "bottom-right", "bottom-left"),
     (LOADER, "overlay", "scale"): ("auto_float", 0.75, 3.0),
 }
@@ -250,10 +260,13 @@ def _valid(stem: str, section: str, key: str, value) -> str:
         if n % 32:
             raise RiftError(f"{key} is a multiple of 32 (or 0 to leave it)")
         return str(n)
-    if kind == "fkey":
-        if not re.fullmatch(r"[Ff](?:[1-9]|1[0-2])", text):
-            raise RiftError(f"{key} is one of F1 to F12")
-        return text.upper()
+    if kind == "fkey":                 # the in-game panel's key: F1 to F12, or one of the named keys (overlay.cpp)
+        if re.fullmatch(r"[Ff](?:[1-9]|1[0-2])", text):
+            return text.upper()
+        for name in PANEL_KEYS:
+            if text.lower() == name.lower():
+                return name
+        raise RiftError(f"{key} is one of F1 to F12, {', '.join(PANEL_KEYS)}")
     if kind == "choice":
         if text.lower() not in rule[1:]:
             raise RiftError(f"{key} is one of: {', '.join(rule[1:])}")

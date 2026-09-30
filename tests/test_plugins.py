@@ -515,6 +515,79 @@ class StudioRoutesTest(PluginsTest):
             self.assertTrue(data, name)
         self.assertEqual(resources.files("riftstone").joinpath("studio/fonts/riftstone-blade.woff2").read_bytes()[:4], b"wOF2")
 
+    def test_the_panel_key_takes_the_named_keys_and_the_banner_settings_are_checked(self):
+        """1.0.3: [overlay] key is F1 to F12 or a named key (Insert by default); banner and banner_seconds are settings."""
+        (self.game.root / "riftstone_loader.ini").write_text(
+            "[overlay]\nkey = Insert\nbanner = 1\nbanner_seconds = 12\n", encoding="utf-8")
+        for given, want in (("f7", "F7"), ("insert", "Insert"), ("PAGEDOWN", "PageDown"), ("scrolllock", "ScrollLock"),
+                            ("F12", "F12"), ("printscreen", "PrintScreen")):
+            self.assertEqual(plugins.set_value(self.game, plugins.LOADER, "overlay", "key", given)["value"], want)
+        for bad in ("F13", "F0", "Space", "Ctrl", "x", ""):
+            with self.assertRaises(RiftError, msg=bad):
+                plugins.set_value(self.game, plugins.LOADER, "overlay", "key", bad)
+        self.assertEqual(plugins.set_value(self.game, plugins.LOADER, "overlay", "banner", "0")["value"], "0")
+        self.assertEqual(plugins.set_value(self.game, plugins.LOADER, "overlay", "banner_seconds", "30")["value"], "30")
+        for key, bad in (("banner", "2"), ("banner_seconds", "2"), ("banner_seconds", "61"), ("banner_seconds", "x")):
+            with self.assertRaises(RiftError, msg=f"{key}={bad}"):
+                plugins.set_value(self.game, plugins.LOADER, "overlay", key, bad)
+
+    def _plugins_command(self, *words, keys=()):
+        """`riftstone plugins ...` against the stand-in game; returns (exit code, what it printed)."""
+        import argparse
+        import contextlib
+        import io
+
+        from riftstone import cli
+
+        args = argparse.Namespace(action=words[0] if words else None, names=list(words[1:]), game=None)
+        out = io.StringIO()
+        with mock.patch.object(cli, "_game", return_value=self.game), contextlib.redirect_stdout(out), \
+                mock.patch("builtins.input", side_effect=list(keys) if keys else EOFError):
+            code = cli.cmd_plugins(args)
+        return code, out.getvalue()
+
+    def test_the_plugins_command_lists_and_switches(self):
+        """1.0.3: `riftstone plugins` -- list, on/off by name ('all' too), and a menu -- so no one has to move files
+        by hand or open Studio to choose Riftstone's features."""
+        code, text = self._plugins_command("list")
+        self.assertEqual(code, 0)
+        self.assertIn("[ ON ]  Enemy cap", text)
+        self.assertIn("[ ON ]  mystery", text)
+        code, text = self._plugins_command("off", "enemy_cap")
+        self.assertEqual(code, 0)
+        self.assertTrue((plugins.off_dir(self.game) / "enemy_cap.asi").is_file())
+        self.assertTrue((plugins.off_dir(self.game) / "enemy_cap.ini").is_file())        # its settings went with it
+        self.assertFalse((plugins.plugins_dir(self.game) / "enemy_cap.asi").exists())
+        self.assertIn("[off ]  Enemy cap", self._plugins_command("list")[1])
+        self.assertIn("already", self._plugins_command("off", "enemy_cap")[1])
+        code, text = self._plugins_command("on", "ENEMY_CAP")                            # names are not case sensitive
+        self.assertEqual(code, 0)
+        self.assertTrue((plugins.plugins_dir(self.game) / "enemy_cap.asi").is_file())
+        code, text = self._plugins_command("off", "all")
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(p.name for p in plugins.off_dir(self.game).glob("*.*") if p.suffix in (".asi", ".dll")),
+                         ["enemy_cap.asi", "mystery.dll"])
+        code, text = self._plugins_command("on", "nosuch")
+        self.assertEqual(code, 1)
+        with self.assertRaisesRegex(RiftError, "name the plugin"):
+            self._plugins_command("on")
+        with mock.patch.object(install, "game_running", lambda g: True):
+            code, text = self._plugins_command("on", "enemy_cap")
+        self.assertEqual(code, 1)                                                        # the game is open: refused
+        self.assertFalse((plugins.plugins_dir(self.game) / "enemy_cap.asi").exists())
+
+    def test_the_plugins_menu_switches_by_number(self):
+        self.assertEqual(self._plugins_command("menu", keys=["1", ""])[0], 0)            # 1 = Enemy cap (on -> off)
+        self.assertTrue((plugins.off_dir(self.game) / "enemy_cap.asi").is_file())
+        self._plugins_command("menu", keys=["n", ""])
+        self.assertFalse((plugins.plugins_dir(self.game) / "mystery.dll").exists())
+        self._plugins_command("menu", keys=["a", ""])
+        self.assertTrue((plugins.plugins_dir(self.game) / "mystery.dll").is_file())
+        code, text = self._plugins_command("menu", keys=["what", "99", ""])              # nonsense is answered, not run
+        self.assertEqual(code, 0)
+        self.assertIn("type a number from the list", text)
+        self.assertEqual(self._plugins_command("menu")[0], 0)                            # input ends: leave quietly
+
 
 if __name__ == "__main__":
     unittest.main()

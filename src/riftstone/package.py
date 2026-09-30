@@ -56,7 +56,11 @@ PLUGIN_SUFFIXES = (".asi", ".dll")
 RESERVED = ("dinput8.dll", "riftstone_loader.dll")
 # Riftstone's own plugins (native/plugins, MIT); any other plugin in a package keeps its author's terms.
 OWN_PLUGINS = ("enemy_cap", "enemy_skins", "lod_tuner", "inclination_lock", "save_backup", "free_sprint",
-               "draw_distance", "six_skill_warrior", "stage_enemies")
+               "draw_distance", "six_skill_warrior", "stage_enemies", "portcrystals")
+# The player zip starts Riftstone's own features OFF (in riftstone\plugins\off), so people choose what changes
+# their game; only what protects the player is on.  "Riftstone - Start Here.cmd" turns them on one by one.
+DEFAULT_ON = ("save_backup",)
+START_HERE = "Riftstone - Start Here.cmd"
 MAX_MEMBER = 256 * 1024 * 1024          # a package member, unpacked
 MAX_TOTAL = 1024 * 1024 * 1024          # everything in a package, unpacked
 MAX_MEMBERS = 50_000
@@ -114,6 +118,12 @@ def _about(plugin: Path) -> str:
     if first.startswith(";") and " -- " in first:
         return first.split(" -- ", 1)[1].strip()[:160]
     return CATALOG.get(plugin.stem.lower(), {}).get("summary", "")[:160]
+
+
+def _player_line(plugin: Path) -> str:
+    """What a plugin does, for a player: the catalog's line for one of Riftstone's own, else _about's."""
+    from .plugins import CATALOG
+    return CATALOG.get(plugin.stem.lower(), {}).get("summary", "") or _about(plugin)
 
 
 def _license() -> bytes:
@@ -523,43 +533,91 @@ def _ninput_lines() -> list[str]:
             "  SafetyHook (Boost Software License 1.0), Zydis and Zycore (MIT): optional\\ninput\\licenses."]
 
 
-def _plugins_readme(title: str, plugins: list[tuple[str, str]], ninput: bool = False) -> str:
+def _batch_text(text: str, limit: int = 118) -> str:
+    """Text for a batch `set "X=..."` line: printable ASCII, none of the characters cmd.exe would act on."""
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r'[%!"^&|<>\r\n]', " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def _start_here(plugins: list[tuple[str, str, str]]) -> bytes:
+    """"Riftstone - Start Here.cmd": the check, the plugin switch and the logs shortcut for a player without
+    Python (a plain batch file).  ``plugins`` is (file stem, title, one line) for each plugin the zip holds;
+    only names of letters, digits and underscores are listed by name (any other .asi is shown as not
+    Riftstone's)."""
+    template = (Path(__file__).resolve().parent / "data" / "start_here.cmd").read_text(encoding="utf-8")
+    named = [(n, t, w) for n, t, w in plugins if re.fullmatch(r"[A-Za-z0-9_]+", n)]
+    labels = "".join(f':desc_{n}\nset "TITLE={_batch_text(t, 60) or n}"\nset "WHAT={_batch_text(w)}"\nexit /b 0\n\n'
+                     for n, t, w in named)
+    text = (template.replace("@VERSION@", __version__).replace("@PLUGIN_NAMES@", " ".join(n for n, _, _ in named))
+            .replace("@DESCRIPTIONS@", labels.rstrip("\n") + "\n"))
+    return text.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii", "replace")
+
+
+def _plugins_readme(title: str, plugins: list[tuple[str, str]], ninput: bool = False,
+                    off: tuple[str, ...] | set[str] = ()) -> str:
     from . import legal
     lines = [title, "=" * len(title), ""]
-    lines += ["Native plugins for Dragon's Dogma: Dark Arisen (Steam), made with Riftstone. You do not need",
-              "Riftstone: the loader and the plugins are in this zip, and it holds no game files.", "",
-              "What is inside",
-              "  * dinput8.dll -- the Riftstone loader, which loads the plugins"]
-    for p, about in plugins:
-        lines.append(f"  * plugin {p}" + (f" -- {about}" if about else ""))
-    lines += ["", "Install (Windows)",
+    lines += ["Riftstone for Dragon's Dogma: Dark Arisen (Steam). It adds crash protection, save backups and",
+              "optional features to the game. It changes none of the game's own files, and this zip holds no",
+              "game files. You do not need Python or anything else.", "",
+              "Install (one minute)",
               "  1. Close the game.",
-              "  2. Find the game folder: in Steam, right-click Dragon's Dogma: Dark Arisen > Manage > Browse local files",
-              "     (the folder with DDDA.exe in it).",
-              "  3. Unzip everything here into that folder, keeping the folders. dinput8.dll and",
-              "     riftstone_loader.ini go next to DDDA.exe; the riftstone folder goes there too.",
-              "  4. Play. Nothing in the game's own files is changed. Each plugin's settings are the .ini beside it",
-              "     in riftstone\\plugins.",
-              "",
-              "  Already have a dinput8.dll there (for example DDDA Tweak)? Before step 3, rename yours to",
-              "  dinput8_chain.dll, then open riftstone_loader.ini and change the last line to",
-              "  chain = dinput8_chain.dll  -- both keep working.",
-              "",
+              "  2. Open the game folder: in Steam, right-click Dragon's Dogma: Dark Arisen, then Manage, then",
+              "     Browse local files. It is the folder with DDDA.exe in it.",
+              "  3. Unzip everything from this zip into that folder, keeping the folders. If Windows asks to",
+              "     replace files, say yes. (If it says a file named dinput8.dll is already there, another mod",
+              "     owns that name: stop and read \"Already have a dinput8.dll?\" below first.)",
+              f"  4. Double-click  {START_HERE}  in that folder:",
+              "        1  checks that the install is right and says what to fix",
+              "        2  lets you pick features. They start OFF, so nothing about your game changes until you",
+              "           choose (only the save backup is on).",
+              "  5. Start the game. For about 12 seconds a small RUNNING notice shows in the top-right corner:",
+              "     that is how you know Riftstone is in the game. It names the key (Insert) that opens a",
+              "     diagnostics panel, which changes nothing in the game.", "",
+              "  Windows may show a blue \"Windows protected your PC\" box for the Start Here file, because it came",
+              "  in a download. Click More info, then Run anyway. The file is plain text: right-click it and choose",
+              "  Edit to read every line first.", "",
+              "Updating from an older Riftstone",
+              "  Unzip over it the same way, then double-click Start Here once: it swaps in this zip's new copy of",
+              "  every feature you already had on, and keeps that feature's settings. The zip replaces",
+              "  riftstone_loader.ini, so redo any change you made in that file.", "",
+              "What is in the zip"]
+    lines += ["  * dinput8.dll and riftstone_loader.ini -- the Riftstone loader, which loads the features",
+              f"  * {START_HERE} -- the check and the on/off switch"]
+    for p, about in plugins:
+        stem = Path(p).stem.lower()
+        state = "off until you turn it on" if stem in off else "on"
+        lines.append(f"  * feature {p} ({state})" + (f" -- {about}" if about else ""))
+    lines += ["", "Turning a feature on or off without the script",
+              "  Move its .asi file and its .ini from riftstone\\plugins\\off into riftstone\\plugins to turn it",
+              "  on, and back to turn it off. Close the game first. Each feature's settings are in the .ini",
+              "  beside it.", "",
+              "Nothing shows up in the game?",
+              f"  Run {START_HERE}, choice 1. It says what is missing (most often dinput8.dll is not in the",
+              "  same folder as DDDA.exe, or another mod is using that name; see below). If you ask for help,",
+              "  send the two files choice 3 shows: loader.log and the newest crash-*.txt.", "",
+              "Already have a dinput8.dll?",
+              "  Another mod in the game folder (DDDA Tweak, for example) may use that file name. Do this before",
+              "  step 3 and both keep working:",
+              "    a. Rename your dinput8.dll to  dinput8_chain.dll  (in the same folder).",
+              "    b. Do step 3. Then open riftstone_loader.ini in Notepad. Under [loader], find the line  chain =",
+              "       (the note above it mentions DDDA Tweak), change it to  chain = dinput8_chain.dll  and save.", "",
               "Steam Deck / Linux (Proton)",
-              "  Do the same, then in Steam: the game's Properties > General > Launch Options, enter",
+              "  Do the same (the .cmd file needs Windows; move the plugin files by hand instead), then in Steam:",
+              "  the game's Properties > General > Launch Options, enter",
               "      WINEDLLOVERRIDES=\"dinput8=n,b\" %command%",
-              "  so Proton uses the dinput8.dll from the game folder.",
-              "",
+              "  so Proton uses the dinput8.dll from the game folder.", "",
               "Remove",
-              "  Delete dinput8.dll, riftstone_loader.ini and the riftstone folder from the game folder",
-              "  (if you renamed your own dinput8.dll to dinput8_chain.dll, rename it back). The game is as it was.",
-              "",
+              "  Delete dinput8.dll, riftstone_loader.ini, the riftstone folder and the Start Here file from the",
+              "  game folder (if you renamed your own dinput8.dll to dinput8_chain.dll, rename it back).",
+              "  The game is as it was.", "",
               "Good to know",
-              "  * Made for the Steam version of the game (build 2364871). The plugins check the game's",
+              "  * Made for the Steam version of the game (build 2364871). The features check the game's",
               "    code when it starts and do nothing on any other version (their reason is in riftstone\\logs).",
-              "  * If the game crashes, riftstone\\logs has a crash report (crash-*.txt) to send to the plugins' authors",
-              "    or to Riftstone, not to Capcom's support.",
-              "  * The loader (dinput8.dll) and Riftstone's own plugins are free software under the MIT License",
+              "  * If the game crashes, riftstone\\logs has a crash report (crash-*.txt) to send to Riftstone's",
+              "    author, not to Capcom's support.",
+              "  * The loader (dinput8.dll) and Riftstone's own features are free software under the MIT License",
               "    (riftstone\\LICENSE-Riftstone.txt)."]
     others = [p for p, _ in plugins if Path(p).stem.lower() not in OWN_PLUGINS]
     if others:
@@ -590,11 +648,15 @@ def _check_ninput(path: Path) -> bytes:
 
 
 def build_plugins(plugins: list[Path], out: Path, name: str | None = None, loader_dir: Path | None = None,
-                  ninput: Path | None = None) -> dict:
+                  ninput: Path | None = None, start_on: tuple[str, ...] | None = None) -> dict:
     """A zip for players without Riftstone: the loader (dinput8.dll + riftstone_loader.ini) and the plugins at
-    their game-folder paths, a README and riftstone/package.json -- no mods and no game data.  ``ninput`` (its
-    xinput1_3.dll) adds Ninput under optional\\ninput with its licences: shipped, but off until a player copies it."""
+    their game-folder paths, a README, "Riftstone - Start Here.cmd" and riftstone/package.json -- no mods and no
+    game data.  Riftstone's own plugins start OFF (in riftstone\\plugins\\off, where the loader never looks) except
+    the ones in ``start_on`` (default: DEFAULT_ON, the save backup); a plugin that is not Riftstone's is on, since
+    whoever packaged it named it.  ``ninput`` (its xinput1_3.dll) adds Ninput under optional\\ninput with its
+    licences: shipped, but off until a player copies it."""
     out = _out_path(out)
+    on_names = {n.lower() for n in (DEFAULT_ON if start_on is None else start_on)}
     plugin_files, inis = _plugin_files(plugins)
     if not plugin_files:
         raise RiftError("no plugins to package: build them (native\\plugins\\<name>\\build.cmd) or pass --plugin")
@@ -620,23 +682,31 @@ def build_plugins(plugins: list[Path], out: Path, name: str | None = None, loade
                 z.writestr(zipfile.ZipInfo(path, time.localtime()[:6]), data, zipfile.ZIP_DEFLATED)
                 entries[path] = _sha(data)
 
+            def folder_of(stem: str) -> str:            # Riftstone's own features start off, the rest as named
+                s = stem.lower()
+                return "riftstone/plugins/off/" if s in OWN_PLUGINS and s not in on_names else "riftstone/plugins/"
+
             put("dinput8.dll", dll.read_bytes())
             put("riftstone_loader.ini", _loader_ini())
             put("riftstone/LICENSE-Riftstone.txt", _license())
             for f in plugin_files:
-                put(f"riftstone/plugins/{f.name}", f.read_bytes())
+                put(folder_of(f.stem) + f.name, f.read_bytes())
             for ini in inis.values():
-                put(f"riftstone/plugins/{ini.name}", ini.read_bytes())
+                put(folder_of(ini.stem) + ini.name, ini.read_bytes())
+            from .plugins import CATALOG
+            put(START_HERE, _start_here([(f.stem, CATALOG.get(f.stem.lower(), {}).get("title", f.stem), _player_line(f))
+                                         for f in plugin_files]))
+            off = tuple(sorted(f.stem.lower() for f in plugin_files if folder_of(f.stem).endswith("/off/")))
             if ninput_dll is not None:
                 put("optional/ninput/xinput1_3.dll", ninput_dll)
                 put("optional/ninput/README - Ninput.txt", ("\r\n".join(_ninput_lines()) + "\r\n").encode("utf-8"))
                 for lic in sorted(NINPUT_LICENSES.glob("*.txt")):
                     put(f"optional/ninput/licenses/{lic.name}", lic.read_bytes())
-            put(readme, _plugins_readme(title, [(f.name, _about(f)) for f in plugin_files],
-                                        ninput_dll is not None).encode("utf-8", "replace"))
+            put(readme, _plugins_readme(title, [(f.name, _player_line(f)) for f in plugin_files],
+                                        ninput_dll is not None, off).encode("utf-8", "replace"))
             manifest = {"name": title, "made_with": f"Riftstone {__version__}", "game_build": "2364871",
                         "made": time.strftime("%Y-%m-%dT%H:%M:%S"), "mods": [],
-                        "plugins": [f.name for f in plugin_files], "archives": [],
+                        "plugins": [f.name for f in plugin_files], "plugins_off": list(off), "archives": [],
                         "optional": ["optional/ninput/xinput1_3.dll"] if ninput_dll is not None else [],
                         "files": dict(sorted(entries.items()))}
             put("riftstone/package.json", json.dumps(manifest, indent=1).encode("utf-8"))
@@ -645,7 +715,7 @@ def build_plugins(plugins: list[Path], out: Path, name: str | None = None, loade
         if tmp.exists():
             tmp.unlink()
     return {"out": str(out), "bytes": out.stat().st_size, "plugins": [f.name for f in plugin_files],
-            "files": len(entries), "readme": readme, "ninput": ninput_dll is not None}
+            "files": len(entries), "readme": readme, "ninput": ninput_dll is not None, "off": list(off)}
 
 
 # -- reading a package ---------------------------------------------------------------------------

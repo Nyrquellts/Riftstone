@@ -172,8 +172,29 @@ class CheckSessionTest(unittest.TestCase):
         self.assertEqual((items["panel"].status, items["textures"].status, items["free_sprint"].status),
                          ("untested", "untested", "untested"))
         self.assertIn("press the key while the game is in front", items["panel"].todo)
+        self.assertIn("no key press reached the loader", items["panel"].todo)
         self.assertIn("playtest guard-mod", items["textures"].todo)
         self.assertIn("sprint outside a fight", items["free_sprint"].todo)
+
+    def test_the_startup_notice_and_the_key_presses_are_evidence(self):
+        """1.0.3: the banner drawn proves the loader draws in the game; a key press that asked for the panel with
+        nothing drawn after it is a failure (the report a Nexus player gave: the key did something else)."""
+        base = "\n".join(s for s in LOADER_LOG.splitlines() if "panel shown" not in s and "panel opened" not in s)
+        banner = "22:22:24.100  overlay  startup banner shown on the 2560x1440 back buffer at scale 1.33 (top-right)"
+        with tempfile.TemporaryDirectory() as tmp:
+            panel = by_key(playtest.check_session(game(tmp, loader=base + "\n" + banner)))["panel"]
+        self.assertEqual(panel.status, "untested")
+        self.assertIn("the startup notice was drawn", "\n".join(panel.lines))
+        self.assertIn("no key press reached the loader", panel.todo)
+        pressed = "22:22:30.000  overlay  Insert pressed with the game in front: the panel is now shown"
+        with tempfile.TemporaryDirectory() as tmp:
+            panel = by_key(playtest.check_session(game(tmp, loader=base + "\n" + banner + "\n" + pressed)))["panel"]
+        self.assertEqual(panel.status, "fail")
+        self.assertIn("the key arrived but nothing was drawn", "\n".join(panel.lines))
+        hidden = "22:22:31.000  overlay  Insert pressed with the game in front: the panel is now hidden"
+        with tempfile.TemporaryDirectory() as tmp:            # pressed twice, no panel: opened and closed before a frame
+            panel = by_key(playtest.check_session(game(tmp, loader=base + "\n" + pressed + "\n" + hidden)))["panel"]
+        self.assertEqual(panel.status, "fail")
 
     def test_a_1_0_1_session(self):
         # 1.0.x's summary carries the Direct3D part (and memory pressure) before "ended by"; 1.0.1 arms the archive

@@ -373,5 +373,52 @@ class StudioTest(unittest.TestCase):
             self.assertEqual(r.status, 400, body)
 
 
+class BackdropTest(unittest.TestCase):
+    """The World map's ground behind the dots (a Nexus player's suggestion, 1.0.3): the stage's navigation mesh,
+    the open field's terrain cells, or nothing."""
+
+    @classmethod
+    def setUpClass(cls):
+        import world_fixture
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        base = Path(cls.tmp.name)
+        os.environ["RIFTSTONE_HOME"] = str(base / "home")
+        cls.game = world_fixture.make(base / "game", navmesh=True, bare=True)
+        cls.studio = studio.Studio(cls.game, base / "mods")
+        cls.studio.start_index()
+        for _ in range(300):
+            if cls.studio.index_state["ready"]:
+                break
+            time.sleep(0.02)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_a_stage_with_a_mesh_a_stage_without_and_the_route(self):
+        b = self.studio.world_backdrop("424")
+        self.assertEqual(b["kind"], "nav")
+        self.assertGreater(len(b["tris"]), 0)
+        self.assertEqual(len(b["tris"]) % 3, 0)
+        self.assertEqual(len(b["verts"]) % 2, 0)
+        self.assertTrue(all(0 <= v < len(b["verts"]) // 2 for v in b["tris"]))
+        self.assertIs(self.studio.world_backdrop("424"), b)                        # kept, not read again
+        self.assertEqual(self.studio.world_backdrop("501"), {"stage": 501, "kind": "none"})     # 501 has no mesh
+        self.assertEqual(self.studio.api("GET", "world/backdrop", {"n": "424"}, {})["kind"], "nav")
+
+    def test_the_open_field_is_the_cells_that_hold_something(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        # layout names are <m>m<n>n and x, z are those numbers in that order: 56m52n starts at world (20000, 60000)
+        layouts = {"st100_56m52n_e292": {"stage": 100, "x": 56, "z": 52}, "st100_56m52n_p0": {"stage": 100, "x": 56, "z": 52},
+                   "st100_40m30n_e1": {"stage": 100, "x": 40, "z": 30}, "st200_00m00n_e1": {"stage": 200, "x": 0, "z": 0}}
+        with mock.patch.object(self.studio, "world", return_value=SimpleNamespace(layouts=layouts)):
+            b = self.studio.world_backdrop("100")
+        self.assertEqual((b["kind"], b["size"]), ("cells", 10000))
+        self.assertEqual(b["cells"], [[-200000, -100000], [20000, 60000]])         # one square a cell, other stages left out
+
+
 if __name__ == "__main__":
     unittest.main()

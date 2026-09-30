@@ -8,7 +8,7 @@
 //               window fixes, the frame-rate ceiling, save backups
 // session.cpp   why the game closed: its window's close paths and its own exit, for loader.log and
 //               runtime-state.ini
-// overlay.cpp   the in-game diagnostics panel (F10), drawn at Present
+// overlay.cpp   the in-game diagnostics panel (Insert) and its startup banner, drawn at Present
 // graphics.cpp  Direct3D 9: the runtime the game gets (Windows' own, or one chained from the game folder
 //               such as DXVK) and the textures and buffers it holds, by pool
 #pragma once
@@ -17,7 +17,7 @@
 #include <windows.h>
 #include <stdint.h>
 
-#define RIFTSTONE_VERSION_A "1.0.1"             // the one version: the log, reports, the live page, the panel
+#define RIFTSTONE_VERSION_A "1.0.3"             // the one version: the log, reports, the live page, the panel
 #define RIFTSTONE_LOADER_VERSION L"" RIFTSTONE_VERSION_A
 
 // ---- loader.cpp -------------------------------------------------------------------------------

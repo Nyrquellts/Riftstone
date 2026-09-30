@@ -146,6 +146,16 @@ class Studio:
                         out.append({"name": p.stem, "title": info.get("title", p.stem), "enabled": on})
         return out
 
+    @staticmethod
+    def panel_key(g) -> str:
+        """The key that shows the in-game panel, from the game's riftstone_loader.ini (Insert by default)."""
+        from . import loader as loader_mod
+
+        try:
+            return loader_mod.panel_key(g)
+        except OSError:
+            return loader_mod.OVERLAY_KEY_DEFAULT
+
     def loader_versions(self) -> dict:
         """The installed loader's version and the one this Riftstone would install (read once per file change)."""
         from . import loader as loader_mod, runtime
@@ -385,7 +395,8 @@ class Studio:
                               "crash_reports": [r["name"] for r in reversed(runtime.list_reports(g.state_dir / "logs"))],
                               "safe_mode": rstate["safe_mode"], "quarantine": rstate["quarantine"],
                               "last_session": end, "plugins": self.plugin_summary(),
-                              "loader_version": self.loader_versions()}
+                              "loader_version": self.loader_versions(),
+                              "panel_key": self.panel_key(g)}
             st["ddo_server"] = self.ddo_server()
             return st
         if route == "plugins" and method == "GET":
@@ -575,6 +586,8 @@ class Studio:
             return self.world_overview(self.world())
         if route == "world/stage" and method == "GET":
             return self.world_stage(self.world(), q.get("n", ""))
+        if route == "world/backdrop" and method == "GET":
+            return self.world_backdrop(q.get("n", ""))
         if route == "world/enemy" and method == "GET":
             w = self.world()
             em = w.find_enemy(str(q.get("q", "")))
@@ -798,6 +811,42 @@ class Studio:
                             for n_ in layouts],
                 "names": [{"id": nm, "name": w.enemies.get(nm, {}).get("name", "")} for nm in names],
                 "points": points, "groups": groups, "free": w.free_groups(s)[:5]}
+
+    def world_backdrop(self, n) -> dict:
+        """The ground behind a stage's dots, seen from above: its navigation mesh (where the game's walkers can
+        stand) for a stage that has one; for the open field (stage 100, which has none) the square of every terrain
+        cell that has a layout, 10,000 units on a side (docs/terrain.md: world = the cell's corner + local).  Read
+        from the game and kept; nothing is written."""
+        from . import nav
+        from .encounter import parse_stage
+
+        s = parse_stage(n)
+        game = self.need_game()
+        key = (str(game.root).lower(), s)
+        with self.lock:
+            cache = self.__dict__.setdefault("_backdrops", {})
+            if key in cache:
+                return cache[key]
+        out: dict = {"stage": s, "kind": "none"}
+        if game.kind == "ddda":
+            idx = self.open_index()
+            try:
+                mesh = nav.stage_mesh(game, idx, s)
+            except RiftError:
+                mesh = None                  # a mesh that cannot be read is no picture, not an error for the map
+            finally:
+                idx.close()
+            if mesh is not None:
+                out = {"stage": s, "kind": "nav", **nav.backdrop(mesh)}
+            elif s == 100:
+                w = self.world()
+                cells = sorted({(lay["x"], lay["z"]) for lay in w.layouts.values() if lay["stage"] == s})
+                # a layout's name is <m>m<n>n, and x, z are those two numbers in that order: world X is n's cell
+                out = {"stage": s, "kind": "cells", "size": 10000,
+                       "cells": [[10000 * z - 500000, 10000 * x - 500000] for x, z in cells]}
+        with self.lock:
+            cache[key] = out
+        return out
 
     def encounter(self, body: dict) -> dict:
         """Plan (and unless dry_run, write) an encounter into a mod: the CLI's `encounter`."""

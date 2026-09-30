@@ -34,7 +34,7 @@ fixes eleven faults a review found in 0.3.2, each reproduced in the harness firs
 | Direct3D pools | the textures and buffers the game holds, in bytes by pool: how much of its address space Windows' Direct3D 9 spends on its copy of the managed ones | on | both |
 | **Memory pressure watch** | past 3,400 MB of commit, or with the address space nearly used up: one `loader.log` line saying what holds the memory and what would help. Nothing is flushed: the engine keeps no resource no one uses (below) | on | both |
 | Large-address check | `loader.log` says whether the exe is large-address aware (4 GB, not 2 GB); `Riftstone.cmd laa` checks any exe and writes a copy with the flag set | always | both |
-| **In-game panel** | F10 shows a small panel over the game: enemy slots in use and the session's peak, address space with the warning level, each plugin's state, frame rate, stage (below) | on, hidden until F10 | both (enemies, stage: DDDA 2364871) |
+| **In-game panel** | Insert shows a small panel over the game (and for 12 s at start a notice says the loader is running): enemy slots in use and the session's peak, address space with the warning level, each plugin's state, frame rate, stage (below) | on, hidden until Insert | both (enemies, stage: DDDA 2364871) |
 | Save backups | the save folder copied to `%LOCALAPPDATA%\Riftstone\saves\DDDA\<account>\<time>` before the game reads it, only when it changed; newest 20 kept (only folders named `YYYYMMDD-HHMMSS[-n]` count as backups: anything else there is never counted or removed); `Riftstone.cmd saves list / backup / restore` (the list also holds the `save_backup` plugin's copies, `docs/saves.md`) | on | DDDA |
 | Borderless window | windowed mode without a frame, covering the monitor | off | both |
 | Keep running when alt-tabbed | windowed/borderless only; the mouse is released while the game is behind | off | both |
@@ -108,14 +108,21 @@ and writes them in that code page to match (`runtime.ini_text` / `ini_bytes` / `
 `plugins.py`, `loader.py`, `saves.py`; bug-sweep 4c126bd). **UNKNOWN**: other code pages, and Windows' "Use
 Unicode UTF-8 for worldwide language support" (ANSI code page 65001); not measured.
 
-## In-game panel (F10)
+## In-game panel (Insert) and the startup notice
 
-F10 (while the game is in front) shows a small panel in a corner of the game, and F10 again hides it.
+**The startup notice** (1.0.3). For 12 seconds after the first frame the loader draws a small notice in the panel's
+corner: `RUNNING  press Insert for the panel` and how many plugins loaded (`safe mode  plugins and mods are off` with a
+ruby mark when safe mode is on). It is the answer to "is Riftstone in my game?" for a player: no notice, no loader
+(`Riftstone - Start Here.cmd`, choice 1, says why). `[overlay] banner = 0` turns it off, `banner_seconds` (3 to 60)
+sets how long; the panel, once opened, replaces it for good. It is drawn by the panel's own code, so it holds a
+Direct3D texture and a state block for those seconds and none after.
+
+Insert (while the game is in front) shows the panel in a corner of the game, and Insert again hides it.
 Top to bottom:
 
 | Row | What it says |
 |---|---|
-| `NryQ // Riftstone v0.4.1` ... `F10` | the loader's version, and the key that hides the panel |
+| `NryQ // Riftstone v1.0.3` ... `Insert` | the loader's version, and the key that hides the panel |
 | ACTIVE ENEMY POOL `3 / 10 slots` | enemies in `sSetManager`'s slots now, of the slots there are (10, or `enemy_cap`'s count). The meter fills with the share in use; a cyan tick and `peak 7` mark the most at once this session. DDDA 2364871 only |
 | MEMORY GUARD `2.71 / 4.00 GB` | the game's address space used, of all it has (a 32-bit game crashes when it runs out). A white notch marks the loader's warning level, 400 MB before the end; `32.2% headroom` is what is left |
 | chips | each plugin in load order: `ACTIVE` (loaded), `FAILED` (did not load), `SKIPPED` (quarantined, or safe mode); `safe mode: ON` first when it is on; `+N more` when two rows are full |
@@ -132,7 +139,9 @@ panel's edge. Readings refresh four times a second; nothing animates.
 | Key | Default | What it does |
 |---|---|---|
 | `enabled` | 1 | 0: the panel never draws and the key does nothing |
-| `key` | F10 | F1 to F12 (DDDA's window swallows F10, so it does nothing else there) |
+| `key` | Insert | Insert, Delete, Home, End, PageUp, PageDown, Pause, ScrollLock, PrintScreen or F1 to F12. Up to 1.0.2 the default was F10: the game's window treats F10 as a system key, and a player reported that F10 only hid the HUD (Nexus, 2026-09-27). DDDA's own key bindings (`config.ini` `[KEYBOARDMOUSE]`, DirectInput scan codes) use the letters, the digits, Space, Ctrl, Shift, Alt, Caps Lock and F1 to F3, so Insert is free. An update of the loader (`loader install`) moves an old `key = F10` to Insert |
+| `banner` | 1 | the startup notice above; 0: none |
+| `banner_seconds` | 12 | how long it stays (3 to 60) |
 | `show_at_start` | 0 | 1: shown from the first frame (not in safe mode, where only the key shows it) |
 | `position` | top-right | top-right, top-left, bottom-right or bottom-left, 16 px from the corner |
 | `scale` | auto | auto: the back buffer's height / 1080 (0.75 to 3), or a number such as 1.5 |
@@ -152,12 +161,17 @@ the session and writes one line to `loader.log` (not a crash report). DDDA does 
 D3DCREATE_MULTITHREADED`, with a software-vertex-processing fallback), so its state can be saved; on a pure
 device the panel says so in the log and stays off.
 
-`loader.log`: `overlay  F10 shows the diagnostics panel (top-right, scale auto)` once the device exists,
-`overlay  panel shown on the 1920x1080 back buffer at scale 1.00 (top-right)` the first time it draws (and
-after a resolution change), and `overlay  the diagnostics panel stopped: ...` if it ever has to stop.
-**UNKNOWN until seen in the game:** all of it in DDDA itself, including whether F10 reaches
-`GetAsyncKeyState` while the game holds the keyboard through DirectInput, and how it sits over DXVK and the
-Steam overlay.
+`loader.log`: `overlay  Insert shows the diagnostics panel (top-right, scale auto)` once the device exists (and
+`overlay  a startup banner shows for 12 s ...`), `overlay  startup banner shown on the 2560x1440 back buffer ...` the
+first time the notice draws, `overlay  Insert pressed with the game in front: the panel is now shown` for each key
+press that reached the loader (the first twelve), `overlay  panel shown on the 1920x1080 back buffer at scale 1.00
+(top-right)` the first time the panel draws (and after a resolution change), and `overlay  the diagnostics panel
+stopped: ...` if it ever has to stop. Those lines tell a report apart: no `startup banner shown` means nothing is
+drawn in that game; a `pressed` line with no `panel shown` after it means the key arrived and the draw did not
+(`riftstone playtest` says both). **UNKNOWN until seen in the game:** all of it in DDDA itself, including whether the
+key reaches `GetAsyncKeyState` while the game holds the keyboard through DirectInput, and how it sits over DXVK and
+the Steam overlay. (The one report so far, a player on 2026-09-27 who pressed F10: the HUD went and no panel came;
+the cause is not known, and the log lines above are how the next report will show it.)
 
 ## How each part works (and the engine facts it rests on)
 
@@ -456,7 +470,7 @@ the game's first Direct3DCreate9 the loader (`graphics.cpp`):
   Windows' own Direct3D 9 for the rest of the session and `loader.log` says so;
 - leaves it off in safe mode; a changed DLL is a changed setup (safe mode ends).
 
-Frame timing, the F10 panel and the pool counters work on the chained runtime's objects (the harness draws the
+Frame timing, the in-game panel and the pool counters work on the chained runtime's objects (the harness draws the
 panel over DXVK and reads it back pixel by pixel). `[live] frame_stats = 0` leaves Direct3D alone except for
 the chain itself. Ninput's display arbiter (`native/ninput`) hooks the chained DLL's Direct3DCreate9 too, so
 its lost/reset broadcasts reach the chained device. **UNKNOWN until seen in the game:** Dark Arisen under DXVK
@@ -473,7 +487,7 @@ overlay over a chained DXVK (Steam hooks Windows' own `d3d9.dll`), DDO with it (
 **The pools.** The loader counts the textures and buffers the game creates, in bytes by pool, until their last
 Release: CreateTexture, CreateVolumeTexture, CreateCubeTexture, CreateVertexBuffer and CreateIndexBuffer in the
 device's function table, and Release in the table of each kind of object (every level as the object reports
-them; block-compressed formats by their 4x4 blocks). What the loader creates itself (the F10 panel) is not
+them; block-compressed formats by their 4x4 blocks). What the loader creates itself (the in-game panel) is not
 counted. Since 1.0.2 the counters' lock is never held across a call into Direct3D: a Release runs the runtime's
 own Release first and takes the lock only when the object is gone, and a creation stamp on each counted object
 keeps an address the runtime hands out again meanwhile from being taken for the released one. Before, the lock
@@ -622,7 +636,7 @@ window's size, but it multiplies the radius within which its cells load (the LOD
   Windows' own), a 64-bit one, one outside the game folder, an absolute path, a missing file, not a `.dll`, a
   `d3d9.dll` already in the game folder (it stays in charge), safe mode, `[live] frame_stats = 0` (the chain
   still applies). With DXVK when a copy is at hand (`RIFTSTONE_DXVK` or `vendor\dxvk-*\x32\d3d9.dll`): the
-  measurement above, DXVK's log in `riftstone\logs`, and the F10 panel drawn over DXVK and read back.
+  measurement above, DXVK's log in `riftstone\logs`, and the in-game panel drawn over DXVK and read back.
 - Memory (9 checks): a stand-in without the large-address flag warns; one given the flag by
   `pe.write_large_address_aware_copy` commits 3.45 GB: `PRESSURE` in the log, the live page's pressure flag and
   count, the verdict `memory-bound`; given back, `pressure eased`; the exit summary says it once.
@@ -665,7 +679,7 @@ watch: over 3400 MB of commit ...`, the hooks (`KERNEL32.dll!CreateFileA install
 installed`), `d3d9     Direct3D 9 is Windows' own (...)` (or, with DXVK, `d3d9     chained ...\riftstone\dxvk\
 d3d9.dll for the game's Direct3D 9`), `d3d9     counting the game's textures and buffers by pool`, `live
 Direct3D device ... (flags 0x46): frame timing on` (0x26 on the software fallback),
-`overlay  F10 shows the diagnostics panel`, `saves backed up ...`, `exit     watching the
+`overlay  Insert shows the diagnostics panel`, `saves backed up ...`, `exit     watching the
 game window ...; the game's own exit (its quit flag) is verified for this build`, and on exit an `exit`
 line with what closed the game and a `summary` line (frames, average fps, stutters, peak address space,
 the managed pool's peak, `ended by: ...`). `Riftstone.cmd live` while it runs; its `Direct3D 9:` line says how
@@ -673,8 +687,8 @@ many MB of managed textures Windows' Direct3D 9 is keeping a copy of, which is t
 would save. Any `missing` lines during normal play would mean
 the engine probes loose files routinely; the trace says it does not.
 
-F10 in game should show the panel (`overlay  panel shown on the ... back buffer` in the log) with the enemy
-count, a stage number and the plugins; F10 again hides it. If the key does nothing, the log still says
+Insert in game should show the panel (`overlay  panel shown on the ... back buffer` in the log) with the enemy
+count, a stage number and the plugins; Insert again hides it. If the key does nothing, the log still says
 whether the panel was available; `show_at_start = 1` shows it without the key.
 
 Closing it once each way checks the close watch in the game itself: Exit Game on the title screen should
