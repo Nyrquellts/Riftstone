@@ -364,23 +364,26 @@ class PackageTest(unittest.TestCase):
 
     def test_the_player_zip_starts_features_off_and_says_how_to_turn_them_on(self):
         """1.0.3 (a Nexus player's suggestion): Riftstone's own features ship OFF so people choose; only the save
-        backup (protection) is on.  ``start_on`` names others; a plugin that is not Riftstone's stays on."""
+        backup and (1.0.4) collision_cap, the crash guard, are on.  ``start_on`` names others; a plugin that is not
+        Riftstone's stays on."""
         d = self.base / "many"
         d.mkdir()
-        for n in ("save_backup", "enemy_cap", "free_sprint", "someones"):
+        for n in ("save_backup", "enemy_cap", "free_sprint", "someones", "collision_cap", "pool_cap"):
             (d / f"{n}.asi").write_bytes(b"MZ " + n.encode())
             (d / f"{n}.ini").write_text(f"; {n} -- {n} does things\n[{n}]\non = 1\n", encoding="ascii")
-        plugins = [d / f"{n}.asi" for n in ("save_backup", "enemy_cap", "free_sprint", "someones")]
+        plugins = [d / f"{n}.asi" for n in ("save_backup", "enemy_cap", "free_sprint", "someones", "collision_cap",
+                                            "pool_cap")]
         out = self.base / "many-dist" / "default.zip"
         r = package.build_plugins(plugins, out, loader_dir=self.ldir)
         with zipfile.ZipFile(out) as z:
             asi = sorted(n for n in z.namelist() if n.endswith(".asi"))
-            self.assertEqual(asi, ["riftstone/plugins/off/enemy_cap.asi", "riftstone/plugins/off/free_sprint.asi",
+            self.assertEqual(asi, ["riftstone/plugins/collision_cap.asi", "riftstone/plugins/off/enemy_cap.asi",
+                                   "riftstone/plugins/off/free_sprint.asi", "riftstone/plugins/off/pool_cap.asi",
                                    "riftstone/plugins/save_backup.asi", "riftstone/plugins/someones.asi"])
             for n in ("enemy_cap", "free_sprint"):                # the settings travel with their plugin
                 self.assertIn(f"riftstone/plugins/off/{n}.ini", z.namelist())
             self.assertIn("riftstone/plugins/save_backup.ini", z.namelist())
-        self.assertEqual(r["off"], ["enemy_cap", "free_sprint"])
+        self.assertEqual(r["off"], ["enemy_cap", "free_sprint", "pool_cap"])
         out = self.base / "many-dist" / "chosen.zip"
         package.build_plugins(plugins, out, loader_dir=self.ldir, start_on=("save_backup", "enemy_cap"))
         with zipfile.ZipFile(out) as z:
@@ -396,8 +399,11 @@ class PackageTest(unittest.TestCase):
         text = data.decode("ascii")
         self.assertNotIn("@", text.replace("@echo", ""))              # @VERSION@, @PLUGIN_NAMES@, @DESCRIPTIONS@ filled
         self.assertNotIn("\n", text.replace("\r\n", ""))              # CRLF throughout
-        self.assertIn('set "KNOWN=enemy_cap save_backup"', text)     # "odd name" is not a name a batch label can hold
+        # "odd name" is not a name a batch label can hold; every other Riftstone feature is named after the zip's own
+        rest = [n for n in package.OWN_PLUGINS if n not in ("enemy_cap", "save_backup")]
+        self.assertIn('set "KNOWN=' + " ".join(["enemy_cap", "save_backup"] + rest) + '"', text)
         self.assertIn(":desc_enemy_cap\r\nset \"TITLE=Enemy cap\"", text)
+        self.assertIn(":desc_free_sprint\r\nset \"TITLE=Free sprint\"", text)       # one this zip does not hold
         self.assertIn(":desc_save_backup", text)
         self.assertNotIn(":desc_odd", text)
         what = next(ln for ln in text.splitlines() if ln.startswith('set "WHAT=More enemies'))
@@ -472,6 +478,84 @@ class PackageTest(unittest.TestCase):
                            text=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(r.returncode, 1)
         self.assertIn("not in the game folder", r.stdout)
+
+    def test_a_zip_of_one_plugin_says_what_it_holds(self):
+        """1.0.4: each plugin is also a download of its own.  Its README names that feature and its state (the
+        player zip's own text stays word for word), and it starts as it does in the player zip."""
+        d = self.base / "single"
+        d.mkdir()
+        for n in ("free_sprint", "collision_cap", "save_backup", "enemy_cap"):
+            (d / f"{n}.asi").write_bytes(b"MZ " + n.encode())
+
+        def readme(names: list[str]) -> tuple[str, list[str]]:
+            out = self.base / "single-dist" / ("-".join(names) + ".zip")
+            package.build_plugins([d / f"{n}.asi" for n in names], out, name="Riftstone X", loader_dir=self.ldir)
+            with zipfile.ZipFile(out) as z:
+                return (z.read("README - Riftstone X.txt").decode("utf-8"),
+                        sorted(n for n in z.namelist() if n.endswith(".asi")))
+
+        text, asi = readme(["free_sprint"])
+        self.assertEqual(asi, ["riftstone/plugins/off/free_sprint.asi"])
+        self.assertIn("with one feature: Free sprint. It works on its", text)
+        self.assertIn("2  lets you turn Free sprint on. It starts OFF", text)
+        self.assertNotIn("crash protection", text)
+        self.assertNotIn("only the save backup", text)
+        text, asi = readme(["enemy_cap", "collision_cap"])
+        self.assertEqual(asi, ["riftstone/plugins/collision_cap.asi", "riftstone/plugins/off/enemy_cap.asi"])
+        self.assertIn("with these features: Enemy cap and More hit", text)
+        self.assertIn("choose (only the collision crash guard is on).", text)
+        text, _ = readme(["collision_cap"])
+        self.assertIn("2  lets you turn features off and on. Everything in this zip starts ON.", text)
+        text, _ = readme(["save_backup", "enemy_cap", "collision_cap"])        # the player zip's words
+        self.assertIn("It adds crash protection, save backups and\r\noptional features", text)
+        self.assertIn("until you\r\n           choose (only the save backup and the collision crash guard are on).", text)
+
+    @unittest.skipUnless(os.name == "nt", "the Start Here script is a Windows batch file")
+    def test_start_here_of_one_plugins_zip_keeps_every_feature(self):
+        """A one-plugin zip unzipped over the player zip replaces Start Here: the features the player zip brought
+        still show as Riftstone's, switch, and the fresh copy of one already on is swapped in with its settings."""
+        import subprocess
+
+        d = self.base / "over"
+        d.mkdir()
+        for n in ("free_sprint", "collision_cap", "save_backup", "enemy_cap"):
+            (d / f"{n}.asi").write_bytes(b"MZ " + n.encode())
+            (d / f"{n}.ini").write_text(f"[{n}]\non = 1\n", encoding="ascii")
+        full = self.base / "over-dist" / "player.zip"
+        one = self.base / "over-dist" / "free_sprint.zip"
+        package.build_plugins([d / f"{n}.asi" for n in ("free_sprint", "collision_cap", "save_backup", "enemy_cap")],
+                              full, loader_dir=self.ldir)
+        (d / "free_sprint.asi").write_bytes(b"MZ free_sprint, the newer build")
+        package.build_plugins([d / "free_sprint.asi"], one, name="Riftstone Free sprint", loader_dir=self.ldir)
+        game = self.base.joinpath("over", "Program Files (x86)", "Steam", "steamapps", "common", "DDDA")
+        game.mkdir(parents=True)
+        (game / "DDDA.exe").write_bytes(b"MZ")
+        with zipfile.ZipFile(full) as z:
+            z.extractall(game)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        def run(*args):
+            line = 'cmd /s /c ""' + str(game / package.START_HERE) + '" ' + " ".join(args) + '"'
+            return subprocess.run(line, cwd=game, capture_output=True, text=True, timeout=60, creationflags=flags,
+                                  stdin=subprocess.DEVNULL)
+
+        plugs = game / "riftstone" / "plugins"
+        self.assertIn("free_sprint is now on", run("on", "free_sprint").stdout)
+        (plugs / "free_sprint.ini").write_text("[free_sprint]\nMode = always\n", encoding="ascii")
+        with zipfile.ZipFile(one) as z:                     # the newer build of one feature, over the player zip
+            z.extractall(game)
+        r = run("list")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("Updated free_sprint", r.stdout)
+        for title in ("[ ON ]  Free sprint", "[ ON ]  Save backup", "[ ON ]  More hit shapes a frame",
+                      "[off ]  Enemy cap"):
+            self.assertIn(title, r.stdout)
+        self.assertNotIn("Not part of Riftstone", r.stdout)
+        self.assertEqual((plugs / "free_sprint.asi").read_bytes(), b"MZ free_sprint, the newer build")
+        self.assertIn("Mode = always", (plugs / "free_sprint.ini").read_text(encoding="ascii"))
+        self.assertIn("enemy_cap is now on", run("on", "all").stdout)
+        self.assertTrue((plugs / "enemy_cap.asi").is_file())
+        self.assertEqual(run("check").returncode, 0)
 
     @unittest.skipUnless(os.name == "nt", "the Start Here script is a Windows batch file")
     def test_start_here_touches_no_plugin_while_the_game_runs(self):
@@ -727,6 +811,14 @@ class AboutTest(unittest.TestCase):
             self.assertEqual(package._about(Path(d) / "save_backup.asi"), plugins.CATALOG["save_backup"]["summary"])
             self.assertEqual(package._about(Path(d) / "enemy_skins.asi"), plugins.CATALOG["enemy_skins"]["summary"])
             self.assertEqual(package._about(Path(d) / "someones.asi"), "")
+
+    def test_start_here_shows_every_summary_whole(self):
+        """Start Here's list cuts a plugin's line where _batch_text does (118 characters): 1.0.4's first zip showed
+        collision_cap's, pool_cap's and stage_enemies' lines cut mid-word."""
+        from riftstone import plugins
+        for name, entry in plugins.CATALOG.items():
+            summary = entry.get("summary", "")
+            self.assertEqual(package._batch_text(summary), " ".join(summary.split()), name)
 
     def test_a_plugins_line_is_read_in_the_code_page(self):
         """A plugin's .ini is in the code page its plugin reads it in; the README read its line as UTF-8 (U+FFFD for

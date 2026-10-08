@@ -753,7 +753,8 @@ _FLAT = {
     "map": ("Per-spell motion and effect frames, shot control per level", "魔法ごとのモーション・エフェクトのフレームと、"
                                                                         "レベルごとの射出制御"),
     "qct": ("Quest judgment and result commands per sheet", "シートごとのクエスト判定・結果コマンド"),
-    "rst": ("Per-creature status regions (grab / climb candidates)", "モンスターごとの状態領域（掴み・登りの候補）"),
+    "rst": ("A creature's health: base HP (mHPMax) per region, with its DP, BP and damage adjustment",
+            "モンスターの体力：リージョンごとの基本 HP（mHPMax）と、DP・BP・ダメージ補正などの値"),
     "spn": ("Stage place names: the stage -> room-name map", "ステージの地名：ステージと部屋名の対応表"),
     "jcp": ("Online: per custom skill, the 17 resources it uses (motion list, motion params, collision, 10 attack "
             "params, sounds, effects) by path hash and type", "DDO：カスタムスキルごとに、使用する 17 個のリソース"

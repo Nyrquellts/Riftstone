@@ -71,8 +71,13 @@ struct ArcRec { uint32_t tag; const char* path; };
 struct ArcList { const ArcRec* records; uint32_t count; };
 
 // ---- settings ---------------------------------------------------------------------------------
+// The slot record holds 16 tags (0x00418810: cmp eax, 0x10 at 0x0041882C); past them it chains 0x88-byte
+// blocks from sArchiveManager's extend pool, 64 blocks for every slot together (0x004186A0: 8 bitmap bytes),
+// and an empty pool is the game's fatal error ("sArchiveManager::issueExtendPool", 0x00418724).  16 enemies a
+// stage and 64 in all keep the worst case to a few blocks; an enemy listed twice for a stage is queued once.
 struct Entry { uint32_t stage; uint32_t tag; };
 constexpr int MAX_ENTRIES = 64;
+constexpr int MAX_PER_STAGE = 16;
 Entry g_entries[MAX_ENTRIES];
 int g_count = 0;
 bool g_enabled = true;
@@ -239,13 +244,33 @@ void ParseLine(const wchar_t* key, const wchar_t* value) {
     long stage = wcstol(key, nullptr, 10);
     if (stage <= 0 || stage > 0xFFFF) return;
     char val[256];
-    WideCharToMultiByte(CP_ACP, 0, value, -1, val, sizeof val, nullptr, nullptr);
+    if (!WideCharToMultiByte(CP_ACP, 0, value, -1, val, sizeof val, nullptr, nullptr)) {
+        Log("  stage %ld: the line is longer than %u characters; skipped", stage, (unsigned)sizeof val - 1);
+        return;                                       // a failed conversion leaves val unterminated
+    }
     char* ctx = nullptr;
     for (char* tok = strtok_s(val, ", \t", &ctx); tok; tok = strtok_s(nullptr, ", \t", &ctx)) {
-        if (!*tok || g_count >= MAX_ENTRIES) continue;
+        if (*tok == ';') break;                       // a comment after the list
+        if (!*tok) continue;
         uint32_t tag = StageEnemies_ResolveTag(tok);
         if (!tag) {
             Log("  stage %ld: '%s' is not a known enemy (emNNNN) or tag number; skipped", stage, tok);
+            continue;
+        }
+        int here = 0;
+        bool twice = false;
+        for (int i = 0; i < g_count; i++) {
+            if (g_entries[i].stage != (uint32_t)stage) continue;
+            here++;
+            twice |= g_entries[i].tag == tag;
+        }
+        if (twice) {
+            Log("  stage %ld: '%s' is listed already; loaded once", stage, tok);
+            continue;
+        }
+        if (here >= MAX_PER_STAGE || g_count >= MAX_ENTRIES) {
+            Log("  stage %ld: '%s' skipped: at most %d enemies a stage and %d in all", stage, tok, MAX_PER_STAGE,
+                MAX_ENTRIES);
             continue;
         }
         g_entries[g_count].stage = (uint32_t)stage;
@@ -265,9 +290,13 @@ void LoadSettings(HMODULE self) {
     bool haveIni = GetFileAttributesW(ini) != INVALID_FILE_ATTRIBUTES;
     g_enabled = GetPrivateProfileIntW(L"stage_enemies", L"Enabled", 1, ini) != 0;
 
-    // Every "stage = enemies" key in [stage_enemies] except Enabled.
-    wchar_t section[4096];
+    // Every "stage = enemies" key in [stage_enemies] except Enabled.  The section comes back whole, comments and
+    // all; install puts its lines at the section's end, so the buffer is large (a full one is cut there, and said).
+    static wchar_t section[32768];
     DWORD got = GetPrivateProfileSectionW(L"stage_enemies", section, _countof(section), ini);
+    if (got >= _countof(section) - 2)
+        Log("settings: [stage_enemies] is longer than %u characters; the lines past that are not read",
+            (unsigned)_countof(section) - 2);
     if (got > 0) {
         for (const wchar_t* p = section; *p; p += wcslen(p) + 1) {
             const wchar_t* eq = wcschr(p, L'=');

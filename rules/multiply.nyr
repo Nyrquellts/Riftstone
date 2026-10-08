@@ -1,0 +1,24 @@
+# How many more enemies a group gets when every spawn is multiplied (riftstone multiply).
+# multiply.plan (src/riftstone/multiply.py) evaluates this once for every enemy group of the game; nyrc compiles
+# this file (nyr.json) into src/riftstone/rules/multiply.py; tools\test_all.cmd fails when that file is out of date.
+#
+# Inputs   factor     how many times as many enemies, 2..10
+#          eligible   the group's placements the multiplier copies (all its layouts together)
+#          cap        the group's spawn cap in its group list (mSetCountMax); -1 when it has none
+#          free       the placement ids the group still has under its kill record's 32 bits
+# Outputs  copies         new placements for the group, handed out over the eligible ones in turn
+#          set_count_max  the group's new spawn cap; without an update the group list keeps its own
+
+MaxTotal := 9999        # the ceiling horde.nyr gives a cap (the game's own largest is 100)
+
+# Each placement of a group spawns its enemy, so "N times as many" is N - 1 copies of every placement. A group's
+# kill record is one bit a placement id, 32 in all (0x004A653D), and every group of the game keeps its ids under
+# 32: the copies stop where the ids do, and the report says how many were left out.
+[eligible > 0] => copies <- min(eligible * (factor - 1), free)
+[eligible <= 0] => copies <- 0
+
+# A capped group brings its cap in total from its placements (stage 330's group 35: 100 goblins from 7 spawn
+# points), or picks that many of them when the cap is the smaller number. Either way N times as many is N times
+# the cap; the copies above keep the share of spawn points the game gave it. A group with nothing to copy (a big
+# monster's, a scripted placement's) keeps its cap.
+[eligible > 0 and cap >= 0] => set_count_max <- min(cap * factor, MaxTotal)

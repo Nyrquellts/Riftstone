@@ -20,13 +20,15 @@ have version 0x77DF43D8 and the same layout: all 4,042 distinct ones pass the sa
         nodes.  A 4-wide node: one mask byte four times (low nibble: lane j points at a node, high: at a
         leaf; neither: empty -- 1.4 million empty lanes, all holding real, finite bounds), u16 child[4],
         four 0xCD fill bytes, then minX[4] minY[4] minZ[4] maxX[4] maxY[4] maxZ[4]
-  ...   Triangle[triangles], 0x20: normal, u16 vertex[3], u16 material, u32 attribute, u8 adjust[3], u8,
-        u32 physics -- no plane distance, so a translation leaves triangles untouched
+  ...   Triangle[triangles], 0x20: normal, u16 vertex[3] (counted from the part's first vertex), u16 material,
+        u32 attribute, u8 adjust[3], u8, u32 physics -- no plane distance, so a translation leaves triangles
+        untouched
   ...   Vertex[vertices], 0x10: float3 position, u32 0
   ...   MaterialInfo[materials], 0x20 (attribute words); Leaf[leaves], 10 bytes (triangle numbers)
 
 Measured on every vanilla file: each part's vertices lie inside its box and each part box inside the
-header's (26,137 of 26,137); trees may reach about 1 cm past their part (the builder's margin).
+header's (26,137 of 26,137); trees may reach about 1 cm past their part (the builder's margin); every one of the
+2,920,986 triangles belongs to one part, names three of that part's vertices, and stores its corners' own normal.
 
 What moves when a collision mesh is translated: the header box, each part box, each tree's root box, every
 lane of every node (min and max per axis), and every vertex.  Everything else stays byte for byte.
@@ -145,6 +147,24 @@ def _vec3_offsets(s: Sbc, data: bytes) -> list[int]:
 def positions(data: bytes) -> list[tuple[float, float, float]]:
     s = parse(data)
     return [struct.unpack_from("<3f", data, s.vertex_offset + k * VERTEX) for k in range(s.vertices)]
+
+
+def triangles(data: bytes) -> list[tuple[tuple, tuple, tuple, tuple]]:
+    """Every triangle as (corner, corner, corner, its stored normal).  A triangle's three u16 vertex numbers count
+    from its part's first vertex (a file holds more vertices than a u16 names), so each part's triangles are read
+    with that part's vertex start; one naming a vertex past its part's is a FormatError."""
+    s = parse(data)
+    verts = [v[:3] for v in struct.iter_unpack("<3fI", data[s.vertex_offset:s.vertex_offset + s.vertices * VERTEX])]
+    out = []
+    for i in range(s.parts):
+        _ls, _ln, ts, tn, vs, vn = struct.unpack_from("<6I", data, s.part_offset(i) + 0x2C)
+        for k in range(ts, ts + tn):
+            o = s.triangle_offset + k * TRIANGLE
+            nx, ny, nz, a, b, c = struct.unpack_from("<3f3H", data, o)
+            if max(a, b, c) >= vn:
+                raise FormatError("sbc", f"a triangle of part {i} names a vertex past the part's {vn}", o)
+            out.append((verts[vs + a], verts[vs + b], verts[vs + c], (nx, ny, nz)))
+    return out
 
 
 def moved_floats(data: bytes) -> list[tuple[int, int]]:

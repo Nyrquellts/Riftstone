@@ -558,9 +558,13 @@ def plan(game, idx, w: World, mod_root: Path, stage, enemy: str, total: int, at:
     if dist > FAR:
         enc.notes.append(f"the nearest enemy group ({tnum}) stands {dist:.0f} units from the spot; its areas may not "
                          "cover it, so the new group could idle or leave. Pick a spot near existing enemies.")
-    if not any(w.layouts[p[0]]["stage"] == s for p in w.placements if p[4] == em):
-        enc.notes.append(f"{em} is not placed in stage {s} in the game. Its model is loaded from the group's unit list "
-                         "(the same path the game's groups use); in game this is UNKNOWN until played.")
+    from . import stage_enemies
+
+    if em not in stage_enemies.native(w.data, s):
+        enc.notes.append(f"stage {s} never loads {em} itself, so the group alone never appears (seen in game, "
+                         f"2026-09-28). Installing the mod writes '{s} = {em}' into the stage_enemies plugin's ini, "
+                         "which loads it with the stage (docs/stage-enemies.md); the plugin must be on. How it "
+                         "behaves there: UNKNOWN until played.")
     return enc
 
 

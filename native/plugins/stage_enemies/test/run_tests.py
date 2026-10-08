@@ -6,7 +6,9 @@ stage_enemies_stub.exe maps DDDA.exe's image into its own process, stage_enemies
 the built plugin (which reads its ini, resolves the enemies to archive tags through the exe's own table,
 verifies the stage loader and patches that copy), then checks tag resolution against the real archive
 table, the dispatch through a recorder, and the real thunk entered at the stage loader with a fake frame.
-Two profiles: the shipped stage_enemies.ini (370 = em5301) and Enabled = 0.  Needs
+Profiles: one stage listed; the Archydra + Chimera + Drake mix with a duplicate, the limit of 16 a stage
+and a line too long; the lines riftstone install writes, after 6,000 characters of comments; the shipped
+stage_enemies.ini (no stage); Enabled = 0.  Needs
 native\\plugins\\stage_enemies\\build.cmd to have run; without the build or without the game it reports a
 skip.  Exit status 0 = passed or skipped, 1 = failed.
 """
@@ -26,9 +28,28 @@ sys.path.insert(0, str(HERE.parents[3] / "src"))
 
 PROFILES = {
     "on": "[stage_enemies]\nEnabled = 1\n370 = em5301\n",   # a stage listed (the shipped ini lists none)
+    # the Archydra with a Chimera and Drakes in the Tower (a comment after the list, the Archydra twice), 17
+    # tags for one stage (the 17th past the limit of 16), and a line longer than the plugin's 255 characters
+    "mix": ("[stage_enemies]\nEnabled = 1\n370 = em5301, em5200, em5900   ; the Archydra, a Chimera, Drakes\n"
+            "370 = em5301\n600 = " + ", ".join(str(200 + i) for i in range(17)) + "\n"
+            "601 = " + ", ".join(["em5200"] * 40) + "\n"),
+    "install": "install",  # the shipped ini as riftstone install leaves it (install_ini)
     "shipped": None,  # the shipped stage_enemies.ini: no stage listed, so nothing is patched
     "off": "[stage_enemies]\nEnabled = 0\n370 = em5301\n",
 }
+
+
+def install_ini() -> bytes:
+    """The shipped ini with 6,000 characters of a player's comments (past the 4,096 the plugin once read of its
+    section) and then the block riftstone install writes for an Archydra, a Chimera and Drakes in the Tower."""
+    from riftstone import stage_enemies
+
+    shipped = (PLUGIN / "stage_enemies.ini").read_bytes()
+    nl = b"\r\n" if b"\r\n" in shipped else b"\n"
+    notes = b"".join(b"; a player's note %02d " % i + b"." * 80 + nl for i in range(60))
+    rows = [{"stage": 370, "enemies": ["em5200", "em5301", "em5900"], "over": [], "no_archive": [],
+             "mods": ["Tower Trio"]}]
+    return stage_enemies.write_block(shipped.rstrip(b"\r\n") + nl + notes, rows)
 
 
 def run_profile(exe: Path, name: str, ini: str | None) -> int:
@@ -38,6 +59,8 @@ def run_profile(exe: Path, name: str, ini: str | None) -> int:
             shutil.copy(OUT / n, work / n)
         if ini is None:
             shutil.copy(PLUGIN / "stage_enemies.ini", work / "stage_enemies.ini")
+        elif ini == "install":
+            (work / "stage_enemies.ini").write_bytes(install_ini())
         else:
             (work / "stage_enemies.ini").write_text(ini, encoding="utf-8")
         r = subprocess.run([str(work / "stage_enemies_stub.exe"), str(exe), str(work / "stage_enemies.asi"), name],

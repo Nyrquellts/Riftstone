@@ -399,7 +399,7 @@ def parse_report(text: str) -> dict:
                "safe_mode": False, "exception": None, "access": None, "fault_in": None, "fault_plugin": None,
                "objects": [], "stack": [], "memory": {}, "out_of_memory": False, "plugins": [], "last_files": [],
                "missing_count": 0, "missing": [], "message": None, "caption": None, "missing_file": None,
-               "main_thread": None, "stage": None}
+               "main_thread": None, "stage": None, "device": {}}
     m = re.search(r"\(Riftstone loader ([^)]+)\)", first)
     if m:
         r["loader"] = m.group(1)
@@ -445,6 +445,8 @@ def parse_report(text: str) -> dict:
                 section = "stack"
             elif s == "memory":
                 section = "memory"
+            elif s == "graphics device":
+                section = "device"
             elif s == "plugins":
                 section = "plugins"
             elif s.startswith("last files opened"):
@@ -502,6 +504,34 @@ def parse_report(text: str) -> dict:
                 r["memory"]["d3d_managed_mb"] = int(m.group(1)) if m else None
             elif key == "VERDICT":
                 r["out_of_memory"] = True
+        elif section == "device":
+            # The loader's "graphics device" (hang and snapshot reports): what Direct3D last told the game and the
+            # main loop's own gates.
+            key, _, rest = s.partition("  ")
+            key, rest = key.strip(), rest.strip()
+            dev = r["device"]
+            m = re.search(r"0x([0-9a-fA-F]{8}) (\w{1,40})", s)
+            if line.startswith(" " * 23) and dev.get("verdict"):
+                dev["verdict"] += " " + s
+            elif key == "frames presented":
+                m = re.match(_NUM, rest)
+                dev["frames"] = int(m.group(1)) if m else None
+            elif key == "last Present" and m:
+                dev["present"] = m.group(2)
+                f = re.search(r"failing " + _NUM + r" times in a row for " + _NUM + " ms", s)
+                dev["present_failing_ms"] = int(f.group(2)) if f else 0
+            elif s.startswith("TestCooperativeLevel") and m:
+                dev["tcl"] = m.group(2)
+            elif key == "window":
+                dev["window"] = rest
+            elif key == "the game's gates":
+                g = re.search(r"active (\d{1,3}) \(\+0x20 (\d{1,3})\), reset requests 0x([0-9a-fA-F]{1,8}), "
+                              r"device-lost flag (\d{1,3})", rest)
+                if g:
+                    dev["active"], dev["forced"] = int(g.group(1)), int(g.group(2))
+                    dev["reset_requests"], dev["lost_flag"] = int(g.group(3), 16), int(g.group(4))
+            elif key == "VERDICT":
+                dev["verdict"] = rest
         elif section == "plugins":
             m = re.match(r"(\S+)\s+(loaded|failed to load|quarantined|skipped \(safe mode\))", s)
             if m:
@@ -623,6 +653,9 @@ def explain(report: dict, game_root: Path | None = None) -> list[str]:
     elif kind == "hang":
         out.append(f"The game stopped drawing frames{when}"
                    + (f"; its main thread was at {report['main_thread']}." if report.get("main_thread") else "."))
+        dev = report.get("device") or {}
+        if dev.get("verdict"):
+            out.append("Its graphics device: " + dev["verdict"])
     elif kind == "snapshot":
         out.append(f"A snapshot asked for while the game ran{when}; the game went on"
                    + (f". Its main thread was at {report['main_thread']}." if report.get("main_thread") else "."))

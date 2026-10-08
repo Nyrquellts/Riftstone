@@ -47,6 +47,12 @@ rem the save_backup plugin, in a stand-in game process against fake Steam saves 
 rem the stage_enemies plugin (load an enemy's archive in a stage it is not native to), inside the real
 rem DDDA.exe code: the byte sites, tag resolution against the archive table, and the thunk on a fake frame
 %PY% -B "%ROOT%\native\plugins\stage_enemies\test\run_tests.py" || goto :fail
+rem the collision_cap plugin (more collision entry nodes a frame, the sweep clamped), inside the real DDDA.exe
+rem code: every patched site, the constructor's and destructor's loops, the allocator, the sweep job, the reset
+%PY% -B "%ROOT%\native\plugins\collision_cap\test\run_tests.py" || goto :fail
+rem the pool_cap plugin (the game's eight memory pools sized from its ini, every refusal counted), inside the
+rem real DDDA.exe code: the pools built, filled to refusal, and the ragdoll setup refused at each of its arrays
+%PY% -B "%ROOT%\native\plugins\pool_cap\test\run_tests.py" || goto :fail
 rem Ninput, the native plugin host: its offline harnesses (hook arbiter, XInput proxy, display arbiter; no game)
 if exist "%ROOT%\native\ninput\out-msvc" (
   %PY% -B "%ROOT%\native\ninput\test\run_tests.py" || goto :fail

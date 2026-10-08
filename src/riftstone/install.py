@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import mod as modlib
+from . import stage_enemies
 from .arcfolder import write_file
 from .errors import BuildError, RiftError
 from .game import Game
@@ -279,6 +280,7 @@ class ApplyReport:
     unmoved: list[dict] = field(default_factory=list)
     loose_written: list[str] = field(default_factory=list)     # loose/ files written into the overlay
     loose_removed: list[str] = field(default_factory=list)
+    stage_enemies: dict | None = None   # enemies the mods place in stages that never load them (stage_enemies.py)
 
 
 def _target(game: Game, arc: str, mode: str) -> Path:
@@ -337,6 +339,7 @@ def apply(game: Game, index, mod_roots: list[Path], dry_run: bool = False,
         modlib.check_plan(p)
         report = ApplyReport(mode, conflicts=p.conflicts, dry_run=dry_run, merged=p.merged,
                              renumbered=p.renumbered, unmoved=p.unmoved)
+        enemy_rows = _stage_enemy_rows(game, index, p, report)
         if state.get("mode") and state["mode"] != mode and state.get("archives"):
             raise RiftError(f"mods were installed in {state['mode']} mode; run 'riftstone restore' before switching to {mode}")
         installed: dict = state.setdefault("archives", {})
@@ -381,6 +384,8 @@ def apply(game: Game, index, mod_roots: list[Path], dry_run: bool = False,
             # loose files: checked now, so a refusal writes nothing; written after the archives
             _apply_loose(game, index, mods, state, report if dry_run else ApplyReport(mode), True, mode)
             if dry_run:
+                if enemy_rows is not None:
+                    report.stage_enemies = stage_enemies.update(game, enemy_rows, dry_run=True)
                 return report
             for arc_name, target, staged, entry in todo:
                 try:
@@ -400,6 +405,8 @@ def apply(game: Game, index, mod_roots: list[Path], dry_run: bool = False,
             if server:
                 _write_server(game, state, server)
             _apply_loose(game, index, mods, state, report, False, mode)
+            if enemy_rows is not None:
+                report.stage_enemies = stage_enemies.update(game, enemy_rows)
             state["mods"] = [{"path": str(m.root), "name": m.name, "version": m.version, "priority": m.priority}
                              for m in mods]
             if p.renumbered:
@@ -412,6 +419,19 @@ def apply(game: Game, index, mod_roots: list[Path], dry_run: bool = False,
         finally:
             shutil.rmtree(staging, ignore_errors=True)
     return report
+
+
+def _stage_enemy_rows(game: Game, index, p, report: ApplyReport) -> list[dict] | None:
+    """The stage_enemies lines the plan needs (Dark Arisen; None for Online, which has no such plugin).  A world
+    map that cannot be read leaves the block as the last install wrote it and says why, rather than refusing the
+    install: the mods themselves are not wrong."""
+    if game.kind != "ddda":
+        return None
+    try:
+        return stage_enemies.for_plan(game, index, p)
+    except Exception as e:  # noqa: BLE001 -- reported, never silent
+        report.stage_enemies = {"rows": [], "error": f"{type(e).__name__}: {e}"}
+        return None
 
 
 def _server_target(assets: Path, rel: str) -> Path:
@@ -677,6 +697,8 @@ def restore_all(game: Game) -> list[str]:
             _remove_loose_one(game, rel, entry)
             done.append("loose/" + rel)
         state.pop("loose", None)
+        if game.kind == "ddda" and stage_enemies.update(game, [])["changed"]:
+            done.append("stage_enemies.ini (the install's lines)")
         state["archives"] = {}
         state["mods"] = []
         state.pop("mode", None)

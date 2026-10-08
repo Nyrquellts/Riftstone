@@ -553,6 +553,23 @@ class RefusalsTest(StandIn):
         self.assertEqual(code, 2, out)
         self.assertFalse(target.exists())
 
+    def test_import_refuses_a_zip_and_a_folder_without_archives(self):
+        # was: a folder with no .arc files made an empty mod ("0 changed and 0 new"), exit 0; a zip was only
+        # "not an archive", with no word on what to do
+        empty = self.folder()
+        (empty / "readme.txt").write_text("no archives here")
+        zipped = self.base / "Old Mod.zip"
+        zipped.write_bytes(b"PK\x05\x06" + bytes(18))
+        unpacked = self.folder()                         # an archive Riftstone unpacked is a folder named x.arc
+        (unpacked / "model.arc" / "ui").mkdir(parents=True)
+        (unpacked / "model.arc" / "ui" / "x.gmd").write_bytes(b"")
+        for given, word in ((empty, "no .arc archives"), (zipped, "extract it first"), (unpacked, "no .arc archives")):
+            target = self.folder() / "NewMod"
+            code, out = run("import", str(given), "--mod", str(target), "--game", self.G)
+            self.assertEqual(code, 2, out)
+            self.assertIn(word, out)
+            self.assertFalse(target.exists(), out)
+
     def test_studio_port_is_0_to_65535(self):
         # was: OverflowError from the server's bind
         for bad in ("70000", "-1", "x"):

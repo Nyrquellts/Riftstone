@@ -26,6 +26,7 @@
 // start that, with the crash note, becomes [last_session] (end: a session.cpp code, or crash,
 // fatal-error, not-clean) and one line in loader.log.
 #include "runtime.h"
+#include <d3d9.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
 #include <stdio.h>
@@ -411,6 +412,39 @@ static BOOL NotACrash(const EXCEPTION_RECORD* er) {
 #define LOW_STACK (64 * 1024)                        // less than this left: the report goes to a helper thread
 #define HELPER_WAIT_MS 30000                         // the longest the crashing thread waits for it
 
+// One report at a time.  The game's job threads fault together (three reports in the same moment at Gran
+// Soren, 2026-10-06, three times): dbghelp is single-threaded and a minidump stops the process's other threads
+// while it is written, and every one of those dumps but at most one came out empty.  So a crashing thread
+// takes the turn before it writes, and after its own report (or none: past three, or no turn in time) it
+// waits until no other crashing thread is still writing, since the game's filter it calls next ends the
+// process; the thread past the three reports used to end it while the others wrote (crashrace in the
+// harness).  A writer stuck on a lock the crashing threads hold costs each of them HELPER_WAIT_MS at most.
+static volatile LONG g_reportTurn = 0;               // the thread writing a report or a dump; 0 for none
+static volatile LONG g_crashing = 0;                 // crashing threads in CrashFilter not done with their report
+// A crash went past every filter and none recovered it: the process is ending (the game's own exit, or Windows Error
+// Reporting, which can keep it alive for a while).  The owner's crash of 2026-09-28 12:47:48 (0x00479C44) went on to
+// Windows Error Reporting (Application Error at 12:47:49, its report at 12:47:51), and 43 s later the hang watch began
+// a hang report that was never written to (hang-20260928-124832.txt, 0 bytes): no frame since then is no hang.
+// GetTickCount when it happened (odd, so never 0), 0 for never; a frame after it means the game lives on.
+static volatile LONG g_crashEndedAt = 0;
+
+static BOOL TakeReportTurn(ULONGLONG until) {
+    LONG me = (LONG)GetCurrentThreadId();
+    while (InterlockedCompareExchange(&g_reportTurn, me, 0) != 0) {
+        if (GetTickCount64() >= until) return FALSE;
+        Sleep(5);
+    }
+    return TRUE;
+}
+
+static void GiveReportTurn() {
+    InterlockedCompareExchange(&g_reportTurn, 0, (LONG)GetCurrentThreadId());
+}
+
+static void WaitForOtherReports(ULONGLONG until) {
+    while (g_crashing > 0 && GetTickCount64() < until) Sleep(5);
+}
+
 static SIZE_T StackLeft() {
     ULONG_PTR low = 0, high = 0;
     if (!g_stackLimits) return (SIZE_T)-1;           // Windows 7: only a stack overflow counts as low
@@ -505,11 +539,21 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     // Up to three reports a session: a filter further down may recover (continue execution), and a
     // report must not use up the one a real crash later needs.
     static volatile LONG reports = 0;
-    if (g_crash && !NotACrash(ep->ExceptionRecord) && InterlockedIncrement(&reports) <= 3) ReportCrash(ep);
+    BOOL crash = g_crash && !NotACrash(ep->ExceptionRecord);
+    if (crash) {
+        ULONGLONG until = GetTickCount64() + HELPER_WAIT_MS;
+        InterlockedIncrement(&g_crashing);
+        BOOL turn = TakeReportTurn(until);
+        if (turn && InterlockedIncrement(&reports) <= 3) ReportCrash(ep);
+        if (turn) GiveReportTurn();
+        InterlockedDecrement(&g_crashing);
+        WaitForOtherReports(until);
+    }
     LONG r = EXCEPTION_CONTINUE_SEARCH;
     if (g_gameFilter && g_gameFilter != CrashFilter) r = g_gameFilter(ep);
     for (LONG i = g_otherCount - 1; r == EXCEPTION_CONTINUE_SEARCH && i >= 0; i--)    // newest first
         if (i < OTHER_FILTERS && g_otherFilters[i] && g_otherFilters[i] != CrashFilter) r = g_otherFilters[i](ep);
+    if (crash && r != EXCEPTION_CONTINUE_EXECUTION) InterlockedExchange(&g_crashEndedAt, (LONG)(GetTickCount() | 1));
     if (guard) TlsSetValue(g_inFilter, NULL);
     return r;
 }
@@ -633,6 +677,7 @@ static int WINAPI Hook_MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT
 static wchar_t g_hangDumpFor[MAX_PATH];
 
 static DWORD WINAPI HangDumpThread(LPVOID) {
+    if (!TakeReportTurn(GetTickCount64() + 10000)) return 0;     // a crash report is being written
     HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
     auto dump = dbg ? (MiniDumpWriteDump_t)GetProcAddress(dbg, "MiniDumpWriteDump") : NULL;
     wchar_t path[MAX_PATH];
@@ -643,7 +688,65 @@ static DWORD WINAPI HangDumpThread(LPVOID) {
                   (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory | MiniDumpWithThreadInfo),
                   NULL, NULL, NULL);
     if (d != INVALID_HANDLE_VALUE) CloseHandle(d);
+    GiveReportTurn();
     return ok ? 1 : 0;
+}
+
+// What the graphics device and the main loop's own gates said when the frames stopped: stuck, or waiting for its
+// device or its window?  DDDA runs no frame while it counts itself inactive, and presents nothing while its device
+// is lost (docs/stability-membrane.md, "The hang of 2026-10-06 14:42").
+static void DeviceSection(HANDLE f) {
+    Out(f, L"\r\ngraphics device\r\n");
+    DeviceState d;
+    BOOL dev = GetDeviceState(&d);
+    if (!dev) {
+        Out(f, L"  (no Direct3D device watched: none made yet, or [live] frame_stats = 0)\r\n");
+    } else {
+        Out(f, L"  frames presented     %ld\r\n", d.frames);
+        Out(f, L"  last Present         0x%08lx %s", d.presentHr, D3dResultName(d.presentHr));
+        if (d.presentBad) Out(f, L", failing %ld times in a row for %lu ms", d.presentBad, d.presentBadMs);
+        Out(f, L"\r\n");
+        if (!d.tclHooked) {
+            Out(f, L"  TestCooperativeLevel not watched\r\n");
+        } else if (!d.tclCalls) {
+            Out(f, L"  TestCooperativeLevel never asked\r\n");
+        } else {
+            Out(f, L"  TestCooperativeLevel %ld calls, the last %lu ms ago: 0x%08lx %s", d.tclCalls, d.tclAgoMs, d.tclHr,
+                D3dResultName(d.tclHr));
+            if (d.tclBad) Out(f, L", not OK %ld times in a row for %lu ms", d.tclBad, d.tclBadMs);
+            Out(f, L"\r\n");
+        }
+        if (d.resets) Out(f, L"  Reset                %ld calls, the last 0x%08lx %s\r\n", d.resets, d.resetHr, D3dResultName(d.resetHr));
+        else Out(f, L"  Reset                never called\r\n");
+    }
+    HWND w = g_gameWindow;
+    if (w) {
+        LONG mode = g_d3dWindowed;
+        Out(f, L"  window               %s, %s, %s\r\n",
+            mode == 0 ? L"exclusive full screen" : mode == 1 ? L"windowed" : L"mode unknown",
+            GetAncestor(GetForegroundWindow(), GA_ROOTOWNER) == GetAncestor(w, GA_ROOTOWNER) ? L"in front" : L"NOT in front",
+            IsIconic(w) ? L"minimized" : L"not minimized");
+    }
+    FrameGates g;
+    BOOL gates = ReadFrameGates(&g);
+    if (gates)
+        Out(f, L"  the game's gates     active %d (+0x20 %d), reset requests 0x%lx, device-lost flag %d\r\n",
+            g.appActive, g.appForced, (unsigned long)g.resetBits, g.deviceLost);
+    if (dev && d.presentBad && (d.presentHr == D3DERR_DEVICELOST || d.tclHr == D3DERR_DEVICELOST)) {
+        Out(f, L"  VERDICT              the device is lost: a full-screen game loses it when another window takes the\r\n"
+               L"                       screen, or the driver resets it. The game asks for a reset and waits for\r\n"
+               L"                       TestCooperativeLevel to say it may (D3DERR_DEVICENOTRESET), which Direct3D 9 says\r\n"
+               L"                       once the game's window has the screen again.\r\n");
+    } else if (dev && d.presentBad && (d.presentHr == D3DERR_DEVICEREMOVED || d.presentHr == D3DERR_DEVICEHUNG ||
+                                       d.presentHr == D3DERR_DRIVERINTERNALERROR)) {
+        Out(f, L"  VERDICT              the graphics driver stopped the device (%s); the game cannot draw again.\r\n",
+            D3dResultName(d.presentHr));
+    } else if (gates && !g.appActive && !g.appForced) {
+        Out(f, L"  VERDICT              the game counts itself inactive (Windows told it another program was in front)\r\n"
+               L"                       and sleeps without a frame until its window is activated again.\r\n");
+    } else if (gates && g.deviceLost) {
+        Out(f, L"  VERDICT              the game's device-lost flag is set: it skips its frames until the device is reset.\r\n");
+    }
 }
 
 // A report on the main thread (where it is, its registers, its stack), and with `dump` every thread's state in a
@@ -707,6 +810,7 @@ static void ThreadReport(const wchar_t* kind, const wchar_t* title, const wchar_
     } else {
         Out(f, L"\r\nthe main thread's registers could not be read\r\n");
     }
+    DeviceSection(f);
     MemorySection(f);
     PluginsSection(f);
     FilesSection(f);
@@ -726,6 +830,15 @@ static void ThreadReport(const wchar_t* kind, const wchar_t* title, const wchar_
 }
 
 void WriteHangReport(DWORD thread, DWORD seconds, BOOL notResponding) {
+    if (g_crashing > 0) {        // no frames because a crash is being reported: its report holds every thread
+        LogLine(L"hang     no frame for %lu s while a crash was being reported; no hang report", seconds);
+        return;
+    }
+    DWORD ended = (DWORD)g_crashEndedAt;
+    if (ended && (LONG)(GetTickCount() - seconds * 1000 - ended) <= 1000) {   // no frame since a crash ended the game
+        LogLine(L"hang     no frame for %lu s since a crash nothing recovered (the game is ending); no hang report", seconds);
+        return;
+    }
     wchar_t intro[512], logged[96];
     _snwprintf_s(intro, _countof(intro), _TRUNCATE,
                  L"the game drew no frame for %lu s %s; this report does not\r\n"

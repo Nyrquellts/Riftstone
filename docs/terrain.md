@@ -82,6 +82,10 @@ riftstone terrain localize st100e_47m35n_mrg00.world.sbc                  the sa
   - every envelope's sphere, box and oriented box (the box's rotation and extents stay).
 
   Every other byte stays the same, and the model keeps its size.
+- **The field's ground** (`terrain.Ground`): the height and slope of the walkable `e` collision under a world point, read from the
+  point's cell and the cells around it (a cell's collision reaches into its neighbours). Of stage 100's 2,643 enemy
+  placements 2,552 have that ground under them, 2,537 within 100 cm of it (`tools/multiply_proof.py`); `riftstone multiply`
+  stands its copies on it (`docs/spawn-multiplier.md`).
 - **Moving a collision mesh** (`sbc.py`, the layout read from `DDDA.exe`'s loader, `docs/formats.md`):
   - the file's box, each part's box and each tree's root box;
   - every lane of every tree node (min and max per axis, four lanes a node, empty lanes included: they
@@ -92,7 +96,8 @@ riftstone terrain localize st100e_47m35n_mrg00.world.sbc                  the sa
   for byte, as do materials, leaves and the node masks. Every other byte stays the same.
 - **Which files.** Only bone-less models whose vertex formats store float positions, which covers all 417
   vanilla cell models, and collision meshes with 4-wide trees, which is every one of the game's 1,496.
-  Anything else (a binary-tree or grid collision, Online's revision 0x77DF43D8) is refused, not guessed.
+  Anything else (a binary-tree or grid collision) is refused, not guessed. Online's revision 0x77DF43D8 has the
+  same layout and moves the same way (`check_corpus --game ddo --only sbc`).
 - **Precision.** `localize` of a world-space file is exact: the corner is a multiple of 16 cm, so the
   difference is a float. `worldize` rounds each position to float32, at most 0.0078 cm in Gransys.
   `worldize(localize(W)) == W` byte for byte on all 417 cell models and all 836 cell collisions.

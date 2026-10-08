@@ -1,6 +1,6 @@
 // stage_enemies_harness_core -- runs the stage_enemies hook inside the real game code, without the game.
 //
-//   stage_enemies_stub.exe <DDDA.exe> <stage_enemies.asi> <on|off>
+//   stage_enemies_stub.exe <DDDA.exe> <stage_enemies.asi> <on|mix|install|off|shipped>
 //
 // Maps DDDA.exe at its fixed base (0x00400000) over the stub's image, loads the plugin (which reads its
 // ini, resolves the enemies to archive tags through the exe's own table, verifies the stage loader and
@@ -14,8 +14,13 @@
 //     +0x724, slot 5 at +0xA28) and stops at 0x004FFD94, checking the recorder saw (slot 5, tag 173),
 //     that edx (the slot index the covered cmp reads) came through, and that esp is balanced.
 // Profiles (run_tests.py writes the matching stage_enemies.ini):
-//   on   -- 370 = em5301
-//   off  -- Enabled = 0: nothing patched
+//   on      -- 370 = em5301
+//   mix     -- the Archydra, a Chimera and Drakes in the Tower (370 = em5301, em5200, em5900 with a comment
+//              after it, and em5301 again), 17 tags for stage 600 (16 queued), a line too long for stage 601
+//   install -- the shipped ini, 6,000 characters of the player's comments, then the lines install writes
+//              (370 = em5200, em5301, em5900 under its marker and mod-name comments)
+//   off     -- Enabled = 0: nothing patched
+//   shipped -- the shipped ini: no stage listed, nothing patched
 // Prints "pass"/"FAIL" lines, exits 0 when everything passed, 1 on a failure, 2 when the image cannot be
 // mapped here (a skip).
 #define WIN32_LEAN_AND_MEAN
@@ -27,6 +32,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -53,12 +59,21 @@ OnLoadFn g_onLoad = nullptr;
 // ---- recorder standing in for the game's queue -------------------------------------------------
 uint32_t g_recSlot = 0, g_recTag = 0;
 int g_recCount = 0;
+uint32_t g_recTags[64];
 void __cdecl Recorder(uint32_t slot, uint32_t tag) {
     g_recSlot = slot;
     g_recTag = tag;
+    if (g_recCount < 64) g_recTags[g_recCount] = tag;
     g_recCount++;
 }
 void ResetRec() { g_recSlot = g_recTag = 0; g_recCount = 0; }
+bool RecIs(std::initializer_list<uint32_t> tags) {
+    if (g_recCount != (int)tags.size()) return false;
+    int i = 0;
+    for (uint32_t t : tags)
+        if (g_recTags[i++] != t) return false;
+    return true;
+}
 
 // ---- driving the real thunk --------------------------------------------------------------------
 alignas(16) uint8_t g_frame[0x1200];
@@ -161,7 +176,7 @@ extern "C" __declspec(dllexport) void HarnessMain() {
 
 static int Run(int argc, wchar_t** argv) {
     if (argc < 4) {
-        printf("usage: stage_enemies_stub <DDDA.exe> <stage_enemies.asi> <on|off>\n");
+        printf("usage: stage_enemies_stub <DDDA.exe> <stage_enemies.asi> <on|mix|install|off|shipped>\n");
         return 1;
     }
     const std::wstring profile = argv[3];
@@ -188,6 +203,8 @@ static int Run(int argc, wchar_t** argv) {
     Check(g_resolve("EM5301") == 173, "resolution ignores case");
     Check(g_resolve("173") == 173, "a raw number is taken as the tag");
     Check(g_resolve("em9999") == 0, "an enemy with no archive resolves to 0 (skipped, not queued)");
+    Check(g_resolve("em5200") == 122, "em5200 (Chimeras) resolves to tag 122");
+    Check(g_resolve("em5900") == 165, "em5900 (Drakes) resolves to tag 165");
 
     if (profile == L"off" || profile == L"shipped") {
         Check(memcmp((const void*)SITE, SITE_BYTES, sizeof SITE_BYTES) == 0,
@@ -204,7 +221,24 @@ static int Run(int argc, wchar_t** argv) {
     g_setQueue(Recorder);
     ResetRec();
     g_onLoad(370, 5);
-    Check(g_recCount == 1 && g_recSlot == 5 && g_recTag == 173, "a load of stage 370 queues tag 173 into slot 5");
+    if (profile == L"mix") {
+        Check(RecIs({173, 122, 165}) && g_recSlot == 5,
+              "a load of stage 370 queues the Archydra, Chimeras and Drakes (173, 122, 165) into slot 5, once each");
+        ResetRec();
+        g_onLoad(600, 9);
+        bool first16 = g_recCount == 16;
+        for (int i = 0; first16 && i < 16; i++) first16 = g_recTags[i] == (uint32_t)(200 + i);
+        Check(first16, "17 tags listed for stage 600: the first 16 are queued, the 17th is not");
+        ResetRec();
+        g_onLoad(601, 9);
+        Check(g_recCount == 0, "a line too long for the plugin's buffer (stage 601) is skipped whole");
+    } else if (profile == L"install") {
+        Check(RecIs({122, 173, 165}) && g_recSlot == 5,
+              "the line install wrote past 6,000 characters of the player's comments is read: stage 370 queues "
+              "em5200, em5301, em5900 (122, 173, 165) into slot 5");
+    } else {
+        Check(g_recCount == 1 && g_recSlot == 5 && g_recTag == 173, "a load of stage 370 queues tag 173 into slot 5");
+    }
     ResetRec();
     g_onLoad(100, 5);
     Check(g_recCount == 0, "a load of stage 100 (not listed) queues nothing");
@@ -212,8 +246,15 @@ static int Run(int argc, wchar_t** argv) {
     printf("the real thunk, entered at the stage loader with a fake frame\n");
     PlaceCapture();
     bool regs = EnterSite(370, 5);
-    Check(g_recCount == 1 && g_recSlot == 5 && g_recTag == 173,
-          "entering the loader for stage 370 runs the thunk and queues tag 173 (slot 5)");
+    if (profile == L"mix")
+        Check(RecIs({173, 122, 165}) && g_recSlot == 5,
+              "entering the loader for stage 370 runs the thunk and queues 173, 122, 165 (slot 5)");
+    else if (profile == L"install")
+        Check(RecIs({122, 173, 165}) && g_recSlot == 5,
+              "entering the loader for stage 370 runs the thunk and queues 122, 173, 165 (slot 5)");
+    else
+        Check(g_recCount == 1 && g_recSlot == 5 && g_recTag == 173,
+              "entering the loader for stage 370 runs the thunk and queues tag 173 (slot 5)");
     Check(regs, "  edx (the slot index the covered cmp reads) is intact and esp is balanced");
     regs = EnterSite(220, 7);
     Check(g_recCount == 0 && regs, "entering the loader for stage 220 queues nothing, edx/esp intact");

@@ -26,6 +26,8 @@ session  runtime-state.ini and the crash note as the loader leaves them: how the
          a known reason (or named as unknown) with words, one line, and no negative time
 plugin_ini  a plugin's .ini and one setting Studio writes: refused, or the value lands on its key and every
          other line of the file stays as it was
+stage_enemies_ini  stage_enemies.ini and the lines an install writes into it: one block, in [stage_enemies], the
+         same twice; removed, every other line is the file's own; a UTF-16 file that does not decode is refused
 dye      Online's dye baked into a colour map: every texel equals an independent oracle of the shader's formula,
          alpha never changes; as a texture the shape stays and blocks no dye reaches keep their bytes
 dye_tables  a montage, the item list, the model table (byte-exact rebuilds; colour numbers wrap) and the colour
@@ -48,10 +50,17 @@ dungeon  the level director with hostile options on a stage with a mesh: refused
          another and every planned spawn point on the mesh in the doors' region; the dry run writes nothing
 ground   encounters on a stage with a mesh, hostile spot, count, spread and ground choice: refused, or spawn points
          on the mesh, reached on foot from the first, apart and with room as the rules say, fewer only when said
+arrange  stacks of enemies set out with hostile options: refused, or only the stacks' (or the named records')
+         positions and headings change, each placement on the mesh, the field or its own height as it says; the
+         same twice
+export   hostile mods exported as files to copy over the game: refused, or exactly the manifest's files inside the
+         folder with their hashes, each archive install's own build, the same twice, nothing written into the game
 names    plain names for any path or search word: a title says what the file is, enemies and stages only from the
          tables (case and a .yaml suffix aside), whole names before names holding the words
 mod_names  --mod "<name>": a path stays as given; a name is a mod of the mods folder, or refused; a new one is made
          only directly inside the mods folder, under the name as Windows keeps it
+import_inputs  what `import` is given: a folder yields exactly its archive files (a folder named x.arc is none), a
+         zip says to extract it first, anything else or nothing there is refused; nothing is written
 """
 from __future__ import annotations
 
@@ -1480,6 +1489,49 @@ def t_save_knowledge(data: bytes) -> None:
     assert saves.grant_knowledge(new, t) == (new, 0), "a second grant changed the save again"
 
 
+def t_save_arisen(data: bytes) -> None:
+    """A save's XML (what `riftstone saves arisen` edits) under stand-in skill tables, the edit picked by the first
+    bytes: it refuses with RiftError, or changes only the text of values inside the Arisen's records (both copies),
+    each written as the game writes one, as many as it reports; afterwards the records hold what was asked, every
+    skill of the vocation's weapons is learned with no palette slot left empty, and a second edit changes nothing."""
+    import re
+
+    from riftstone import saves
+
+    t = saves.SkillTables(first=(0, 10, 10, 100, 20, 30, 30, 100, 40, 50, 60, 70, 60),
+                          count=(0, 4, 4, 10, 4, 4, 4, 10, 2, 2, 2, 2, 2))
+    pick = data[:4].ljust(4, b"\0")
+    try:
+        edit = saves.ArisenEdit(level=1 + pick[0] % saves.LEVEL_MAX, rank=1 + pick[1] % saves.RANK_MAX,
+                                points=pick[2] * 4000, stats={"mHpMax": float(pick[3])}, skills=bool(pick[2] & 1),
+                                vocation=1 + pick[3] % len(saves.VOCATIONS) if pick[3] & 1 else None)
+        new, n = saves.set_arisen(saves.pack(data), edit, t)
+    except RiftError:
+        return
+    save = saves.pack(data)
+    assert n > 0 or new == save, "an edit that changed nothing rewrote the save"
+    after = saves.unpack(new)
+    values = re.compile(rb'<(f32|u32|u8|s16|s32)(?: name="[^"]*")? value="([^"]*)"/>')   # named scalars too
+    blank = rb'<\1 value=""/>'          # every value element, emptied: what is left must not change
+    assert values.sub(blank, data) == values.sub(blank, after), "the edit changed more than values"
+    changed = [(a, b) for a, b in zip(values.finditer(data), values.finditer(after)) if a.group(2) != b.group(2)]
+    assert len(changed) == n, f"{len(changed)} values changed; the edit says {n}"
+    records = [(s, e) for _, s, e in saves._arisen_records(after)]
+    for _, b in changed:
+        assert saves._WRITTEN[b.group(1).decode()].fullmatch(b.group(2)), f"wrote {b.group(2)!r}, not as the game writes"
+        assert any(s <= b.start() < e for s, e in records), "a value outside the Arisen's records changed"
+    seen = saves.arisen(new, t)
+    job = edit.vocation if edit.vocation is not None else next(iter(seen.values()))["job"]
+    for copy, r in seen.items():
+        assert (r["level"], r["ranks"][job], r["stats"]["mHpMax"]) == (edit.level, edit.rank, float(pick[3])), copy
+        assert all(p == edit.points for p in r["points"]), copy
+        if edit.skills and r["job"] == job:
+            for w, d in r["skills"].items():
+                assert d["learned"] == d["of"], f"{copy}: {w} has {d['learned']} of {d['of']} skills learned"
+                assert d["of"] < saves.PALETTE or -1 not in d["equipped"], f"{copy}: {w} palette {d['equipped']}"
+    assert saves.set_arisen(new, edit, t) == (new, 0), "a second edit changed the save again"
+
+
 def t_fsmap(data: bytes) -> None:
     """Names <-> paths reverse exactly for every resource type (the first two bytes pick it); decoded user
     paths are canonical."""
@@ -1556,11 +1608,11 @@ def close_caches() -> None:
     """Close and forget the stand-in games the filesystem targets keep for the life of their process: their index
     databases stay open in the scratch folder otherwise (a worker that ends closes them anyway; a replay runs the
     targets in its own process, then removes that folder).  The next case builds them again."""
-    global _AUTHOR, _WORLD, _STUDIO, _SF
-    for cached in (_AUTHOR, _WORLD):
+    global _AUTHOR, _WORLD, _STUDIO, _SF, _MULT_WORLD, _NAV_WORLD
+    for cached in (_AUTHOR, _WORLD, _MULT_WORLD, _NAV_WORLD):
         if cached is not None:
             cached[1].close()
-    _AUTHOR = _WORLD = _STUDIO = _SF = None
+    _AUTHOR = _WORLD = _STUDIO = _SF = _MULT_WORLD = _NAV_WORLD = None
 
 
 def t_pack(data: bytes) -> None:
@@ -2573,6 +2625,64 @@ def t_mod_names(data: bytes) -> None:
             assert os.path.basename(os.path.abspath(got)) == arg.strip(), f"Windows would not keep {arg.strip()!r}"
 
 
+def t_import_inputs(data: bytes) -> None:
+    """What `import` is given.  Each byte makes one entry in a scratch folder (its low 3 bits the kind: an archive
+    file in either case, a zip / 7z / rar, a text file, a file with no extension, a folder named like an archive;
+    the next bits how deep).  A folder yields exactly its archive files, found anywhere under it (a folder named
+    x.arc is how Riftstone unpacks an archive, not one to read); a file is taken only when it is an archive, a
+    compressed one says to extract it first, anything else or a missing path is refused, and a folder holding no
+    archive is refused: always a RiftError, and nothing is written."""
+    import shutil
+
+    from riftstone import importer
+
+    kinds = (".arc", ".ARC", ".zip", ".7z", ".rar", ".txt", "", ".arc")
+    root = Path(tempfile.mkdtemp(prefix="rsfz-imp-", dir=os.environ.get("RIFTSTONE_FUZZ_TMP") or None))
+    try:
+        made = []
+        for i, b in enumerate(data[:12]):
+            kind = b & 7
+            parent = root.joinpath(*("a", "b")[:(b >> 3) % 3])
+            parent.mkdir(parents=True, exist_ok=True)
+            p = parent / f"f{i}{kinds[kind]}"
+            if kind == 7:
+                p.mkdir()
+            else:
+                p.write_bytes(b"x")
+            made.append((p, kind))
+        before = sorted(str(x) for x in root.rglob("*"))
+        archives = {p for p, k in made if k in (0, 1)}
+        try:
+            got = importer._inputs([root])
+        except RiftError as e:
+            assert not archives, f"a folder holding {sorted(archives)} was refused: {e}"
+            assert "no .arc archives" in str(e), e
+        else:
+            assert archives, f"a folder with no archive file gave {got}"
+            assert {f for f, _ in got} == archives, f"{got} is not exactly the archive files {sorted(archives)}"
+            assert all(base == root and f.is_file() for f, base in got), got
+        for p, k in made:
+            try:
+                given = importer._inputs([p])
+            except RiftError as e:
+                if k == 7:
+                    want = "no .arc archives"                    # a folder given: nothing inside it
+                else:
+                    want = "extract it first" if k in (2, 3, 4) else "not an archive or a folder of archives"
+                assert k not in (0, 1) and want in str(e), f"{p}: {e}"
+            else:
+                assert k in (0, 1) and given == [(p, p.parent)], f"{p} was taken: {given}"
+        try:
+            importer._inputs([root / "missing.arc"])
+        except RiftError as e:
+            assert "not an archive or a folder of archives" in str(e), e
+        else:
+            raise AssertionError("a path that is not there was taken")
+        assert sorted(str(x) for x in root.rglob("*")) == before, "reading the inputs changed the folder"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def t_port(data: bytes) -> None:
     """Cross-game conversion (first byte picks type and direction): refuses cleanly, or produces a
     resource the destination game's parser accepts; a template material always yields a valid .mrl."""
@@ -2995,6 +3105,8 @@ def t_package_plugins(data: bytes) -> None:
         assert "@VERSION@" not in text and "@PLUGIN_NAMES@" not in text and "@DESCRIPTIONS@" not in text, "an unfilled part"
         known = re.search(r'^set "KNOWN=([^"]*)"', text, re.M)
         assert known is not None and all(re.fullmatch(r"[A-Za-z0-9_]+", n) for n in known.group(1).split()), "KNOWN"
+        # one zip unzipped over another replaces the script: every Riftstone feature stays named (1.0.4)
+        assert set(package.OWN_PLUGINS) <= {n.lower() for n in known.group(1).split()}, "a Riftstone feature unnamed"
         flat = text.replace("\r\n", "\n")               # the generated labels: a name, its title and its line, no more
         labels = re.findall(r'^:desc_(\w+)\nset "TITLE=([^\n]*)"\nset "WHAT=([^\n]*)"\nexit /b 0$', flat, re.M)
         assert sorted(n for n, _, _ in labels) == sorted(known.group(1).split()), "a label per name"
@@ -3409,6 +3521,8 @@ def t_report(data: bytes) -> None:
     assert lines and all(isinstance(x, str) for x in lines), "explanation is not text"
     if r["missing_file"] is not None:
         assert r["missing_file"] and "\n" not in r["missing_file"], "missing file spans lines"
+    for k, v in r["device"].items():
+        assert v is None or type(v) is int or (isinstance(v, str) and "\n" not in v), f"device {k} is not a plain value"
 
 
 def t_session(data: bytes) -> None:
@@ -3682,6 +3796,58 @@ def t_plugin_ini(data: bytes) -> None:
         (old, old_crcr), (new, new_crcr) = _ini_view(ini), _ini_view(path.read_bytes())
         assert len(old) == len(new) and sum(a != b for a, b in zip(old, new)) <= 1, "other lines changed"
         assert new_crcr <= old_crcr, "a line ending was doubled"
+
+
+def t_stage_enemies_ini(data: bytes) -> None:
+    """stage_enemies.ini (any bytes), then after a line "#rows" one row a line, "STAGE MODS: ENEMY, ENEMY" (UTF-8).
+    The install's block (stage_enemies.write_block) is refused only for a UTF-16 mark on text that does not
+    decode; otherwise the file keeps its encoding; writing twice gives the same bytes; the block is there once,
+    in the first [stage_enemies] section, holding exactly block_lines(rows); and removing it gives the file's own
+    lines (an old block taken out too), plus at most the section header the block needed."""
+    from riftstone import stage_enemies as se
+    from riftstone.runtime import INI_UTF16
+
+    ini, _, spec = data.partition(b"\n#rows\n")
+    rows = []
+    for line in spec.decode("utf-8", "replace").splitlines()[:40]:
+        head, _, tail = line.partition(":")
+        stage, _, mods = head.strip().partition(" ")
+        if stage.isdigit() and len(stage) < 8:
+            rows.append({"stage": int(stage), "enemies": [e.strip() for e in tail.split(",") if e.strip()],
+                         "over": [], "no_archive": [], "mods": [mods]})
+    try:
+        out = se.write_block(ini, rows)
+    except RiftError:
+        assert ini.startswith(INI_UTF16), "refused a file that is not UTF-16"
+        try:
+            ini[2:].decode("utf-16-le", "surrogatepass")
+        except UnicodeDecodeError:
+            return
+        raise AssertionError("refused UTF-16 text that decodes")
+    utf16 = ini.startswith(INI_UTF16)
+    assert out.startswith(INI_UTF16) == utf16, "the encoding changed"
+    assert se.write_block(out, rows) == out, "a second install changed the file"
+
+    def text(raw: bytes) -> list[str]:
+        t = raw[2:].decode("utf-16-le", "surrogatepass") if utf16 else raw.decode("latin-1")
+        return [x.rstrip("\r\n") for x in se.lines_of(t)]
+
+    # the block as the file's encoding holds it: in a code-page file a mod name's character Latin-1 has not is '?'
+    body = [x if utf16 else x.encode("latin-1", "replace").decode("latin-1") for x in se.block_lines(rows)]
+    got = text(out)
+    begins = [i for i, x in enumerate(got) if x == se.BEGIN]
+    if body:
+        assert len(begins) == 1 and got[begins[0]:begins[0] + len(body)] == body, "the block is not the rows' lines"
+        heads = [i for i, x in enumerate(got) if x.lstrip(" \t").startswith("[")]
+        above = max((i for i in heads if i < begins[0]), default=None)
+        first = next((i for i in heads if got[i].strip(" \t").lower() == "[stage_enemies]"), None)
+        assert above is not None and above == first, "the block is outside the first [stage_enemies]"
+    else:
+        assert not begins, "a block without rows"
+    own = text(se.write_block(ini, []))
+    back = text(se.write_block(out, []))
+    assert back in (own, own + ["[stage_enemies]"]), "removing the block changed the file's own lines"
+    assert text(se.write_block(se.write_block(ini, []), [])) == own, "a block survived its removal"
 
 
 PLAN_ENTRIES = 4      # of a fuzzed plan applied to the stand-in game: a few stack as a whole plan does
@@ -4185,6 +4351,404 @@ def t_ground(data: bytes) -> None:
         assert any(f"only {enc.points} of {asked} spawn points" in n for n in enc.notes), "fewer points, unsaid"
 
 
+_MULT_WORLD = None
+
+
+def _multiply_world():
+    """The stand-in game 'riftstone multiply' is tested on (tests/multiply_fixture.py), built once per worker."""
+    global _MULT_WORLD
+    if _MULT_WORLD is None:
+        import atexit
+        import shutil
+
+        import multiply_fixture
+        from riftstone import world
+        from riftstone.index import Index
+
+        base = Path(tempfile.mkdtemp(prefix="rsfz-mult-", dir=os.environ.get("RIFTSTONE_FUZZ_TMP") or None))
+        atexit.register(shutil.rmtree, base, True)
+        os.environ["RIFTSTONE_HOME"] = str(base / "home")
+        game = multiply_fixture.make(base / "game")
+        idx = Index(game)
+        idx.refresh()
+        _MULT_WORLD = (game, idx, world.load(game, idx), base)
+    return _MULT_WORLD
+
+
+def t_multiply(data: bytes) -> None:
+    """'riftstone multiply' with hostile options (JSON: factor, stages, enemies, bosses, spread, plain, champions,
+    again) on the stand-in game of tests/multiply_fixture.py: refused with RiftError, or a plan that holds to its
+    word (_multiply_holds) and is the same planned twice; planning writes nothing; written, every file is inside
+    the mod, loads back to the plan's bytes and is in the record; ``again`` (another factor) written over it leaves
+    exactly that plan's files; a planned file somebody changed since is not overwritten."""
+    import shutil
+
+    from riftstone import modfiles, multiply
+    from riftstone import mod as modlib
+
+    game, idx, w, base = _multiply_world()
+    try:
+        case = json.loads(data.decode("utf-8", "replace"))
+    except (ValueError, RecursionError):
+        raise RiftError("not a case") from None
+    if not isinstance(case, dict):
+        raise RiftError("not a case")
+    kw = {}
+    for k in ("stages", "enemies"):
+        v = case.get(k)
+        if v is not None:
+            if not isinstance(v, list) or len(v) > 8:
+                raise RiftError("not a case")
+            kw[k] = v
+    for k in ("bosses", "plain", "champions"):
+        if k in case:
+            kw[k] = bool(case[k])
+    if "spread" in case:
+        kw["spread"] = case["spread"]
+    factor = case.get("factor", 2)
+    root = base / "mod"
+    if root.exists():
+        shutil.rmtree(root)
+    modlib.Mod.create(root, "Fuzz")
+    before = _outside(base, root)
+
+    def held() -> dict:
+        return {f.relative_to(root).as_posix(): f.read_bytes() for f in root.rglob("*") if f.is_file()}
+
+    def check_written(p) -> None:
+        rec = multiply.read_record(root)
+        assert rec is not None and rec["factor"] == p.factor and rec["copies"] == p.copies, "the record is not the plan's"
+        mine = {k for k in held() if k.startswith("files/") and k != "files/README.txt"}
+        assert mine == set(rec["files"]), f"the mod holds {sorted(mine ^ set(rec['files']))[:4]} beside the record"
+        assert len(mine) == len(p.files), "a planned file is missing"
+        for name, (tid, raw) in p.files.items():
+            got, f = modfiles.load(game, idx, root, name.encode("latin-1"), tid)
+            assert got == raw and f is not None and f.suffix == ".yaml", f"{name} does not load back from the mod"
+
+    try:
+        start = held()
+        try:
+            p = multiply.plan(game, idx, w, factor, **kw)
+        finally:
+            assert held() == start, "planning wrote into the mod"
+        _multiply_holds(p, game, idx, w, kw)
+        assert multiply.plan(game, idx, w, factor, **kw).files == p.files, "the same plan twice differs"
+        multiply.write(p, root)
+        check_written(p)
+        again = case.get("again")
+        if again is not None:
+            p2 = multiply.plan(game, idx, w, again, **kw)
+            multiply.write(p2, root)
+            check_written(p2)
+            if p2.files:                                 # somebody edits a file: the next run leaves it alone
+                name, (tid, _raw) = sorted(p2.files.items())[0]
+                f = modfiles.paths(root, name.encode("latin-1"), tid)[0]
+                f.write_bytes(f.read_bytes() + b"# mine\n")
+                kept = held()
+                try:
+                    multiply.write(p, root)
+                except RiftError:
+                    assert held() == kept, "a refused run changed the mod"
+                else:
+                    raise AssertionError("a file changed since the last run was overwritten")
+    finally:
+        changed = _changed(before, _outside(base, root))
+        assert not changed, f"wrote outside the mod: {changed[:5]}"
+
+
+def _multiply_holds(p, game, idx, w, kw: dict) -> None:
+    """A multiply plan against its word.  Every planned layout is an enemy layout of a stage asked for; the game's
+    own records come first, unchanged; each record after them is a copy of an enemy of that layout: asked for, not
+    scripted, not the story's, a big monster only with ``bosses``, standing within the rings of an original of its
+    kind, and with ``plain`` the same as one but for its id and position.  Each group's ids are used once across
+    its layouts and stay under the kill record's 32; a group gets at most factor - 1 copies of each placement.  A
+    planned group list differs from the game's in caps alone, each the game's times the factor.  The counts add up."""
+    import math
+
+    from riftstone import gpl, lot, modfiles, multiply
+
+    LOT, GPL = typemap.BY_EXT["lot"], typemap.BY_EXT["gpl"]
+    wanted = None if kw.get("enemies") is None else {str(e).lower() for e in kw["enemies"]}
+    bosses, plain = bool(kw.get("bosses")), bool(kw.get("plain"))
+    reach = float(kw.get("spread", multiply.SPREAD)) * multiply.BIG_SPREAD * (multiply.RINGS + 0.5) + 1.0
+    groups: dict = {}
+    copies = 0
+    for name, (tid, data) in sorted(p.files.items()):
+        own = modfiles.load(game, idx, None, name.encode("latin-1"), tid)[0]
+        if tid == GPL:
+            a, b = gpl.parse(own), gpl.parse(data)
+            assert [g["mGroup"] for g in a.groups] == [g["mGroup"] for g in b.groups], "a group list's groups changed"
+            caps = 0
+            for ga, gb in zip(a.groups, b.groups):
+                if ga != gb:
+                    cap = ga["mSetCountMax"]
+                    assert cap >= 0 and gb["mSetCountMax"] == min(cap * p.factor, 9999), "a cap is not the game's x N"
+                    gb["mSetCountMax"] = cap
+                    caps += 1
+            assert caps and gpl.build(b) == own, "a group list changed in more than its caps"
+            continue
+        assert tid == LOT and name in w.layouts, f"{name}: not a layout of the game"
+        lay = w.layouts[name]
+        assert lay["type"] == "e" and (kw.get("stages") is None or lay["stage"] in kw["stages"]), f"{name} not asked for"
+        a, b = lot.parse(own), lot.parse(data)
+        lot.check_ids(b)
+        n = len(a.records)
+        assert len(b.records) > n and lot.build(lot.Lot(b.records[:n])) == own, f"{name}: the game's records changed"
+        g = groups.setdefault((lay["stage"], lay["number"]), {"ids": [], "new": 0})
+        g["ids"] += [r.id for r in b.records]
+        g["new"] += len(b.records) - n
+        for r in b.records[n:]:
+            copies += 1
+            like = [o for o in a.records if (o.cls, o.name) == (r.cls, r.name) and multiply._script(o) in multiply.NO_SCRIPT]
+            assert like, f"{name}: a copy of nothing in its layout"
+            assert wanted is None or r.name.lower() in wanted, "an enemy nobody asked for was copied"
+            assert multiply._script(r) in multiply.NO_SCRIPT, "a scripted placement was copied"
+            assert not r.name.lower().startswith(multiply.STORY), "the story's own fight was copied"
+            assert bosses or not r.fields.get("mBossFlag"), "a big monster was copied"
+            at = r.vec()
+            assert all(math.isfinite(v) for v in at), "a copy stands nowhere"
+            assert any(math.hypot(at[0] - o.vec()[0], at[2] - o.vec()[2]) <= reach for o in like), \
+                f"{name}: a copy stands {reach:g} cm or more from every original of its kind"
+            if plain:
+                def rest(x):
+                    return {k: v for k, v in x.fields.items() if k != "mPosition"}
+                assert any(rest(o) == rest(r) for o in like), "--plain changed more than a copy's place"
+    for name, lay in w.layouts.items():                  # a group's layouts the plan left alone still hold its ids
+        key = (lay["stage"], lay["number"])
+        if lay["type"] == "e" and key in groups and name not in p.files:
+            own = modfiles.load(game, idx, None, name.encode("latin-1"), LOT)[0]
+            groups[key]["ids"] += [r.id for r in lot.parse(own).records]
+    for (stage, number), g in groups.items():
+        ids = g["ids"]
+        assert len(set(ids)) == len(ids), f"stage {stage} group {number}: a placement id is used twice"
+        assert max(ids) < lot.KILL_BITS, f"stage {stage} group {number}: an id past the kill record"
+        assert g["new"] <= (len(ids) - g["new"]) * (p.factor - 1), f"stage {stage} group {number}: too many copies"
+    c = p.counts
+    assert copies == p.copies == c.get("copies", 0) == sum(v[1] for v in p.stages.values()), "the copies do not add up"
+    assert copies == c.get("on_mesh", 0) + c.get("on_field", 0) + c.get("beside", 0), "where the copies stand does not add up"
+    assert c.get("groups", 0) == len(groups) and (bool(copies) or not p.files), "the groups do not add up"
+    assert isinstance(p.summary(), list) and all(isinstance(s, str) and "\n" not in s for s in p.summary())
+
+
+def t_arrange(data: bytes) -> None:
+    """'riftstone arrange' with hostile stacks and options (JSON: stage, label, stacks [[enemy, count, [x, y, z]]],
+    shape, spread, heading, toward, records) on the stand-in game of tests/multiply_fixture.py: refused with
+    RiftError, or a layout whose records keep their ids, kinds and every field but mPosition and mAngle y; only
+    the placements of a stack (or the records named) move, each stack in full; a placement said to be on the mesh
+    stands on it, one on the field within FIELD_STAND of its ground, one kept flat at its own height; the result
+    rebuilds byte-exact and is the same arranged twice."""
+    import math
+
+    from riftstone import arrange, lot, nav
+
+    game, idx, w, _base = _multiply_world()
+    try:
+        case = json.loads(data.decode("utf-8", "replace"))
+    except (ValueError, RecursionError):
+        raise RiftError("not a case") from None
+    if not isinstance(case, dict) or not isinstance(case.get("stacks", []), list) or len(case.get("stacks", [])) > 6:
+        raise RiftError("not a case")
+    kinds = {"em0100": 4, "em0101": 5, "em0600": 19, "em5200": 26, "em1002": 3}
+    recs = []
+    for st in case.get("stacks", []):
+        if not (isinstance(st, list) and len(st) == 3 and st[0] in kinds and isinstance(st[1], int)
+                and 0 < st[1] <= 16 and isinstance(st[2], list) and len(st[2]) == 3):
+            raise RiftError("not a stack")
+        try:
+            at = tuple(float(v) for v in st[2])
+        except (TypeError, ValueError, OverflowError):
+            raise RiftError("not a spot") from None
+        if not all(math.isfinite(v) and abs(v) < 1e6 for v in at):
+            raise RiftError("not a spot")
+        for _ in range(st[1]):
+            recs.append(lot.blank(kinds[st[0]], len(recs), mName=st[0], mPosition=at, mSetID=-1))
+    stage = case.get("stage")
+    if stage is not None and not (isinstance(stage, int) and 0 <= stage <= 999):
+        raise RiftError("not a stage")
+    label = case.get("label", lot.layout_name(stage, 0, 0, "e", 9) if stage is not None else "fuzz.lot")
+    if not isinstance(label, str) or len(label) > 200:
+        raise RiftError("not a label")
+    kw = {}
+    for k in ("shape", "spread", "heading", "records"):
+        if k in case:
+            kw[k] = case[k]
+    if "toward" in case:
+        kw["toward"] = arrange.parse_point(",".join(str(v) for v in case["toward"])
+                                           if isinstance(case["toward"], list) else case["toward"])
+    if "records" in kw and not (isinstance(kw["records"], list) and all(isinstance(n, int) and 0 <= n < 4096
+                                                                         for n in kw["records"])):
+        raise RiftError("not records")
+    if "spread" in kw and not isinstance(kw["spread"], (int, float)):
+        raise RiftError("not a spread")
+    if "heading" in kw and not isinstance(kw["heading"], (int, float)):
+        raise RiftError("not a heading")
+    raw = lot.build(lot.Lot(recs))
+    ar = arrange.Arranger(game, idx, w)
+    r = ar.layout(raw, label, stage, **kw)
+    assert ar.layout(raw, label, stage, **kw).data == r.data, "arranged twice differs"
+    before, after = lot.parse(raw), lot.parse(r.data)
+    assert lot.build(after) == r.data, "the arranged layout does not rebuild"
+    assert len(after.records) == len(before.records), "records came or went"
+    moved = {p.number for st in r.stacks for p in st.placed}
+    assert len(moved) == r.moved, "a record was placed twice"
+    if "records" in kw:
+        assert moved == set(kw["records"]), "the records named are not the ones set out"
+    else:
+        own = ar.games_own(label, before.records)
+        assert sorted(moved) == sorted(n for s in arrange.stacks(before.records) for n in s if n not in own), \
+            "not the stacks (less the game's own placements)"
+    for i, (b, a) in enumerate(zip(before.records, after.records)):
+        assert (a.id, a.kind) == (b.id, b.kind), "a record's id or kind changed"
+        assert {k: v for k, v in a.fields.items() if k not in ("mPosition", "mAngle")} == \
+            {k: v for k, v in b.fields.items() if k not in ("mPosition", "mAngle")}, "another field changed"
+        if i not in moved:
+            assert a.fields == b.fields, "a record nobody named moved"
+        else:
+            assert all(math.isfinite(v) for v in a.vec()), "a placement went nowhere"
+            assert a.vec("mAngle")[0] == b.vec("mAngle")[0] and a.vec("mAngle")[2] == b.vec("mAngle")[2]
+            assert -math.pi - 1e-6 <= a.vec("mAngle")[1] <= math.pi + 1e-6, "a heading out of range"
+    mesh = nav.stage_mesh(game, idx, r.stage) if r.stage is not None else None     # the label may name it
+    for st in r.stacks:
+        for i, p in enumerate(st.placed):
+            if p.how == "on_mesh":
+                assert mesh is not None and mesh.locate(p.now) is not None, "on the mesh, but not on it"
+            elif p.how == "on_field":
+                g = ar.ground(r.stage).field.under(p.now)
+                assert g is not None and -0.5 <= p.now[1] - g[0] <= arrange.FIELD_STAND + 0.5, "not on the field"
+            elif p.how == "kept":
+                assert tuple(p.now) == tuple(p.was), "kept, but moved"
+            else:
+                assert p.how == "flat" and abs(p.now[1] - p.was[1]) < 0.01, "flat, but not at its own height"
+            if p.how != "kept":
+                for q in st.placed[:i]:
+                    assert q.how == "kept" or math.dist(p.now, q.now) > 1.0, "two set out on one spot"
+
+
+_EXPORT_RUNS = [0]
+
+
+def t_export(data: bytes) -> None:
+    """'riftstone export' of hostile mods (JSON: mods [{loose {path: text}, files {path: text}, paste [[x, y, z]]}],
+    inside) on the stand-in game of tests/multiply_fixture.py: refused (exit 2), or a folder that holds exactly
+    the manifest's files (plus the READ ME and the stage_enemies lines when there are any), each inside it with its
+    size and SHA-256; every archive install's own build of the same plan, replacing the game's archive of that
+    path; every loose file the mod's own bytes under nativePC/ (compat/ under riftstone/overlay/); the same export
+    twice the same manifest; an output folder inside the game refused with nothing written there."""
+    import contextlib
+    import hashlib
+    import io
+    import math
+    import shutil
+
+    from riftstone import cli, lot, mod as modlib, modfiles, typemap
+
+    game, idx, _w, base = _multiply_world()
+    try:
+        case = json.loads(data.decode("utf-8", "replace"))
+    except (ValueError, RecursionError):
+        raise RiftError("not a case") from None
+    if not isinstance(case, dict) or not isinstance(case.get("mods"), list) or not 1 <= len(case["mods"]) <= 3:
+        raise RiftError("not a case")
+    _EXPORT_RUNS[0] += 1
+    work = base / f"export-{os.getpid()}-{_EXPORT_RUNS[0]}"
+    try:
+        roots = []
+        LOT = typemap.BY_EXT["lot"]
+        name = lot.layout_name(424, 0, 0, "e", 7).encode("latin-1")
+        for i, m in enumerate(case["mods"]):
+            if not isinstance(m, dict):
+                raise RiftError("not a mod")
+            mm = modlib.Mod.create(work / "mods" / f"m{i}", None, "", "ddda")
+            for key, folder in (("loose", modlib.LOOSE_DIR), ("files", "files")):
+                entries = m.get(key, {})
+                if not isinstance(entries, dict) or len(entries) > 4:
+                    raise RiftError("not a file list")
+                for rel, text in entries.items():
+                    if not (isinstance(rel, str) and isinstance(text, str) and 0 < len(rel) <= 120
+                            and len(text) <= 4000):
+                        raise RiftError("not a file")
+                    f = (mm.root / folder / rel).resolve()
+                    if not f.is_relative_to((mm.root / folder).resolve()) or f == (mm.root / folder).resolve():
+                        raise RiftError("a path outside the mod")
+                    try:
+                        f.parent.mkdir(parents=True, exist_ok=True)
+                        f.write_bytes(text.encode("utf-8", "surrogatepass"))
+                    except (OSError, UnicodeEncodeError, ValueError):
+                        raise RiftError("a path this PC cannot hold") from None
+            paste = m.get("paste", [])
+            if not isinstance(paste, list) or len(paste) > 8:
+                raise RiftError("not a paste")
+            if paste:
+                raw, out = modfiles.load(game, idx, mm.root, name, LOT)
+                lt = lot.parse(raw)
+                top = max(r.id for r in lt.records)
+                for k, at in enumerate(paste):
+                    if not (isinstance(at, list) and len(at) == 3 and all(isinstance(v, (int, float)) for v in at)
+                            and all(math.isfinite(v) and abs(v) < 1e6 for v in at)):
+                        raise RiftError("not a spot")
+                    c = lt.records[0].copy()
+                    c.id = top + 1 + k
+                    c.set_vec("mPosition", tuple(float(v) for v in at))
+                    lt.records.append(c)
+                modfiles.save(out, lot.build(lt), name, LOT)
+            roots.append(str(mm.root))
+
+        def run(*argv) -> int:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                return cli.main(["export", *roots, *argv, "--game", str(game.root)])
+
+        if case.get("inside"):
+            before = sorted(p.relative_to(game.root) for p in game.root.rglob("*"))
+            assert run("--out", str(game.root / "exported")) == 2, "an export into the game was not refused"
+            assert sorted(p.relative_to(game.root) for p in game.root.rglob("*")) == before, \
+                "an export into the game wrote there"
+            return
+        dest = work / "out"
+        code = run("--out", str(dest))
+        if code == 2:
+            assert not dest.exists() or not any(dest.rglob(cli.EXPORT_MANIFEST)), "refused, but a manifest was written"
+            raise RiftError("refused")
+        assert code == 0, f"export exited {code}"
+        man = json.loads((dest / cli.EXPORT_MANIFEST).read_text(encoding="utf-8"))
+        assert man["schema"] == "riftstone-export/1" and man["game"] == "ddda"
+        listed = {r["path"] for r in man["files"]}
+        assert len(listed) == len(man["files"]), "a file listed twice"
+        extra = {cli.EXPORT_MANIFEST, cli.EXPORT_README} | ({cli.EXPORT_LINES} if man["stage_enemies"] else set())
+        on_disk = {p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file()}
+        assert on_disk == listed | extra, f"files not in the manifest or missing: {sorted(on_disk ^ (listed | extra))}"
+        mods = [modlib.Mod.load(Path(r)) for r in roots]
+        plan = modlib.plan(game, idx, mods)
+        loose = {}
+        for m in mods:
+            loose.update(modlib.collect_loose(m))
+        by_path = {"nativePC/" + a.replace("\\", "/") + ".arc": a for a in plan.archives}
+        for r in man["files"]:
+            path = (dest / r["path"]).resolve()
+            assert path.is_relative_to(dest.resolve()) and ".." not in r["path"].split("/"), "a path out of the folder"
+            body = path.read_bytes()
+            assert len(body) == r["bytes"] and hashlib.sha256(body).hexdigest() == r["sha256"], "size or hash"
+            if r.get("loose"):
+                rel = r["path"].split("/", 1)[1] if r["path"].startswith("nativePC/") else \
+                    r["path"][len("riftstone/overlay/"):]
+                assert r["path"].startswith("riftstone/overlay/compat/") == rel.lower().startswith("compat/")
+                assert loose.get(rel) == body, "a loose file that is not the mods'"
+            else:
+                assert r["path"].startswith("nativePC/") and r["path"].endswith(".arc")
+                assert r["path"] in by_path, "an archive the plan does not change"
+                a = by_path[r["path"]]
+                assert modlib.build_archive(game, a, plan.archives[a]).data == body, "not install's own build"
+                orig = game.vanilla_arc(a)
+                assert r["replaces"] == (hashlib.sha256(orig.read_bytes()).hexdigest() if orig.is_file() else None)
+        assert {r["path"] for r in man["files"] if not r.get("loose")} == set(by_path), \
+            "not every archive the plan builds"
+        assert run("--out", str(dest)) == 2, "a folder with files in it was written over without --force"
+        again = work / "again"
+        assert run("--out", str(again)) == 0
+        assert json.loads((again / cli.EXPORT_MANIFEST).read_text(encoding="utf-8")) == man, "two exports differ"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 TARGETS = {
     "audio": (t_audio, False, 1 << 17),
     "audio_bank": (t_audio_bank, False, 1 << 17),
@@ -4220,6 +4784,7 @@ TARGETS = {
     "ddo_names": (t_ddo_names, True, 1 << 10),
     "names": (t_names, True, 1 << 10),
     "mod_names": (t_mod_names, True, 1 << 9),
+    "import_inputs": (t_import_inputs, False, 1 << 4),
     "port": (t_port, False, 1 << 18),
     "dye": (t_dye, False, 1 << 12),
     "dye_tables": (t_dye_tables, False, 1 << 16),
@@ -4279,6 +4844,7 @@ TARGETS = {
     "schedule_yaml": (t_schedule_yaml, True, 1 << 17),
     "save": (t_save, False, 1 << 19),
     "save_knowledge": (t_save_knowledge, True, 1 << 17),
+    "save_arisen": (t_save_arisen, True, 1 << 17),
     "xfs": (t_xfs, False, 1 << 19),
     "xfs_ddo_text": (t_xfs_ddo_text, False, 1 << 12),
     "params": (t_params, True, 1 << 19),
@@ -4290,6 +4856,7 @@ TARGETS = {
     "report": (t_report, True, 1 << 14),
     "session": (t_session, True, 1 << 13),
     "plugin_ini": (t_plugin_ini, True, 1 << 12),
+    "stage_enemies_ini": (t_stage_enemies_ini, True, 1 << 12),
     "minidump": (t_minidump, False, 1 << 14),
     "portcrystals": (t_portcrystals, False, 1 << 13),
     "portcrystals_save": (t_portcrystals_save, False, 1 << 12),
@@ -4302,4 +4869,7 @@ TARGETS = {
     "wfc": (t_wfc, False, 1 << 8),
     "dungeon": (t_dungeon, True, 1 << 11),
     "ground": (t_ground, True, 1 << 10),
+    "multiply": (t_multiply, True, 1 << 10),
+    "arrange": (t_arrange, True, 1 << 10),
+    "export": (t_export, True, 1 << 12),
 }

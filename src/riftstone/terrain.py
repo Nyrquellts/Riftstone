@@ -349,3 +349,82 @@ def check(data: bytes, cell: Cell) -> tuple[list[str], list[str]]:
                      f"z {lo[2]:.0f}..{hi[2]:.0f}; vanilla stays within {-reach:.0f}..{CELL + reach:.0f}); the "
                      "engine still puts it at the cell's corner")
     return errors, notes
+
+
+# -- the open field's ground ---------------------------------------------------------------------
+GROUND_GRID = 500.0         # cm: the lookup grid over a cell's walkable triangles
+GROUND_SLOPE = 0.7          # a triangle's normal.y: flatter than about 45 degrees counts as ground to stand on
+STAND_ABOVE = 60.0          # the height window nav.Mesh.locate uses: ground up to 60 cm over the point...
+STAND_BELOW = 300.0         # ...or 3 m under it
+
+
+class Ground:
+    """The open field's walkable ground: the cells' merged ``e`` collision (``Cell.collisions[1]``), which lies on
+    its cell's terrain in the cell's frame.  Stage 100 has no navigation mesh, so this is what says where the ground
+    is there.  Measured (``tools/multiply_proof.py``): of the game's 2,643 enemy placements in the field 2,627 have
+    this collision under them, and they stand on it (median gap 0 cm, 2,506 within 35 cm); the others are flyers.
+
+    ``load(name)`` gives a collision resource's bytes by its engine name, or None; each cell is read once."""
+
+    def __init__(self, load):
+        self._load = load
+        self._cells: dict[Cell, dict | None] = {}
+
+    def _grid(self, cell: Cell) -> dict | None:
+        if cell not in self._cells:
+            data = self._load(cell.collisions[1])
+            grid = None
+            if data is not None:
+                grid = {}
+                for a, b, c, n in sbc.triangles(data):
+                    if not n[1] > 0.0:
+                        continue                                  # a wall, or the underside of something
+                    x0, x1 = min(a[0], b[0], c[0]), max(a[0], b[0], c[0])
+                    z0, z1 = min(a[2], b[2], c[2]), max(a[2], b[2], c[2])
+                    if not all(math.isfinite(v) for v in (x0, x1, z0, z1)) or x1 - x0 > 4 * CELL or z1 - z0 > 4 * CELL:
+                        continue
+                    for gx in range(math.floor(x0 / GROUND_GRID), math.floor(x1 / GROUND_GRID) + 1):
+                        for gz in range(math.floor(z0 / GROUND_GRID), math.floor(z1 / GROUND_GRID) + 1):
+                            grid.setdefault((gx, gz), []).append((a, b, c, n[1]))
+            self._cells[cell] = grid
+        return self._cells[cell]
+
+    def _under(self, cell: Cell, x: float, y: float, z: float, above: float, below: float):
+        grid = self._grid(cell)
+        if not grid:
+            return None
+        ox, _, oz = cell.offset
+        lx, lz = x - ox, z - oz
+        best = None
+        for a, b, c, ny in grid.get((math.floor(lx / GROUND_GRID), math.floor(lz / GROUND_GRID)), ()):
+            d = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2])
+            if abs(d) < 1e-9:
+                continue
+            l1 = ((b[2] - c[2]) * (lx - c[0]) + (c[0] - b[0]) * (lz - c[2])) / d
+            l2 = ((c[2] - a[2]) * (lx - c[0]) + (a[0] - c[0]) * (lz - c[2])) / d
+            l3 = 1.0 - l1 - l2
+            if min(l1, l2, l3) < -1e-6:
+                continue
+            h = l1 * a[1] + l2 * b[1] + l3 * c[1]
+            if y - below <= h <= y + above and (best is None or abs(h - y) < abs(best[0] - y)):
+                best = (h, ny)
+        return best
+
+    def under(self, p, above: float = STAND_ABOVE, below: float = STAND_BELOW) -> tuple[float, float] | None:
+        """(the ground's height, its normal.y) at world point p: the walkable surface nearest p's height, from
+        ``below`` under it to ``above`` over it; None where the field has no ground there (a flyer's perch, the
+        sea, a cell without collision).  The point's own cell first, then the cells around it, whose collision
+        reaches up to a whole cell past their own."""
+        x, y, z = p
+        home = cell_at(x, z)
+        got = self._under(home, x, y, z, above, below)
+        if got is not None:
+            return got
+        best = None
+        for dm in (-1, 0, 1):
+            for dn in (-1, 0, 1):
+                if (dm or dn) and home.m + dm >= 0 and home.n + dn >= 0:
+                    g = self._under(Cell(home.m + dm, home.n + dn), x, y, z, above, below)
+                    if g is not None and (best is None or abs(g[0] - y) < abs(best[0] - y)):
+                        best = g
+        return best

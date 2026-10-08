@@ -23,8 +23,8 @@ Corrections to the plan that started this project:
 |---|---|
 | DDDA is 64-bit | `DDDA.exe` is PE32 (x86), LAA already set |
 | `.aibc` AI bytecode | No such type. AI is XFS: `rAIFSM` (.fsm, 4,385 instances / 3,073 distinct), `rAIGoalPlanning`, `rAIPriorityThink`, plus binary `rAIEnemyActionParameter` (.eap), `rAISensorExt` |
-| `.ccl` is climbing collision | `.ccl` is `rChainCol` (chain collision, 4 files in the whole game). Grab/climb data location: UNKNOWN (candidates: `rObjCollision` .ocl, `rAreaHitShape`, `rRegionStatus` .rst) |
-| `em_param` enemy tables | No such type. Enemy data is spread over `rShlParamList` (.shl, XFS), `rAdjustParam` (.ajp), `rPropParam` (.prp, magic PRPZ), `rRegionStatus` (.rst), `rStatusParam` (.statusparam, XFS) and others |
+| `.ccl` is climbing collision | `.ccl` is `rChainCol` (chain collision, 4 files in the whole game). Grab/climb data location: UNKNOWN (candidates: `rObjCollision` .ocl, `rAreaHitShape`; `rRegionStatus` .rst is a creature's health, not that: `docs/enemy-hp.md`) |
+| `em_param` enemy tables | No such type. Enemy data is spread over `rShlParamList` (.shl, XFS), `rAdjustParam` (.ajp), `rPropParam` (.prp, magic PRPZ: attack, defence, resistances, scale, EXP), `rRegionStatus` (.rst: the creature's health, `mHPMax`), `rStatusParam` (.statusparam, XFS) and others |
 | Blender tools stuck on 2.79 | Albam 0.5.0 (MIT, Blender 4.2 to 5.x) imports and exports DD `.mod` v212, `.mrl`, `.tex`, `.sbc` today |
 
 ## ARC v7 (`src/riftstone/arc.py`)
@@ -614,7 +614,8 @@ guards), 人間敵 HP (human-enemy HP), 経験値 (EXP) and fall thresholds. `pr
 class for reading, and `riftstone open` / `inspect` print the recognised stats in English. Enemy
 scale lives here (`scale value`) as a per-class field; `size` is a 0/1 class set on the big monsters
 (and oxen), not a scale, and the game does not scale weight with size (`docs/re-size-scaling.md`) --
-see `docs/re-enemy-cap.md` for how this relates to the placement-level scale in `.lot`.
+see `docs/re-enemy-cap.md` for how this relates to the placement-level scale in `.lot`. 人間敵 HP is the health
+of the human enemies only; a monster's base health is `mHPMax` in its `.rst` (`docs/enemy-hp.md`).
 
 ## Flat parameter formats (`src/riftstone/flat.py`)
 
@@ -657,12 +658,16 @@ three per-level shot-control blocks), and quest control `.qct` 325 (judgment/res
 nested sheet -> table -> row). `FreeF32` is shown as a float in both eap and sap for readability;
 the bytes are identical to reading it as i32.
 
-`.rst` rRegionStatus (100 files, magic `0x20110930`) is the same nested-list shape and was added
+`.rst` rRegionStatus (106 files, magic `0x20110930`) is the same nested-list shape and was added
 from its PS3 loader (`rRegionStatus::load`, `0x00B07918`, named) rather than dd-tools: a
-list of regions (`mpRegion`), each holding two u32s and a list of 56-byte sub-records (`mpSub`:
-two u32, seven f32, three u32, two f32, in disk order). These are the per-creature status regions
-(grab/climb candidates). Field meanings are not decoded, so the sub-record fields are named by their
-engine struct offset (`at04`, `at0c`, ...); the round trip is byte-exact regardless.
+list of region sets (`mRegionStatusList`: `mNo`, `mType`, then `mElementList`), each holding a list of
+56-byte elements (two u32, seven f32, three u32, two f32, in disk order). These are the creature's
+health and body-part values, and `mHPMax` (the third value of an element) is the base health the game reads for a
+monster (2026-10-02, `docs/enemy-hp.md`: the property names in DDDA.exe, `initRegionStatus`, `getHp`, the
+resource lists that load each file). The fields carry the executable's own names (`mNo`, `mId`, `mHPMax`,
+`mDPMax`, `mDPSpeed`, `mBPMax`, `mBPSpeed`, `mDamageAdj`, `mHitStopAdj`, `mSurface`, `mSeSurface`, `mAttr`,
+`mDPResetTimerMax`, `mBPResetTimerMax`); YAML `rst/1` files, which named them by struct offset (`at0c`, ...) and
+the sets `mpRegion`/`mpSub`, still load. The round trip is byte-exact.
 
 Magic-less formats (bed/fed/hed/hpe) start with `version`, so they are recognised by resource
 type, not content. See `docs/vendor.md` for the tool provenance.
@@ -864,8 +869,8 @@ file's sections add up to its size exactly (`check_corpus --only sbc`). The stre
       tree per part, then the parts tree:
                     "BVHC", u32 0x77B17B24, u32 kind (1 = 4-wide, 0x70-byte nodes; 2 = binary, 0x50),
                     MtAABB root at +0x10, u32 nodes at +0x30 (0x40 bytes), then the nodes
-      Triangle[]    0x20: MtFloat3 normal, u16 vert_index[3], u16 material_index, u32 attribute,
-                    u8 adjustParam[3], u8 reserved, u32 PhysicsReserved
+      Triangle[]    0x20: MtFloat3 normal, u16 vert_index[3] (counted from the part's first vertex),
+                    u16 material_index, u32 attribute, u8 adjustParam[3], u8 reserved, u32 PhysicsReserved
       Vertex[]      0x10: float3 position, u32 0 (0 on all 1,977,739)
       MaterialInfo[] 0x20: u32 attribute, u32 attr[4], 3 words
       Leaf[]        10 bytes: triangle numbers (0xFFFF = none), u16
@@ -884,7 +889,11 @@ Measured over all files:
   but the loader reads none from the stream.
 - **Containment:** every part keeps its vertices inside its box, and its box inside the file's (26,137
   of 26,137). Trees may reach about 1 cm past their part.
-- **Online:** revision `0x77DF43D8` (4,042 files) is a different revision, not read here.
+- **Online:** revision `0x77DF43D8` (4,042 files) has the same layout and passes the same checks.
+- **Triangles:** a triangle's three vertex numbers count from its part's first vertex (a file holds more
+  vertices than a u16 names). Read that way (`sbc.triangles`) every one of the 2,920,986 triangles belongs to
+  one part, names three of that part's vertices, and its stored normal is its corners' own; none has no area.
+  Online's 4,868,199 triangles hold the same (`check_corpus --game ddo --only sbc`).
 
 Moving a mesh (`sbc.translate`, `riftstone terrain`) changes only positions. Triangles store no plane
 distance, so they stay as they are. What moves:

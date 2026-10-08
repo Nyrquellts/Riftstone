@@ -464,7 +464,7 @@ struct FakeContainer {
     uint8_t obj[0x60];
     uint8_t data[0x80];
     uint8_t* list[4];
-    uint8_t bodies[4][0x20];
+    uint8_t bodies[4][0x40];
     uint8_t parts[4][0x20];
     void Ready(int n) {
         memset(this, 0, sizeof *this);
@@ -646,8 +646,9 @@ void TestRagdolls() {
 }
 
 // ---- the ragdoll body-count family --------------------------------------------------------------------------
-// The 55 inline copies scanned out of the exe (FAMILY_SITES).  Two proofs: the stub emitter's two paths run
-// on a fake body-data pointer here, and every real site is patched to a stub that carries its own bytes.
+// The inline copies tools/ragdoll_sites.py finds in the exe (FAMILY_SITES, ragdoll_sites.inc).  Three proofs:
+// the stub emitter's paths run on a fake body-data pointer for each shape, every real site is patched to a
+// stub that carries its own bytes, and three of the game's own walks run on fake ragdolls with and without it.
 static volatile LONG g_familyHits = 0;
 extern "C" void __stdcall TestFamilyHit(DWORD) { InterlockedIncrement(&g_familyHits); }
 static volatile uint32_t g_landZF = 0, g_landReg = 0;
@@ -676,6 +677,57 @@ __declspec(noinline) static void RunFamilyStub(void* stub, void* bodydata) {
         popad
     }
 }
+// The 'M' shape: ecx = the body data, ebp = the mask the game keeps there, esi = what the stub's copy of the
+// game's `xor esi, esi` must clear (returned).  Naked: ebp is not this function's frame while the stub runs.
+static volatile uint32_t g_maskEsi = 0;
+__declspec(naked) static uint32_t __stdcall RunMaskStub(void* /*stub*/, void* /*bodydata*/) {
+    __asm {
+        pushad
+        mov eax, [esp + 0x24]
+        mov ecx, [esp + 0x28]
+        mov ebp, 0xFFFFFF00
+        mov esi, 0x5A5A5A5A
+        call eax
+        mov g_maskEsi, esi
+        popad
+        mov eax, g_maskEsi
+        ret 8
+    }
+}
+
+// Three of the game's own walks, run on fake ragdolls (FakeOwner: the set at +0x20, the ragdoll at +0x24).
+// 0x00794A90 (edi = the owner, one byte on the stack; ret 4): the dying enemy's walk the crash of 2026-10-06
+// stopped in, called from the death action (cEmActActingDie) at 0x008A689A.
+static bool FaultsCall(void (*run)(void*, uint32_t), void* owner, uint32_t arg, uintptr_t* where) {
+    *where = 0;
+    __try {
+        run(owner, arg);
+        return false;
+    } __except (FaultFilter(GetExceptionInformation(), where)) {
+        return true;
+    }
+}
+static void RunDieWalk(void* owner, uint32_t flag) { CallSetBodies(0x00794A90, owner, flag); }
+// 0x00794AF0 (the owner on the stack, the value's switch in dl; ret 4): every body's part (+0x2C) gets 0 or -1.
+static void RunPartWalk(void* owner, uint32_t flag) {
+    __asm {
+        push owner
+        mov edx, flag
+        mov eax, 0x00794AF0
+        call eax
+    }
+}
+// 0x007943B0 (the owner and two more on the stack; ret 0xC): the set's and the ragdoll's bodies, two walks each,
+// with 0xFFFFFF00 kept in ebp ('M' sites); it calls 0x0088D660 and 0x0088D2D0 first, each a 'T' site.
+static void RunMaskWalk(void* owner, uint32_t) {
+    __asm {
+        push 0x3F800000
+        push 0
+        push owner
+        mov eax, 0x007943B0
+        call eax
+    }
+}
 
 void TestRagdollFamily() {
     printf("ragdoll body-count family (%d scanned sites)\n", (int)_countof(FAMILY_SITES));
@@ -686,8 +738,10 @@ void TestRagdollFamily() {
     const BYTE origT[7] = {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF};        // test [ecx+0x68], 0xFFFFFF00
     const BYTE origC[6] = {0x8B, 0x71, 0x68, 0xC1, 0xEE, 0x08};             // mov esi,[ecx+0x68]; shr esi,8
     BYTE* cur = cave;
-    BYTE* stubT = EmitFamilyStub(cur, 'T', origT, 7, 0xABCD, (DWORD_PTR)LandT, (void*)TestFamilyHit);
-    BYTE* stubC = EmitFamilyStub(cur, 'C', origC, 6, 0xABCD, (DWORD_PTR)LandC, (void*)TestFamilyHit);
+    const BYTE origM[5] = {0x33, 0xF6, 0x85, 0x69, 0x68};                   // xor esi,esi; test [ecx+0x68],ebp
+    BYTE* stubT = EmitFamilyStub(cur, 'T', origT, 7, 0, 0xABCD, (DWORD_PTR)LandT, (void*)TestFamilyHit);
+    BYTE* stubC = EmitFamilyStub(cur, 'C', origC, 6, 0, 0xABCD, (DWORD_PTR)LandC, (void*)TestFamilyHit);
+    BYTE* stubM = EmitFamilyStub(cur, 'M', origM, 5, 2, 0xABCD, (DWORD_PTR)LandT, (void*)TestFamilyHit);
     FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
 
     g_familyHits = 0;
@@ -711,6 +765,16 @@ void TestRagdollFamily() {
     RunFamilyStub(stubC, nullptr);
     bool cNull = g_landReg == 0 && g_familyHits == 1;                        // not set up: count 0, counted
     Check(cReady && cNull, "'C' stub: the real count when present, 0 when the body data is null, counted once");
+
+    // 'M': the mask is in ebp, and the stub first runs the instruction before the read (xor esi, esi)
+    g_familyHits = 0;
+    *(uint32_t*)(bd + 0x68) = 3u << 8;
+    bool mReady = RunMaskStub(stubM, bd) == 0 && g_landZF == 0 && g_familyHits == 0;
+    *(uint32_t*)(bd + 0x68) = 0x7F;                                          // flag bits only: no bodies
+    bool mZero = RunMaskStub(stubM, bd) == 0 && g_landZF == 1 && g_familyHits == 0;
+    bool mNull = RunMaskStub(stubM, nullptr) == 0 && g_landZF == 1 && g_familyHits == 1;
+    Check(mReady && mZero && mNull,
+          "'M' stub: runs the instruction before the read (esi zeroed), then the masked test or, null, ZF=count-0");
     VirtualFree(cave, 0, MEM_RELEASE);
 
     // every real site patched to a stub that carries its own (verified) bytes
@@ -719,18 +783,86 @@ void TestRagdollFamily() {
     FixesApplyPatches();
     Check(g_ragFamilyCount == (int)_countof(FAMILY_SITES) && g_ragFamilySkipped == 0,
           "all family sites verified against build 2364871 and guarded");
-    bool patched = true, carries = true, newCrash = false;
+    bool patched = true, carries = true, shapes = true, crash0927 = false, crash1006 = false;
+    int kinds[3] = {0, 0, 0};
     for (const FamilySite& s : FAMILY_SITES) {
         const BYTE* at = (const BYTE*)s.va;
-        int len = s.kind == 'T' ? 7 : 6;
+        int len = s.len, pre = s.pre;
+        shapes &= (s.kind == 'T' && len == 7 && pre == 0) || (s.kind == 'C' && len == 6 && pre == 0) ||
+                  (s.kind == 'M' && len == pre + 3 && len >= 5 && s.bytes[pre] == 0x85);
+        kinds[s.kind == 'T' ? 0 : s.kind == 'C' ? 1 : 2]++;
         if (at[0] != 0xE9) { patched = false; continue; }
         for (int k = 5; k < len; k++) patched &= at[k] == 0x90;
         const BYTE* stub = at + 5 + *(const int32_t*)(at + 1);
-        carries &= memcmp(stub + 4, s.bytes, len) == 0;                     // the stub's copy of the game's bytes
-        if (s.va == 0x007945B4) newCrash = at[0] == 0xE9;
+        carries &= memcmp(stub, s.bytes, pre) == 0 &&                       // the stub's copy of the game's bytes
+                   memcmp(stub + pre + 4, s.bytes + pre, len - pre) == 0;
+        if (s.va == 0x007945B4) crash0927 = true;
+        if (s.va == 0x00794AA2) crash1006 = true;
     }
+    Check(shapes && kinds[0] == 48 && kinds[1] == 10 && kinds[2] == 4,
+          "the table holds 48 'T', 10 'C' and 4 'M' sites, each the length its shape takes");
     Check(patched && carries, "each site jumps to a stub that keeps its own instruction bytes; the reads are filled");
-    Check(newCrash, "the live crash of 2026-09-27 (0x007945B4) is one of the guarded sites");
+    Check(crash0927 && crash1006,
+          "the live crashes of 2026-09-27 (0x007945B4) and 2026-10-06 (0x00794AA2, Devil's Firegrove) are guarded sites");
+
+    // the game's own walks on fake ragdolls, guarded (the image is patched here)
+    static FakeOwner w;
+    uintptr_t where = 0;
+    LONG before = GuardHits(GUARD_RAGDOLL_BODIES);
+    w.ragdoll.NotReady(), w.set.NotReady(), w.Wire(true, true);
+    bool dieNull = !FaultsCall(RunDieWalk, w.obj, 1, &where) && GuardHits(GUARD_RAGDOLL_BODIES) == before + 1;
+    w.ragdoll.Ready(3), w.Wire(true, true);
+    for (int i = 0; i < 4; i++) w.ragdoll.list[i] = nullptr;               // bodies listed empty: walked, nothing called
+    bool dieReady = !FaultsCall(RunDieWalk, w.obj, 1, &where) && GuardHits(GUARD_RAGDOLL_BODIES) == before + 1;
+    Check(dieNull && dieReady,
+          "guarded: 0x00794A90 on a dying enemy whose ragdoll has no bodies yet walks none (counted); a set-up one is walked");
+
+    before = GuardHits(GUARD_RAGDOLL_BODIES);
+    w.ragdoll.Ready(3), w.Wire(true, true);
+    for (int i = 0; i < 4; i++) *(uint8_t**)(w.ragdoll.bodies[i] + 0x2C) = w.ragdoll.parts[i];
+    bool partReady = !FaultsCall(RunPartWalk, w.obj, 1, &where) && w.ragdoll.Part(0, 8) == 0xFFFFFFFF &&
+                     w.ragdoll.Part(2, 0x1C) == 0xFFFFFFFF && w.ragdoll.Part(3, 8) == 0;
+    w.ragdoll.NotReady(), w.Wire(true, true);
+    bool partNull = !FaultsCall(RunPartWalk, w.obj, 1, &where) && w.ragdoll.Part(0, 8) == 0 &&
+                    GuardHits(GUARD_RAGDOLL_BODIES) == before + 1;
+    Check(partReady && partNull,
+          "guarded: 0x00794AF0 sets every body's part of a set-up ragdoll (3 of 3) and none of one not set up (counted)");
+
+    before = GuardHits(GUARD_RAGDOLL_BODIES);
+    w.ragdoll.NotReady(), w.set.NotReady(), w.Wire(true, true);
+    bool maskNull = !FaultsCall(RunMaskWalk, w.obj, 0, &where) && GuardHits(GUARD_RAGDOLL_BODIES) == before + 6;
+    w.ragdoll.Ready(0), w.set.Ready(0), w.Wire(true, true);
+    bool maskEmpty = !FaultsCall(RunMaskWalk, w.obj, 0, &where) && GuardHits(GUARD_RAGDOLL_BODIES) == before + 6;
+    Check(maskNull && maskEmpty,
+          "guarded: 0x007943B0 with the set and the ragdoll not set up passes its four 'M' and two 'T' reads (6 counted)");
+
+    // and the same walks without the guard: the crash
+    MapImage(nullptr);
+    g_ragdolls = 0;
+    FixesApplyPatches();
+    w.ragdoll.NotReady(), w.set.NotReady(), w.Wire(true, true);
+    bool dieFaults = FaultsCall(RunDieWalk, w.obj, 1, &where) && where == 0x00794AA2;
+    bool partFaults = FaultsCall(RunPartWalk, w.obj, 1, &where) && where == 0x00794B01;
+    bool maskFaults = FaultsCall(RunMaskWalk, w.obj, 0, &where) && where == 0x0088D665;
+    Check(dieFaults && partFaults && maskFaults,
+          "vanilla: the same ragdolls stop the game at 0x00794AA2 (the crash of 2026-10-06), 0x00794B01 and 0x0088D665");
+
+    // the 'M' sites are reached with no body data only once the 'T' reads in 0x0088D660 / 0x0088D2D0 before them
+    // are guarded: everything guarded but the four 'M' sites' game bytes put back, the walk stops at the first
+    MapImage(nullptr);
+    g_ragdolls = 1;
+    FixesApplyPatches();
+    for (const FamilySite& s : FAMILY_SITES) {
+        if (s.kind != 'M') continue;
+        DWORD old;
+        VirtualProtect((void*)s.va, s.len, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void*)s.va, s.bytes, s.len);
+        VirtualProtect((void*)s.va, s.len, old, &old);
+    }
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+    w.ragdoll.NotReady(), w.set.NotReady(), w.Wire(true, true);
+    Check(FaultsCall(RunMaskWalk, w.obj, 0, &where) && where == 0x007943D3,
+          "without its 'M' sites, 0x007943B0 gets past the guarded 'T' reads and stops at 0x007943D3");
 
     // a site that differs is left alone; the rest still go in
     MapImage(nullptr);

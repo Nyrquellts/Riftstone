@@ -124,6 +124,8 @@ class CompatGameTest(unittest.TestCase):
         except Exception as e:  # noqa: BLE001
             self.skipTest(f"needs both games: {e}")
         io, ia = Index(ddo), Index(ddda)
+        self.addCleanup(io.close)
+        self.addCleanup(ia.close)
 
         def read(name, ext, idx=io, game=ddo):
             t = typemap.BY_EXT[ext]

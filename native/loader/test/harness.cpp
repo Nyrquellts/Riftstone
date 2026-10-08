@@ -9,6 +9,7 @@
 //   reset        the import table restored after start-up (what a DRM stub could do)
 //   crash        installs its own crash filter, then faults in its own code
 //   stackoverflow  installs a quiet crash filter, then recurses until the main thread's stack is gone
+//   crashrace    four threads fault in the same instant; every report and minidump must be whole
 //   chainfilter  a module sets its own crash filter directly, after the loader's, and passes crashes on
 //                to the one it replaced; once the loader has taken it in, a fault
 //   plugincrash [name]  faults inside riftstone\plugins\<name> (crash_plugin.asi)
@@ -21,6 +22,11 @@
 //   live [engine-cap]  Direct3D 9 frames, then waits for <root>\done so the driver can read live stats
 //                (engine-cap, DDDA layout: a stand-in sSetManager whose slots enemy_cap moved to its tail)
 //   hang         some frames, then none (the hang detector's case)
+//   hanglost     some frames, then a Present that says the device is lost and only TestCooperativeLevel after it
+//                (drawn through chain_d3d9.dll with its "lost" marker)
+//   hanglock     some frames, then the main thread holds the loader lock for 6 s and draws nothing
+//   crashhang    some frames, then a thread crashes and the game takes its time to end (as under Windows Error
+//                Reporting): no frames, and no hang report; then frames again and a stop, which is a hang
 //   window       creates the game window; prints its style and size, and whether focus loss reached it
 //   addon        loads riftstone_loader.dll the way another loader would
 //   close <how>  a window and a message loop like DDDA's, closed one way (see CloseMode below)
@@ -208,6 +214,26 @@ static DWORD WINAPI ResRaceOpen(LPVOID arg) {
     g_resRaceHash[i] = Fnv(h, &g_resRaceSize[i]);
     CloseHandle(h);
     InterlockedIncrement(&g_resRaceOpened);
+    return 0;
+}
+// A crash the game does not survive, but whose process lingers: kernel32's UnhandledExceptionFilter runs the
+// top-level filter (the loader's, then the game's, which says to end), and this thread then lives on for a while
+// instead of ending the process, as a game does while Windows Error Reporting holds it.
+static DWORD WINAPI CrashLinger(LPVOID) {
+    __try {
+        volatile int* p = (int*)(INT_PTR)0x10;
+        *p = 1;
+    } __except (UnhandledExceptionFilter(GetExceptionInformation())) {
+        printf("crash-handed-on\n");
+        fflush(stdout);
+    }
+    return 0;
+}
+
+static DWORD WINAPI CrashRace(LPVOID arg) {
+    WaitForSingleObject(g_raceGo, INFINITE);
+    volatile int* p = (int*)(INT_PTR)(0x10 + 0x10 * (int)(INT_PTR)arg);
+    *p = 1;                                                   // each thread its own address, all at once
     return 0;
 }
 static DWORD WINAPI RaceOpen(LPVOID arg) {
@@ -1352,6 +1378,21 @@ int main(int argc, char** argv) {
         ((void (*)())GetProcAddress(plugin, "RiftstoneTestBoom"))();
         return 3;
     }
+    if (strcmp(mode, "crashrace") == 0) {
+        // Worker threads that fault in the same instant (the game's job threads at Gran Soren, 2026-10-06):
+        // every report must be whole, minidump included, before any thread's crash ends the process.
+        const int n = 4;
+        HANDLE threads[n];
+        SetUnhandledExceptionFilter(GameFilter);
+        g_raceGo = CreateEventW(NULL, TRUE, FALSE, NULL);
+        for (int i = 0; i < n; i++) threads[i] = CreateThread(NULL, 0, CrashRace, (LPVOID)(INT_PTR)i, 0, NULL);
+        Sleep(200);                                           // every thread waits at the start line
+        printf("crashing %d\n", n);
+        fflush(stdout);
+        SetEvent(g_raceGo);
+        WaitForMultipleObjects(n, threads, TRUE, 60000);
+        return 3;
+    }
     if (strcmp(mode, "guardrace") == 0) {
         const int n = 32;
         HANDLE threads[n];
@@ -1412,6 +1453,75 @@ int main(int argc, char** argv) {
         printf("fatal-returned %d\n", r);
         return 0;
     }
+    if (strcmp(mode, "crashhang") == 0) {
+        SetUnhandledExceptionFilter(GameFilter);
+        HWND w = MakeWindow(WS_OVERLAPPEDWINDOW);
+        IDirect3DDevice9* dev = Draw(w, 30, 5);
+        HANDLE t = CreateThread(NULL, 0, CrashLinger, NULL, 0, NULL);
+        if (t) {
+            WaitForSingleObject(t, 60000);
+            CloseHandle(t);
+        }
+        printf("ready\n");
+        fflush(stdout);
+        Sleep(4500);                                             // no frames while the game "ends"
+        for (int i = 0; dev && i < 30; i++) {                    // ...then it lives on after all, and stops again
+            dev->Present(NULL, NULL, NULL, NULL);
+            Sleep(5);
+        }
+        printf("ready2\n");
+        fflush(stdout);
+        Sleep(4500);
+        WaitForDone(exe);
+        if (dev) dev->Release();
+        DestroyWindow(w);
+        return 3;
+    }
+    if (strcmp(mode, "hanglock") == 0) {
+        // A main thread stopped while it holds the loader lock (a DLL's start-up stuck, or LoadLibrary waiting on a
+        // thread that waits for it): no frames, and every call that takes the lock waits until it is let go.
+        HWND w = MakeWindow(WS_OVERLAPPEDWINDOW);
+        IDirect3DDevice9* dev = Draw(w, 30, 5);
+        typedef LONG(NTAPI* LdrLockLoaderLock_t)(ULONG, ULONG*, ULONG_PTR*);
+        typedef LONG(NTAPI* LdrUnlockLoaderLock_t)(ULONG, ULONG_PTR);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        LdrLockLoaderLock_t lock = (LdrLockLoaderLock_t)GetProcAddress(nt, "LdrLockLoaderLock");
+        LdrUnlockLoaderLock_t unlock = (LdrUnlockLoaderLock_t)GetProcAddress(nt, "LdrUnlockLoaderLock");
+        ULONG_PTR cookie = 0;
+        BOOL held = lock && unlock && lock(0, NULL, &cookie) == 0;
+        printf("loader-lock %s\n", held ? "held" : "not held");
+        printf("ready\n");
+        fflush(stdout);
+        Sleep(6000);
+        if (held) unlock(0, cookie);
+        WaitForDone(exe);
+        if (dev) dev->Release();
+        DestroyWindow(w);
+        return 0;
+    }
+    if (strcmp(mode, "hanglost") == 0) {
+        // Drawn through chain_d3d9.dll with its "lost" marker: once RIFTSTONE_TEST_DEVICE_LOST is 1 its Present and
+        // TestCooperativeLevel say D3DERR_DEVICELOST, under the loader's hooks.  Then the game's way (0x00DAEE55,
+        // 0x00DAF834): a Present that says the device is lost sets a reset request, and from then on each pass of
+        // the main loop asks TestCooperativeLevel and presents nothing.
+        HWND w = MakeWindow(WS_OVERLAPPEDWINDOW);
+        IDirect3DDevice9* dev = Draw(w, 30, 5);
+        if (dev) {
+            SetEnvironmentVariableW(L"RIFTSTONE_TEST_DEVICE_LOST", L"1");
+            printf("present 0x%08lx\n", (unsigned long)dev->Present(NULL, NULL, NULL, NULL));
+        }
+        printf("ready\n");
+        fflush(stdout);
+        for (ULONGLONG until = GetTickCount64() + 4500; dev && GetTickCount64() < until;) {
+            dev->TestCooperativeLevel();
+            Sleep(16);
+        }
+        WaitForDone(exe);
+        SetEnvironmentVariableW(L"RIFTSTONE_TEST_DEVICE_LOST", NULL);
+        if (dev) dev->Release();
+        DestroyWindow(w);
+        return 0;
+    }
     if (strcmp(mode, "live") == 0 || strcmp(mode, "hang") == 0 || strcmp(mode, "hangbehind") == 0) {
 #ifdef HARNESS_DDDA_LAYOUT
         if (argc > 2 && strcmp(argv[2], "engine-cap") == 0)   // 7 of the vanilla ten in use; enemy_cap's 30, 17 in use
@@ -1422,7 +1532,11 @@ int main(int argc, char** argv) {
         IDirect3DDevice9* dev = Draw(w, strcmp(mode, "live") == 0 ? 60 : 30, 5);
         printf("ready\n");
         fflush(stdout);
-        if (strcmp(mode, "hang") == 0) Sleep(4500);      // no frames: the detector's case
+        if (strcmp(mode, "hang") == 0) {                 // no frames: the detector's case
+            if (dev) printf("tcl 0x%08lx\n", (unsigned long)dev->TestCooperativeLevel());
+            fflush(stdout);
+            Sleep(4500);
+        }
         if (strcmp(mode, "hangbehind") == 0) {           // not in front, no frames, no messages: "not responding"
             ShowWindow(w, SW_MINIMIZE);
             Sleep(9000);

@@ -38,7 +38,7 @@ from pathlib import Path
 
 OUT = Path(__file__).resolve().parents[1] / "out"
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
-from riftstone import pe, runtime, tex  # noqa: E402
+from riftstone import minidump, pe, runtime, tex  # noqa: E402
 
 # The version the loader sources carry (runtime.h), which the built DLL must report.
 VERSION = re.search(r'#define RIFTSTONE_VERSION_A "([^"]+)"',
@@ -271,6 +271,33 @@ def test_crash(work: Path) -> None:
         check("what it means" in text, "the report explains what the message means")
     check("fatal    the game showed" in log_of(root), "loader.log records the fatal error")
     check(_session(root).get("end") == "fatal-error", "runtime-state.ini: the session ended with the fatal error")
+
+
+def test_crash_race(work: Path) -> None:
+    print("crashes on several threads at once (the game's job threads at Gran Soren, 2026-10-06: four reports, "
+          "every minidump empty)")
+    root = game(work / "crashrace")
+    code, r, raw = run(root, "crashrace")
+    check(r.get("crashing") == "4" and is_crash_code(code), f"four threads fault at once; the process ends with the "
+                                                            f"access violation (got {code:#x})")
+    found = reports(root, "crash")
+    texts = [p.read_text(encoding="utf-8", errors="replace") for p in found]
+    check(len(found) == 3, f"three reports, the loader's limit ({len(found)})")
+    check(len(texts) == 3 and all("ACCESS_VIOLATION" in t and "\nmodules" in t for t in texts),
+          "every report is whole: the fault and the module list at its end")
+    dumps = sorted((root / "riftstone/logs").glob("crash-*.dmp"))
+    sizes = [d.stat().st_size for d in dumps]
+    check(len(dumps) == 3 and all(s > 4096 for s in sizes)
+          and all(d.read_bytes()[:4] == b"MDMP" for d in dumps),
+          f"every report's minidump is written whole before the process ends (sizes {sizes})")
+    for d in dumps:
+        try:
+            ts = minidump.threads(d.read_bytes())
+        except Exception as e:                     # a dump cut short: reported, not raised
+            ts = []
+            print(f"        {d.name}: {e}")
+        check(len(ts) >= 5, f"{d.name} reads back: its threads ({len(ts)}), the four that faulted among them")
+    check("game-filter-called" in raw, "the game's own crash filter still runs after the reports")
 
 
 def test_stack_overflow(work: Path) -> None:
@@ -596,10 +623,13 @@ def test_live(work: Path) -> None:
         if snap:
             rep = runtime.parse_report(snap["report"].read_text(encoding="utf-8", errors="replace"))
             check(rep["kind"] == "snapshot" and rep["main_thread"], "the snapshot names where the main thread was")
+            if drew:
+                dev = rep["device"]
+                check(dev.get("frames", 0) >= 60 and dev.get("present") == "D3D_OK" and not dev.get("verdict"),
+                      f"the snapshot holds the graphics device: frames presented, the last Present's result ({dev})")
             check(snap["dump"] is not None and snap["dump_note"] == "every thread's state written beside it (.dmp)",
                   f"every thread's state beside it (.dmp): {snap['dump_note']}")
             if snap["dump"]:
-                from riftstone import minidump
                 ts = minidump.threads(snap["dump"].read_bytes())
                 check(len(ts) >= 2 and any("DDDA.exe" in t.where or any("DDDA.exe" in f for f in t.frames) for t in ts),
                       f"minidump.threads reads it ({len(ts)} threads, the stand-in game's among them)")
@@ -633,8 +663,104 @@ def test_live(work: Path) -> None:
             if found:
                 rep = runtime.parse_report(found[0].read_text(encoding="utf-8", errors="replace"))
                 check(rep["kind"] == "hang" and rep["main_thread"], "the hang report holds where the main thread was")
+                dev = rep["device"]
+                check(dev.get("present") == "D3D_OK" and dev.get("tcl") == "D3D_OK" and not dev.get("verdict"),
+                      f"its graphics device: Present and TestCooperativeLevel were fine, so no device verdict ({dev})")
+                check(dev.get("window", "").startswith("windowed"), f"the device's window mode ({dev.get('window')})")
         else:
             print("  skip  Direct3D 9 could not draw on this machine; hang detection not checked")
+    finally:
+        (root / "done").write_text("")
+        p.wait(timeout=60)
+
+    # DDDA's way with a lost device (docs/stability-membrane.md, "The hang of 2026-10-06 14:42"): a Present that says
+    # D3DERR_DEVICELOST, then only TestCooperativeLevel, no frame.  The stand-ins for Present and TestCooperativeLevel
+    # are chain_d3d9.dll's ("lost" beside it), under the loader's hooks.
+    print("hang report while the device is lost")
+    root = _chain_game(work, "hang-lost", ini="[live]\nhang_seconds = 2\nhang_needs_front = 0\n")
+    (root / "riftstone" / "dxvk" / "lost").write_text("")
+    p = subprocess.Popen([str(root / "DDDA.exe"), "hanglost"], cwd=root, stdout=subprocess.PIPE, text=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        seen = _wait_line(p, "ready")
+        drew = any(s.startswith("presented") for s in seen)
+        time.sleep(4.0)
+        found = reports(root, "hang")
+        if drew:
+            check(_chain_note(root).get("called") is not None, "the device came from the chained stand-in")
+            check("present 0x88760868" in seen, f"the Present through the loader's hook said D3DERR_DEVICELOST ({seen})")
+            check(len(found) == 1, "no frame for 2 s with the device lost writes one hang report")
+            if found:
+                text = found[0].read_text(encoding="utf-8", errors="replace")
+                rep = runtime.parse_report(text)
+                dev = rep["device"]
+                check(dev.get("present") == "D3DERR_DEVICELOST" and dev.get("present_failing_ms", 0) >= 1500,
+                      f"the last Present's result and how long it has been failing ({dev})")
+                check(dev.get("tcl") == "D3DERR_DEVICELOST", "the game kept asking TestCooperativeLevel, which said lost")
+                check(str(dev.get("verdict", "")).startswith("the device is lost"), "the report's verdict: the device is lost")
+                check("Its graphics device: the device is lost" in "\n".join(runtime.explain(rep)),
+                      "riftstone crash explains it in plain words")
+                check(not rep["out_of_memory"], "the device's verdict is not taken for the memory one")
+        else:
+            print("  skip  Direct3D 9 could not draw on this machine; the lost device not checked")
+    finally:
+        (root / "done").write_text("")
+        p.wait(timeout=60)
+
+    # A main thread stopped while it holds the loader lock (a DLL's start-up stuck).  The report names modules with
+    # GetModuleFileName and GetModuleHandleEx, which on Windows 11 do not wait for that lock (measured here, 2026-10-07,
+    # build 26200); this keeps it so.  The report must be whole while the lock is held.
+    print("hang report while the main thread holds the loader lock")
+    root = game(work / "hang-lock", ini="[live]\nhang_seconds = 2\nhang_needs_front = 0\n")
+    p = subprocess.Popen([str(root / "DDDA.exe"), "hanglock"], cwd=root, stdout=subprocess.PIPE, text=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        seen = _wait_line(p, "ready")
+        drew = any(s.startswith("presented") for s in seen)
+        time.sleep(3.5)                         # the lock is held until 6 s after "ready"
+        found = reports(root, "hang")
+        if drew:
+            check("loader-lock held" in seen, f"the stand-in holds the loader lock ({seen})")
+            check(len(found) == 1, "no frame for 2 s writes one hang report")
+            if found:
+                text = found[0].read_text(encoding="utf-8", errors="replace")
+                rep = runtime.parse_report(text)
+                check(rep["kind"] == "hang" and bool(rep["main_thread"]),
+                      f"the report is whole while the lock is held ({len(text)} characters; main thread "
+                      f"{rep['main_thread']})")
+                check("ntdll.dll+0x" in str(rep["main_thread"]) or "KERNELBASE.dll+0x" in str(rep["main_thread"]),
+                      "the main thread's place is named by its module while the lock is held")
+                plain = text.replace("\r\n", "\n")
+                check(rep["device"].get("present") == "D3D_OK" and "\nplugins\n" in plain and "\nlast files opened" in plain,
+                      "the device, plugins and files sections are there too")
+        else:
+            print("  skip  Direct3D 9 could not draw on this machine; the loader lock case not checked")
+    finally:
+        (root / "done").write_text("")
+        p.wait(timeout=60)
+
+    # The owner's crash of 2026-09-28 12:47:48 went on to Windows Error Reporting, and 43 s later the hang watch began
+    # a report that was never written to (0 bytes).  After a crash nothing recovered, no frame is no hang.
+    print("no hang report after a crash the game does not survive")
+    root = game(work / "crash-hang", ini="[live]\nhang_seconds = 2\nhang_needs_front = 0\n")
+    p = subprocess.Popen([str(root / "DDDA.exe"), "crashhang"], cwd=root, stdout=subprocess.PIPE, text=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        seen = _wait_line(p, "ready")
+        drew = any(s.startswith("presented") for s in seen)
+        time.sleep(4.0)
+        if drew:
+            check("game-filter-called" in seen and "crash-handed-on" in seen,
+                  f"the crash went through the loader's filter to the game's, and the process lingered ({seen})")
+            check(len(reports(root, "crash")) == 1, "the crash is reported")
+            check(not reports(root, "hang"), "no hang report while the crashed game ends")
+            check("since a crash nothing recovered (the game is ending); no hang report" in log_of(root),
+                  "loader.log says why there is none")
+            seen += _wait_line(p, "ready2")
+            time.sleep(3.5)
+            check(len(reports(root, "hang")) == 1, "frames after the crash, then none for 2 s: a hang again, reported")
+        else:
+            print("  skip  Direct3D 9 could not draw on this machine; the crash-then-no-frames case not checked")
     finally:
         (root / "done").write_text("")
         p.wait(timeout=60)
@@ -1940,8 +2066,8 @@ def test_from_archives(work: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--work")
-    ap.add_argument("--only", help="comma-separated test names (files,reset,hooks,dinputchain,crash,overflow,"
-                                   "filters,crashoff,rotation,quarantine,names,safe,state,live,cap,guard,window,"
+    ap.add_argument("--only", help="comma-separated test names (files,reset,hooks,dinputchain,crash,crashrace,"
+                                   "overflow,filters,crashoff,rotation,quarantine,names,safe,state,live,cap,guard,window,"
                                    "saves,foreignsaves,exit,overlay,d3d9,d3d9bench,chain,dxvk,memory,other,engine,"
                                    "archives)")
     a = ap.parse_args()
@@ -1957,7 +2083,8 @@ def main() -> int:
     base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="run-", dir=base))
     tests = {"files": test_files, "reset": test_reset_plugins_off_addon, "hooks": test_foreign_hooks,
-             "dinputchain": test_chain_self, "crash": test_crash, "overflow": test_stack_overflow,
+             "dinputchain": test_chain_self, "crash": test_crash, "crashrace": test_crash_race,
+             "overflow": test_stack_overflow,
              "filters": test_filter_chain, "crashoff": test_crash_reports_off, "rotation": test_rotation,
              "quarantine": test_quarantine, "names": test_plugin_names, "safe": test_safe_mode,
              "state": test_state_after_clean_exit, "live": test_live, "cap": test_enemy_cap_renamed,

@@ -56,10 +56,16 @@ PLUGIN_SUFFIXES = (".asi", ".dll")
 RESERVED = ("dinput8.dll", "riftstone_loader.dll")
 # Riftstone's own plugins (native/plugins, MIT); any other plugin in a package keeps its author's terms.
 OWN_PLUGINS = ("enemy_cap", "enemy_skins", "lod_tuner", "inclination_lock", "save_backup", "free_sprint",
-               "draw_distance", "six_skill_warrior", "stage_enemies", "portcrystals")
+               "draw_distance", "six_skill_warrior", "stage_enemies", "portcrystals", "collision_cap",
+               "pool_cap")
 # The player zip starts Riftstone's own features OFF (in riftstone\plugins\off), so people choose what changes
-# their game; only what protects the player is on.  "Riftstone - Start Here.cmd" turns them on one by one.
-DEFAULT_ON = ("save_backup",)
+# their game; only what protects the player is on: the save backup, and collision_cap (a frame with more than
+# the game's 800 hit shapes made it read past its table and crash, docs/re-collision-cap.md; 2.6 MB).
+# pool_cap is protection too but stays off: its larger pools take up to 1280 MiB of the 32-bit game's address
+# space, a cost the player should choose.  "Riftstone - Start Here.cmd" turns them on one by one.
+DEFAULT_ON = ("save_backup", "collision_cap")
+# how a README names a feature that starts on
+_ON_WORDS = {"save_backup": "the save backup", "collision_cap": "the collision crash guard"}
 START_HERE = "Riftstone - Start Here.cmd"
 MAX_MEMBER = 256 * 1024 * 1024          # a package member, unpacked
 MAX_TOTAL = 1024 * 1024 * 1024          # everything in a package, unpacked
@@ -540,13 +546,23 @@ def _batch_text(text: str, limit: int = 118) -> str:
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
+def _and(words: list[str]) -> str:
+    """'a', 'a and b', 'a, b and c'."""
+    return " and ".join(words) if len(words) < 3 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
 def _start_here(plugins: list[tuple[str, str, str]]) -> bytes:
     """"Riftstone - Start Here.cmd": the check, the plugin switch and the logs shortcut for a player without
     Python (a plain batch file).  ``plugins`` is (file stem, title, one line) for each plugin the zip holds;
     only names of letters, digits and underscores are listed by name (any other .asi is shown as not
-    Riftstone's)."""
+    Riftstone's).  Every other Riftstone feature is named too (1.0.4, one zip a plugin): a zip unzipped over
+    another replaces this file, and the features the other zip brought must still show as Riftstone's and still
+    be updated and switched (a name with no plugin in the folder is never listed)."""
+    from .plugins import CATALOG
     template = (Path(__file__).resolve().parent / "data" / "start_here.cmd").read_text(encoding="utf-8")
     named = [(n, t, w) for n, t, w in plugins if re.fullmatch(r"[A-Za-z0-9_]+", n)]
+    have = {n.lower() for n, _, _ in named}
+    named += [(n, CATALOG[n]["title"], CATALOG[n]["summary"]) for n in OWN_PLUGINS if n not in have]
     labels = "".join(f':desc_{n}\nset "TITLE={_batch_text(t, 60) or n}"\nset "WHAT={_batch_text(w)}"\nexit /b 0\n\n'
                      for n, t, w in named)
     text = (template.replace("@VERSION@", __version__).replace("@PLUGIN_NAMES@", " ".join(n for n, _, _ in named))
@@ -557,11 +573,35 @@ def _start_here(plugins: list[tuple[str, str, str]]) -> bytes:
 def _plugins_readme(title: str, plugins: list[tuple[str, str]], ninput: bool = False,
                     off: tuple[str, ...] | set[str] = ()) -> str:
     from . import legal
+    from .plugins import CATALOG
+    stems = [Path(p).stem.lower() for p, _ in plugins]
+    own_on = [s for s in stems if s in OWN_PLUGINS and s not in off]
+    own_off = [s for s in stems if s in OWN_PLUGINS and s in off]
+    named = lambda ss: [CATALOG[s]["title"] if s in CATALOG else s for s in ss]   # noqa: E731
+    para = lambda s, first="", rest="": textwrap.wrap(s, 100, initial_indent=first, subsequent_indent=rest)  # noqa: E731
     lines = [title, "=" * len(title), ""]
-    lines += ["Riftstone for Dragon's Dogma: Dark Arisen (Steam). It adds crash protection, save backups and",
-              "optional features to the game. It changes none of the game's own files, and this zip holds no",
-              "game files. You do not need Python or anything else.", "",
-              "Install (one minute)",
+    if set(DEFAULT_ON) <= set(own_on) and own_off:      # the player zip: its protections on, the rest to choose
+        lines += ["Riftstone for Dragon's Dogma: Dark Arisen (Steam). It adds crash protection, save backups and",
+                  "optional features to the game. It changes none of the game's own files, and this zip holds no",
+                  "game files. You do not need Python or anything else.", ""]
+    else:                                               # one feature (or a few) on its own (1.0.4)
+        feats = named(stems)
+        lines += para(f"Riftstone for Dragon's Dogma: Dark Arisen (Steam), with "
+                      f"{'one feature' if len(feats) == 1 else 'these features'}: {_and(feats)}. It works on its "
+                      "own, or unzipped over the full Riftstone player zip. It changes none of the game's own "
+                      "files, and this zip holds no game files. You do not need Python or anything else.") + [""]
+    if own_off and own_on:
+        firsts = [s for s in DEFAULT_ON if s in own_on] + [s for s in own_on if s not in DEFAULT_ON]
+        on_words = [_ON_WORDS.get(s, CATALOG.get(s, {}).get("title", s)) for s in firsts]
+        state = ("lets you pick features. They start OFF, so nothing about your game changes until you choose "
+                 f"(only {_and(on_words)} {'is' if len(on_words) == 1 else 'are'} on).")
+    elif len(own_off) == 1:
+        state = f"lets you turn {named(own_off)[0]} on. It starts OFF, so nothing about your game changes until you choose."
+    elif own_off:
+        state = "lets you pick features. They start OFF, so nothing about your game changes until you choose."
+    else:
+        state = "lets you turn features off and on. Everything in this zip starts ON."
+    lines += ["Install (one minute)",
               "  1. Close the game.",
               "  2. Open the game folder: in Steam, right-click Dragon's Dogma: Dark Arisen, then Manage, then",
               "     Browse local files. It is the folder with DDDA.exe in it.",
@@ -569,10 +609,9 @@ def _plugins_readme(title: str, plugins: list[tuple[str, str]], ninput: bool = F
               "     replace files, say yes. (If it says a file named dinput8.dll is already there, another mod",
               "     owns that name: stop and read \"Already have a dinput8.dll?\" below first.)",
               f"  4. Double-click  {START_HERE}  in that folder:",
-              "        1  checks that the install is right and says what to fix",
-              "        2  lets you pick features. They start OFF, so nothing about your game changes until you",
-              "           choose (only the save backup is on).",
-              "  5. Start the game. For about 12 seconds a small RUNNING notice shows in the top-right corner:",
+              "        1  checks that the install is right and says what to fix"]
+    lines += para(state, "        2  ", "           ")
+    lines += ["  5. Start the game. For about 12 seconds a small RUNNING notice shows in the top-right corner:",
               "     that is how you know Riftstone is in the game. It names the key (Insert) that opens a",
               "     diagnostics panel, which changes nothing in the game.", "",
               "  Windows may show a blue \"Windows protected your PC\" box for the Start Here file, because it came",
@@ -652,7 +691,7 @@ def build_plugins(plugins: list[Path], out: Path, name: str | None = None, loade
     """A zip for players without Riftstone: the loader (dinput8.dll + riftstone_loader.ini) and the plugins at
     their game-folder paths, a README, "Riftstone - Start Here.cmd" and riftstone/package.json -- no mods and no
     game data.  Riftstone's own plugins start OFF (in riftstone\\plugins\\off, where the loader never looks) except
-    the ones in ``start_on`` (default: DEFAULT_ON, the save backup); a plugin that is not Riftstone's is on, since
+    the ones in ``start_on`` (default: DEFAULT_ON, the save backup and collision_cap); a plugin that is not Riftstone's is on, since
     whoever packaged it named it.  ``ninput`` (its xinput1_3.dll) adds Ninput under optional\\ninput with its
     licences: shipped, but off until a player copies it."""
     out = _out_path(out)

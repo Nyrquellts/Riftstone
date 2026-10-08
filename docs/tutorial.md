@@ -75,6 +75,9 @@ name beside each one Riftstone knows: change `攻撃力: 250.0  # Attack` to `40
 Riftstone.cmd restore
 ```
 
+Health is its own file: `find goblin` lists `charparam/em/em0100.rst` right after the stats, and its first
+`mHPMax` is the Goblins' base health (`docs/enemy-hp.md` has the recipe, and the human enemies').
+
 Prefer buttons? `Riftstone.cmd studio` opens the whole thing in your browser.
 
 ---
@@ -428,6 +431,25 @@ pre|post|any` changes when it exists; `--dry-run` shows the plan. Two
 encounters in one mod stack. **In game: untested** -- please report what you
 see.
 
+**Every spawn at once.** `multiply` does to the whole game what you would otherwise do one placement at a
+time:
+
+```bat
+Riftstone.cmd multiply 2 --dry-run
+Riftstone.cmd multiply 2
+Riftstone.cmd install "Spawn Multiplier"
+Riftstone.cmd plugins on enemy_cap
+```
+
+Every enemy group gets twice its placements (3 for three times, up to 10), each copy on walkable ground beside
+its original; a capped group's cap is doubled. Placements a quest scripts, and the Dragon, the Ur-Dragon and
+Daimon, stay as they are; big monsters join with `--bosses`. `--stage 100 424` or `--enemy goblin wolf` narrow
+it, `--plain` gives exact copies with no champion. Running it again with another number replaces the last run.
+A group holds 32 placements at most (the game's kill record), so the largest groups stop there and the command
+says how many copies were left out. The whole game is about 6.5 GB of rebuilt archives in the overlay; `--stage`
+keeps it small. Without `enemy_cap` the game still shows ten enemies at once. **In game: untested**
+(`docs/spawn-multiplier.md`).
+
 **Editing a group directly.** `open`/`extract` a group list
 (`scr/st100/etc/st100_e.gpl`) to edit it as YAML: `mUnitKindList` (the enemies
 it can spawn -- the game loads an enemy's model because a group lists it),
@@ -535,6 +557,17 @@ My Mod\
 - `Riftstone.cmd new "My Mod"` — make it in the mods folder (`--here` for the
   current folder, or give a path). Commands then find it by name.
 - `Riftstone.cmd mods` — every mods folder, the mods in it, which are installed.
+- `Riftstone.cmd import <folder or .arc files> --mod "My Mod"` — bring in an
+  **old-style archive mod** (one that ships changed `.arc` files, such as a model
+  replacement) without redoing it by hand. Each archive is compared with the
+  game's own and the mod keeps only the resources that changed, so it installs,
+  uninstalls and merges with other mods like any other, and Studio lists it.
+  Unzip the old mod first: `import` reads `.arc` files or a folder of them (a
+  copy of its `nativePC` folder is fine), not a zip, and `package install` is
+  for Riftstone's own packages, not for this. Nothing in the game is touched;
+  `install "My Mod"` then plays it, writing its own copy over any file you had
+  put at the same path in `riftstone\overlay` by hand. Add `--game "<folder>"`
+  when the game is not the one Steam finds.
 - `Riftstone.cmd build "My Mod"` — build to `My Mod\build\` without touching the
   game (to inspect the archives).
 - `Riftstone.cmd install "My Mod"` — enable and apply. Originals are copied to

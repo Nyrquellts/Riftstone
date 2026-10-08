@@ -20,7 +20,7 @@ fixes eleven faults a review found in 0.3.2, each reproduced in the harness firs
 |---|---|---|---|
 | Crash reports | `riftstone\logs\crash-<time>.txt` + `.dmp`: the fault, which plugin or module it is in, the **engine class** of each object in the registers and on the stack (`uEm5200`, `sSetManager`...), memory headroom with a verdict when the game ran out of address space, the stage, the last files opened, the files it looked for and did not find. A stack overflow gets one too (written from a helper thread) | on | both |
 | Fatal-error reports | the game's own "Failed open file" box becomes `fatal-<time>.txt` (the missing file, what it means) and the box gains one line naming it | on | both |
-| Hang reports | no frame for 20 s while the game is in front, or while Windows calls it not responding (since 1.0.2: a frozen fullscreen game is usually behind the desktop by the time its player got out, and one ended at shutdown on 2026-09-27 left no report): `hang-<time>.txt` with where the main thread waits, and with `minidump = 1` every thread's state in `hang-<time>.dmp`, written on a thread of its own that the watch gives 30 s. The game is not touched | on | both |
+| Hang reports | no frame for 20 s while the game is in front, or while Windows calls it not responding (since 1.0.2: a frozen fullscreen game is usually behind the desktop by the time its player got out, and one ended at shutdown on 2026-09-27 left no report): `hang-<time>.txt` with where the main thread waits and what the Direct3D device last told the game, and with `minidump = 1` every thread's state in `hang-<time>.dmp`, written on a thread of its own that the watch gives 30 s. The game is not touched | on | both |
 | **Snapshots** (1.0.2) | `riftstone snapshot` sets `Local\RiftstoneSnapshot-<pid>` (the live thread creates it and checks it every quarter second): the same report as a hang, `snapshot-<time>.txt`, and every thread in `snapshot-<time>.dmp` while the game goes on (its main thread is paused only while its registers and stack are read, and every thread while the dump is written); `riftstone threads` reads any of the loader's dumps and groups the threads by what they are in. Snapshots are not problems: `doctor`, `playtest` and Studio leave them out | with live stats | both |
 | **Why the game closed** | a normal exit leaves no report, so the loader watches it happen: Alt+F4 (and whether the key came from the keyboard or a program), the close button or window menu, a close message from another program, Windows ending the session, the game's own exit menu, its fatal error. `loader.log` gets an `exit` line and the exit summary ends `ended by: ...`; `runtime-state.ini` keeps it; `Riftstone.cmd crash`, `doctor` and Studio's Game tab say it, and whether it was a crash | on | both (the exit menu: DDDA 2364871) |
 | Report rotation | the newest 10 of each kind; `loader.prev.log` keeps the last session's log | on | both |
@@ -207,8 +207,11 @@ safe mode and the window fixes need no engine address at all.
   check that skips the walk when the data or the body list is missing. Every site, the two accessors and the
   inline walks' continuations are byte-verified first; one differing byte patches nothing. The engine harness runs
   the game's own code: unguarded, a ragdoll without its data faults at `0x00794942`; guarded, complete ragdolls get
-  the same values and leave the same `eax`, and the one without data walks nothing. Whether a goblin whose
-  ragdoll was not set up in time falls right in game: UNKNOWN.
+  the same values and leave the same `eax`, and the one without data walks nothing. The same read is inlined in
+  62 more places (`native/loader/ragdoll_sites.inc`, written by `tools/ragdoll_sites.py`; one of them,
+  `0x00794AA2` in a dying enemy's walk, stopped the owner's game at Devil's Firegrove on 2026-10-06), each guarded
+  by a stub that gives a ragdoll without its data a count of 0 (`docs/stability-membrane.md`). Whether a goblin
+  whose ragdoll was not set up in time falls right in game: UNKNOWN.
 - **The archive guard** (1.0.1, `resources.cpp`, `[guard] from_archives = 1`). The same path stops the game
   for any resource, not only a texture, whenever the game asks for it before the archive that holds it has
   been read. Players report it at the ending's cutscenes: `"Failed open file.
@@ -271,6 +274,38 @@ safe mode and the window fixes need no engine address at all.
   lock (a crash inside a `DllMain`, e.g. a plugin's while the loader loads it), no new thread can start, so
   only the note is written. Before 0.4.1 the report and the note were left empty and the process ended with a
   second fault (`0xC0000005`), so a stack overflow never counted towards safe mode or quarantine.
+- **Crashes on several threads at once.** The game's job threads can fault together. At Gran Soren on
+  2026-10-06, three crashes left three reports each, stamped within the same second, and 8 of their 9
+  minidumps were 0 bytes (only `crash-20261006-150244-3.dmp`, 966,903 bytes, was whole). A stage 220 crash of
+  2026-09-28 left a 0-byte third one too. dbghelp is single-threaded, and a minidump
+  stops the process's other threads while it is written. A thread past the three reports went straight on to
+  the game's filter, which ends the process, while the others were still writing. So the reports take turns:
+  a crashing thread takes the turn before it writes. After its own report (or none) it waits until no other
+  crashing thread is still writing before it calls the game's filter. A hang dump takes the same turn. A
+  writer stuck on a lock the crashing threads hold costs each of them at most 30 s. A hang noticed while a
+  crash is being reported writes no hang report, since the crash's minidump holds every thread. Nor does one
+  after a crash that nothing recovered, until the game draws again. The game is ending then, and Windows Error
+  Reporting can hold it for a minute. The empty `hang-20260928-124832.txt` came 43 s after such a crash
+  (`docs/stability-membrane.md`; the harness's `crashhang`). The harness's
+  `crashrace` faults four threads at once. Before the change it left 0 or 1 report, cut short, in each of
+  3 runs. After it, 5 of 5 runs gave three whole reports with minidumps that `minidump.threads` reads back
+  (12 threads each).
+- **What the device said, in a hang.** No frame can mean four things: a stuck game, a lost device the game
+  is waiting on, a game that counts itself inactive, or a present chain that holds the frames. Hang and
+  snapshot reports now have a "graphics device" section, written before the memory section:
+  - the last Present's result and how long it has been failing;
+  - TestCooperativeLevel's calls, its last result and how long ago it was asked (slot 3, hooked with
+    Present and Reset; only noted);
+  - Reset's calls and result;
+  - the window's mode, and whether it is in front or minimized;
+  - on the known build, the main loop's own gates (`docs/stability-membrane.md`, "The hang of 2026-10-06
+    14:42").
+
+  A lost device, a device the driver stopped, or a game that counts itself inactive gets a VERDICT line.
+  `runtime.parse_report` reads the section into `device`, and `riftstone crash` repeats its verdict. The
+  harness's `hanglost` puts stand-ins for Present and TestCooperativeLevel into Windows' own device table,
+  under the loader's hooks. It then plays DDDA's lost-device path: one Present that says `D3DERR_DEVICELOST`,
+  then only TestCooperativeLevel. The report names the device as lost. In game: UNKNOWN.
 - **Safe mode.** `riftstone\runtime-state.ini` remembers how each session ended; the crash handler
   leaves `riftstone\logs\last-crash.txt` (uptime, faulting module). "Start-up" means the first two
   minutes. A clean exit, or a run past two minutes, resets the count. The setup fingerprint covers

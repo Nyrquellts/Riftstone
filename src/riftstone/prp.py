@@ -3,14 +3,16 @@
 These are the enemy/character parameter files (``charparam\\em\\em####``): attack,
 defence, magick attack/defence, weight, size and scale, the full elemental and
 status resistance table, flinch/knockback guards, human-enemy HP, EXP, camera and
-fall thresholds.  Editing an enemy's stats is editing one of these.
+fall thresholds.  Editing an enemy's stats is editing one of these.  A monster's base
+health is not here but in its ``.rst`` (``mHPMax``, :mod:`riftstone.flat`,
+docs/enemy-hp.md); ``人間敵 HP`` is the health of the human enemies only.
 
 The wrapper carries no data of its own.  Across every vanilla ``.prp`` the second
 dword is the constant ``0x77CED14C`` and the third equals the embedded XFS root
 class id, so the bytes are fully determined by the XFS body -- Riftstone strips the
 header, hands the body to :mod:`riftstone.xfs`, and rebuilds it on save.  The
 parameter names are the developers' Japanese strings; :data:`GLOSS` translates the
-common enemy class so a reader can find HP, attack and scale, and the YAML writes each
+common enemy class so a reader can find attack, defence and scale, and the YAML writes each
 translated field's English name beside it as a comment.  ``riftstone open`` edits it
 as a parameter YAML like any other XFS resource.
 """

@@ -4,7 +4,8 @@ Dragon's Dogma: Dark Arisen has one save slot per Steam account. Every autosave,
 rest overwrites it, so a failed quest or a bad choice can stick. The loader copies the save folder
 each time the game starts, the `save_backup` plugin copies each save the game writes while you play,
 and `riftstone saves` lists both and puts one back. `riftstone saves knowledge` reads the main pawn's
-enemy knowledge from the save and can raise it to the top (below).
+enemy knowledge from the save and can raise it to the top, and `riftstone saves arisen` reads the Arisen's
+level, vocation rank, discipline, stats and skills and can set them (both below).
 
 | Kind (as the list names it) | Made by | When | Where |
 |---|---|---|---|
@@ -153,6 +154,65 @@ checks, the counters then reach 71 of 71 and 113 of 113, and a second grant chan
 **UNKNOWN until observed in game:** that the pawn shows the new levels and uses the tactics that go
 with them, and whether the pawn other players hire from the Rift carries them.
 
+## The Arisen (`riftstone saves arisen`)
+
+The Arisen's record is `mPl` (`cSAVE_DATA_PL`: `mEdit`, the looks, and `mParam`, `cSAVE_DATA_PARAM`) under
+`mPlCmcEditAndParam` in each of the two copies of the player's data the save holds, `mPlayerDataManual` and
+`mPlayerDataBase`. The pawns beside it (`mCmc`, `cSAVE_DATA_CMC`) hold the same parameter block, and so do the
+copies under `mPlGameData`, `mNetGameData` and `mSystemData`, which the command never touches. Measured on this
+machine's save (2026-10-06, 26 parameter blocks; on it the base copy is older than the manual one: a level-137
+Magick Archer beside the manual copy's Warrior, and its main pawn two levels behind):
+
+| Field | Type | What it holds |
+|---|---|---|
+| `mLevel` | u8 | the level (the game's cap is 200) |
+| `mJob` | u8 | the vocation: 1 Fighter, 2 Strider, 3 Mage, 4 Assassin, 5 Magick Archer, 6 Mystic Knight, 7 Warrior, 8 Ranger, 9 Sorcerer (the game's order; this save's pawns hold ranks only in 1-3 and 7-9, the six a pawn can take; 7 is its Warrior, 5 its earlier Magick Archer) |
+| `mJobLevel` | u8 [10] | each vocation's rank, by number (entry 0 unused) |
+| `mJobExp`, `mJobNextExp` | u32 [10] | discipline earned in the vocation and what its next rank needs: 0 at rank 9 on all 47 rank-9 entries, never at a lower rank |
+| `mJobPoint` | s32 [10] | discipline points, one value in all ten entries |
+| `mHp`, `mHpMax`, `mHpMaxWhite` | f32 | health now, its maximum, and `mHpMaxWhite` (not measured) |
+| `mStamina`, `mStaminaLv` | f32 | stamina and a level part of it (520 apart on the level-137 record) |
+| `mBasicAttack`, `mBasicDefend`, `mBasicMgcAttack`, `mBasicMgcDefend` | f32 | strength, defence, magick and magick defence before equipment |
+| `mWeaponSkill[nWeapon::X]` | s16 [6] x 12 | the skill palette of each weapon, in the save's order SWORD, MACE, GSWORD, DAGGER, WAND, WAND_DX, HAMMER, SHIELD, SHIELD_L, BOW, BOW_L, BOW_MG; -1 = an empty slot |
+| `mSkillLv1`, `mSkillLv2` | u32 [14] | the skills learned at each tier, one bit per skill number: word n // 32, bit n % 32 (every one of the 273 equipped numbers of this save has its bit in `mSkillLv1 \| mSkillLv2`) |
+
+Skill numbers are per weapon category, a palette's index + 1. `removeIllegalCstmSkill` (`0x00780590`), run at
+every player setup, drops a palette entry outside its category's range, read from two 13-entry tables
+(`8B 34 85 80 6C 4F 01` at `0x00780609`: the first number, at `0x014F6C80`; `8B 3C 85 B4 6C 4F 01` at
+`0x00780614`: the count, at `0x014F6CB4`). The longsword (3) and the warhammer (7) share numbers 100-109, the
+sword (1) and the mace (2) 40-59, the daggers (4) 150-169, the staff (5) and the archistaff (6) 210-239, the
+shield (8) 270-278, the magick shield (9) 310-324, the shortbow (10) and the magick bow (12) 350-367, the
+longbow (11) 400-408. Every one of the 273 equipped numbers of this save's 26 records is inside its palette's
+range. `saves.skill_tables` reads the tables from the installed `DDDA.exe` after that code matches byte for byte.
+
+```bat
+riftstone saves arisen                     :: level, vocation and rank, discipline, stats, palettes, skills learned
+riftstone saves arisen --json
+riftstone saves arisen --level 200 --rank 9 --points 999999 --skills all --yes
+riftstone saves arisen --hp 5500 --attack 999 --stat mStaminaLv=3860 --yes
+riftstone saves arisen --max --yes         :: the showcase preset (close the game first)
+```
+
+`--level` (1-200), `--rank` (1-9, of `--vocation`, else the save's own; 9 also sets that vocation's next-rank
+discipline to 0, as the game has it), `--points`, `--hp` (the three HP fields), `--stamina`, `--attack`,
+`--defence`, `--magick`, `--magick-defence` and `--stat NAME=VALUE` (any of the nine f32 fields) set values.
+`--skills all` learns every skill of the vocation's weapons (`--weapons` names others) at both tiers and fills a
+palette's empty slots with the lowest unused numbers of its category, keeping the slots the player chose. `--max`
+is the showcase preset: level 200, rank 9, 999,999 discipline, HP 5500, stamina 4500 (`mStaminaLv` 3860), the
+four stats 999, every skill -- round numbers, not the game's measured caps. Both copies of the player's data get
+the same values; the vocation itself (`mJob`) is never changed, so a copy that holds another vocation keeps it.
+Only value text changes, written as the game writes it. It refuses while the game runs, on a save that does not
+check, and on a value the game would not write; the save as it was is kept as a copy first (`saves restore` puts
+it back).
+
+Measured on this machine's save (2026-10-06): `--max` changed 36 values of the base copy (the manual copy
+already held them), the result checks all the way through, both copies read back as asked and a second run
+changes nothing. The base copy's Magick Archer reports 15 of 20 dagger skills and 9 of 18 magick-bow skills
+learned, in step with its palettes.
+
+**UNKNOWN until observed in game:** that the game shows the level, rank, discipline, stats and skills (it may
+recompute health and stamina from its own tables at load), and what Steam Cloud does with the edited file.
+
 ## Proof so far
 
 - `tests/test_saves.py`: the format against a real save; that damaged or partial saves are refused;
@@ -160,6 +220,11 @@ with them, and whether the pawn other players hire from the Rift carries them.
   back (a save-folder copy restores the folder's other files too); a damaged save-folder copy is
   never put back and nothing is set aside for it; restore while running refused; a damaged current
   save kept aside; the plugin's `Folder` setting; and the CLI under both names, `--yes` required.
+- `tests/test_saves.py` (the Arisen): the record found in both copies and nowhere else; an edit changes only
+  value text, in both copies, with the pawn beside it and the system data's copy untouched; rank 9 zeroes the
+  next-rank discipline; palettes filled around the player's own slots; refusals (levels, ranks, discipline,
+  stats, weapons, vocations, values the game would not write, unbalanced XML); the CLI (`--yes` required, a
+  copy per write, the preset). `fuzz/targets.py` `save_arisen`: the same invariants under random saves.
 - `tests/test_plugins.py`: the plugin's settings through Studio's checks (`Keep`, `KeepSessions`,
   `CheckSeconds`, `Enabled`, `Folder`).
 - `native/plugins/save_backup/test/run_tests.py` loads the real `.asi` in a stand-in game process

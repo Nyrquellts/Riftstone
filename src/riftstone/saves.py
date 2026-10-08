@@ -33,7 +33,7 @@ import os
 import re
 import struct
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -480,11 +480,13 @@ def knowledge_tables(exe: Path) -> KnowledgeTables:
 
 _TAG = re.compile(rb"<(/?)(class|array)\b([^>]*?)(/?)>")
 _ATTR_NAME = re.compile(rb'\bname="([^"]*)"')
-_VALUE = re.compile(rb'<(f32|u32|u8) value="([^"]*)"/>')
+_VALUE = re.compile(rb'<(f32|u32|u8|s16|s32) value="([^"]*)"/>')
 # how the game writes each counter (every value in a real save matches: floats "%.6f", counts in digits)
-_WRITTEN = {"f32": re.compile(rb"-?[0-9]+\.[0-9]{6}"), "u32": re.compile(rb"[0-9]{1,10}"),
+_WRITTEN = {"f32": re.compile(rb"-?[0-9]+\.[0-9]{6}"), "u32": re.compile(rb"[0-9]{1,10}"), "s16": re.compile(rb"-?[0-9]{1,5}"),
+            "s32": re.compile(rb"-?[0-9]{1,10}"),
             "u8": re.compile(rb"[0-9]{1,3}")}
-_LIMIT = {"u32": 0xFFFFFFFF, "u8": 0xFF}
+_LIMIT = {"u32": 0xFFFFFFFF, "u8": 0xFF, "s16": 0x7FFF, "s32": 0x7FFFFFFF}
+_FLOOR = {"s16": -0x8000, "s32": -0x80000000}
 _ONLY = {k: re.compile(rb'(?:\s*<' + k.encode() + rb' value="[^"]*"/>)*\s*') for k in _WRITTEN}  # an array's body
 
 
@@ -526,21 +528,45 @@ def _main_pawns(xml: bytes) -> list[tuple[str, int, int]]:
 
 def _counters(xml: bytes, start: int, end: int, name: str, kind: str, count: int) -> list[tuple[int, int, bytes]]:
     """(value start, value end, text) of each element of one counter array inside a pawn's record."""
+    return _values(xml, start, end, name, kind, count, "the main pawn's")
+
+
+def _written(text: bytes, kind: str, name: str, whose: str) -> None:
+    """Refuse a value the game would not write."""
+    if (not _WRITTEN[kind].fullmatch(text) or (kind in _LIMIT and int(text) > _LIMIT[kind])
+            or (kind in _FLOOR and int(text) < _FLOOR[kind])):
+        raise FormatError("save", f"{whose} {name} holds {text.decode('latin-1')!r}, "
+                                  f"which is not a {kind} value as the game writes one")
+
+
+def _values(xml: bytes, start: int, end: int, name: str, kind: str, count: int,
+            whose: str) -> list[tuple[int, int, bytes]]:
+    """(value start, value end, text) of each element of one array inside a record."""
     head = f'<array name="{name}" type="{kind}" count="{count}">'.encode()
     at = xml.find(head, start, end)
     close = xml.find(b"</array>", at, end) if at >= 0 else -1
     if at < 0 or close < 0:
-        raise FormatError("save", f"the main pawn's record has no {name} of {count} {kind} values")
+        raise FormatError("save", f"{whose} record has no {name} of {count} {kind} values")
     if not _ONLY[kind].fullmatch(xml, at + len(head), close):
-        raise FormatError("save", f"the main pawn's {name} holds something besides {kind} values")
+        raise FormatError("save", f"{whose} {name} holds something besides {kind} values")
     vals = [(m.start(2), m.end(2), m.group(2)) for m in _VALUE.finditer(xml, at + len(head), close)]
     if len(vals) != count:
-        raise FormatError("save", f"the main pawn's {name} holds {len(vals)} values, not {count}")
+        raise FormatError("save", f"{whose} {name} holds {len(vals)} values, not {count}")
     for _, _, text in vals:
-        if not _WRITTEN[kind].fullmatch(text) or (kind in _LIMIT and int(text) > _LIMIT[kind]):
-            raise FormatError("save", f"the main pawn's {name} holds {text.decode('latin-1')!r}, "
-                                      f"which is not a {kind} value as the game writes one")
+        _written(text, kind, name, whose)
     return vals
+
+
+def _scalar(xml: bytes, start: int, end: int, name: str, kind: str, whose: str) -> tuple[int, int, bytes]:
+    """(value start, value end, text) of one value inside a record."""
+    head = f'<{kind} name="{name}" value="'.encode()
+    at = xml.find(head, start, end)
+    close = xml.find(b'"/>', at, end) if at >= 0 else -1
+    if at < 0 or close < 0:
+        raise FormatError("save", f"{whose} record has no {kind} {name}")
+    text = xml[at + len(head):close]
+    _written(text, kind, name, whose)
+    return at + len(head), close, text
 
 
 def _number(text: bytes, kind: str) -> float | int:
@@ -623,6 +649,238 @@ def grant_knowledge_file(save: Path, root: Path, account: str, t: KnowledgeTable
     _refuse_while_running(game_running)
     data = _complete(save, save.name)
     new, n = grant_knowledge(data, t)
+    if not n:
+        return None, 0
+    check(new, deep=True)
+    kept, _ = backup(save, root, account)
+    _write_save(save, new)
+    return kept, n
+
+
+# --- the Arisen: level, vocation rank, discipline, stats and skills (`riftstone saves arisen`) -----------------------
+
+#: the weapon palettes a character record keeps (`mWeaponSkill[nWeapon::X]`, six skill numbers each, -1 = empty),
+#: in the save's own order; the game's weapon category is the index + 1 (category 0 is no weapon)
+WEAPONS = ("SWORD", "MACE", "GSWORD", "DAGGER", "WAND", "WAND_DX", "HAMMER", "SHIELD", "SHIELD_L", "BOW", "BOW_L",
+           "BOW_MG")
+WEAPON_NAMES = {"SWORD": "sword", "MACE": "mace", "GSWORD": "longsword", "DAGGER": "daggers", "WAND": "staff",
+                "WAND_DX": "archistaff", "HAMMER": "warhammer", "SHIELD": "shield", "SHIELD_L": "magick shield",
+                "BOW": "shortbow", "BOW_L": "longbow", "BOW_MG": "magick bow"}
+#: the vocations by the game's number (`mJob`) and the weapons each one wields
+VOCATIONS = {1: ("Fighter", ("SWORD", "SHIELD")), 2: ("Strider", ("DAGGER", "BOW")), 3: ("Mage", ("WAND",)),
+             4: ("Assassin", ("SWORD", "DAGGER", "SHIELD", "BOW")), 5: ("Magick Archer", ("DAGGER", "BOW_MG")),
+             6: ("Mystic Knight", ("SWORD", "MACE", "SHIELD_L")), 7: ("Warrior", ("GSWORD", "HAMMER")),
+             8: ("Ranger", ("DAGGER", "BOW_L")), 9: ("Sorcerer", ("WAND_DX",))}
+LEVEL_MAX = 200          # the game's level cap
+RANK_MAX = 9             # a vocation's top rank
+VOCATION_SLOTS = 10      # entries of mJobLevel / mJobExp / mJobNextExp / mJobPoint (by vocation number; 0 unused)
+PALETTE = 6              # skills a weapon palette holds
+SKILL_WORDS = 14         # u32 words of mSkillLv1 / mSkillLv2: one bit per skill number (word n // 32, bit n % 32)
+POINTS_MAX = 0x7FFFFFFF  # mJobPoint is s32
+#: the f32 fields of the record a `--stat` may set
+STATS = ("mHp", "mHpMax", "mHpMaxWhite", "mStamina", "mStaminaLv", "mBasicAttack", "mBasicDefend", "mBasicMgcAttack",
+         "mBasicMgcDefend")
+_COPIES = (b"mPlayerDataManual", b"mPlayerDataBase")
+
+
+@dataclass(frozen=True)
+class SkillTables:
+    """Each weapon category's first skill number and how many it has (13 categories; 0 is no weapon), as
+    `removeIllegalCstmSkill` reads them from DDDA.exe."""
+    first: tuple[int, ...]
+    count: tuple[int, ...]
+
+    def numbers(self, weapon: str) -> range:
+        c = WEAPONS.index(weapon) + 1
+        return range(self.first[c], self.first[c] + self.count[c])
+
+
+SKILL_CODE = ((0x00780609, bytes.fromhex("8B3485806C4F01")),   # mov esi, [eax*4 + 0x14F6C80]: the first number
+              (0x00780614, bytes.fromhex("8B3C85B46C4F01")))   # mov edi, [eax*4 + 0x14F6CB4]: the count
+_SKILL_FIRST, _SKILL_COUNT, _CATEGORIES = 0x014F6C80, 0x014F6CB4, 13
+
+
+def skill_tables(exe: Path) -> SkillTables:
+    """The skill numbers of each weapon category, read from DDDA.exe (build 2364871 only)."""
+    try:
+        read = _pe_reader(Path(exe).read_bytes())
+    except OSError as e:
+        raise RiftError(f"cannot read {exe}: {e}") from None
+    for at, want in SKILL_CODE:
+        if read(at, len(want)) != want:
+            raise RiftError(f"{Path(exe).name} is not the build whose skill tables Riftstone knows "
+                            f"(the code at 0x{at:08X} differs); nothing was read")
+    first = struct.unpack(f"<{_CATEGORIES}I", read(_SKILL_FIRST, 4 * _CATEGORIES))
+    count = struct.unpack(f"<{_CATEGORIES}I", read(_SKILL_COUNT, 4 * _CATEGORIES))
+    if not all(0 < f + c <= 32 * SKILL_WORDS for f, c in zip(first, count)):
+        raise RiftError(f"{Path(exe).name}: the skill tables do not read as expected; nothing was read")
+    return SkillTables(first, count)
+
+
+def _arisen_records(xml: bytes) -> list[tuple[str, int, int]]:
+    """(copy, start, end) of the Arisen's parameter block (`mPl` > `mParam`, cSAVE_DATA_PARAM) in each copy of the
+    player's data a save holds, mPlayerDataManual and mPlayerDataBase, in file order."""
+    stack: list[tuple[bytes, int]] = []    # (name, start)
+    found = []
+    for m in _TAG.finditer(xml):
+        closing, _tag, attrs, empty = m.groups()
+        if empty:
+            continue
+        if not closing:
+            n = _ATTR_NAME.search(attrs)
+            stack.append((n.group(1) if n else b"", m.start()))
+            continue
+        if not stack:
+            raise FormatError("save", "its XML closes more elements than it opens")
+        name, start = stack.pop()
+        if (name == b"mParam" and len(stack) >= 3 and stack[-1][0] == b"mPl"
+                and stack[-2][0] == b"mPlCmcEditAndParam" and stack[-3][0] in _COPIES
+                and xml.startswith(b'<class name="mParam" type="cSAVE_DATA_PARAM">', start)):
+            found.append((stack[-3][0].decode(), start, m.end()))
+    if stack:
+        raise FormatError("save", "its XML leaves elements open")
+    return found
+
+
+def _read_record(xml: bytes, s: int, e: int, whose: str, tables: SkillTables | None) -> dict:
+    level = int(_scalar(xml, s, e, "mLevel", "u8", whose)[2])
+    job = int(_scalar(xml, s, e, "mJob", "u8", whose)[2])
+    ranks = [int(t) for _, _, t in _values(xml, s, e, "mJobLevel", "u8", VOCATION_SLOTS, whose)]
+    points = [int(t) for _, _, t in _values(xml, s, e, "mJobPoint", "s32", VOCATION_SLOTS, whose)]
+    stats = {n: float(_scalar(xml, s, e, n, "f32", whose)[2]) for n in STATS}
+    palettes = {w: [int(t) for _, _, t in _values(xml, s, e, f"mWeaponSkill[nWeapon::{w}]", "s16", PALETTE, whose)]
+                for w in WEAPONS}
+    lv1 = [int(t) for _, _, t in _values(xml, s, e, "mSkillLv1", "u32", SKILL_WORDS, whose)]
+    lv2 = [int(t) for _, _, t in _values(xml, s, e, "mSkillLv2", "u32", SKILL_WORDS, whose)]
+    name, weapons = VOCATIONS.get(job, (f"vocation {job}", ()))
+    skills = {}
+    for w in weapons:
+        d: dict = {"equipped": palettes[w]}
+        if tables is not None:
+            nums = tables.numbers(w)
+            d["learned"] = sum(1 for n in nums if (lv1[n // 32] | lv2[n // 32]) >> (n % 32) & 1)
+            d["of"] = len(nums)
+        skills[w] = d
+    return {"level": level, "job": job, "vocation": name, "rank": ranks[job] if 0 <= job < VOCATION_SLOTS else None,
+            "ranks": ranks, "points": points, "stats": stats, "skills": skills}
+
+
+def arisen(data: bytes, tables: SkillTables | None = None) -> dict:
+    """The Arisen's level, vocation and rank, discipline, stats and the palettes of the vocation's weapons (with
+    how many of their skills are learned when the skill tables are given), from each copy of the player's data."""
+    xml = unpack(data)
+    recs = _arisen_records(xml)
+    if not recs:
+        raise RiftError("this save has no Arisen record (mPlayerDataManual > mPlCmcEditAndParam > mPl)")
+    return {copy: _read_record(xml, s, e, f"the Arisen's ({copy})", tables) for copy, s, e in recs}
+
+
+@dataclass(frozen=True)
+class ArisenEdit:
+    """What `set_arisen` changes; None leaves a field as it is."""
+    level: int | None = None
+    rank: int | None = None                 # of `vocation`; 9 also sets its next-rank EXP to 0, as the game does
+    points: int | None = None               # discipline (every entry of mJobPoint, which the game keeps equal)
+    stats: dict[str, float] = field(default_factory=dict)   # by field name (STATS)
+    skills: bool = False                    # every skill of the weapons learned at both tiers; empty slots filled
+    vocation: int | None = None             # whose rank and weapons; None = the first copy's own
+    weapons: tuple[str, ...] = ()           # instead of the vocation's
+
+    def __post_init__(self) -> None:
+        if self.level is not None and not 1 <= self.level <= LEVEL_MAX:
+            raise RiftError(f"level {self.level}: the game's levels are 1-{LEVEL_MAX}")
+        if self.rank is not None and not 1 <= self.rank <= RANK_MAX:
+            raise RiftError(f"rank {self.rank}: a vocation's ranks are 1-{RANK_MAX}")
+        if self.points is not None and not 0 <= self.points <= POINTS_MAX:
+            raise RiftError(f"{self.points} discipline: the save holds 0-{POINTS_MAX}")
+        for name, value in self.stats.items():
+            if name not in STATS:
+                raise RiftError(f"{name}: not a stat of the record ({', '.join(STATS)})")
+            if not (math.isfinite(value) and 0 <= value < 1e9):
+                raise RiftError(f"{name} = {value}: not a value the game would hold")
+        for w in self.weapons:
+            if w not in WEAPONS:
+                raise RiftError(f"{w}: not a weapon palette ({', '.join(WEAPONS)})")
+        if self.vocation is not None and self.vocation not in VOCATIONS:
+            raise RiftError(f"vocation {self.vocation}: the game's are " + ", ".join(f"{k} {v[0]}" for k, v in VOCATIONS.items()))
+
+    @property
+    def empty(self) -> bool:
+        return self.level is None and self.rank is None and self.points is None and not self.stats and not self.skills
+
+
+def set_arisen(data: bytes, edit: ArisenEdit, tables: SkillTables | None = None) -> tuple[bytes, int]:
+    """The save with the Arisen's record changed in both copies of the player's data (only value text changes,
+    written as the game writes it; everything else stays byte for byte).  Learning skills fills a palette's empty
+    slots with the lowest unused numbers of its category and keeps the slots the player chose.  Returns the new
+    save and how many values changed."""
+    if edit.skills and tables is None:
+        raise RiftError("learning skills needs the skill tables (read from DDDA.exe)")
+    xml = unpack(data)
+    recs = _arisen_records(xml)
+    if not recs:
+        raise RiftError("this save has no Arisen record (mPlayerDataManual > mPlCmcEditAndParam > mPl)")
+    job = edit.vocation
+    if job is None:
+        job = int(_scalar(xml, recs[0][1], recs[0][2], "mJob", "u8", f"the Arisen's ({recs[0][0]})")[2])
+        if job not in VOCATIONS:
+            raise RiftError(f"the save's vocation {job} is not one the game has (1-{len(VOCATIONS)}); pass one")
+    weapons = edit.weapons or VOCATIONS[job][1]
+    edits: list[tuple[int, int, bytes]] = []
+
+    def put(at: tuple[int, int, bytes], new: bytes) -> None:
+        if at[2] != new:
+            edits.append((at[0], at[1], new))
+
+    for copy, s, e in recs:
+        whose = f"the Arisen's ({copy})"
+        if edit.level is not None:
+            put(_scalar(xml, s, e, "mLevel", "u8", whose), str(edit.level).encode())
+        if edit.rank is not None:
+            put(_values(xml, s, e, "mJobLevel", "u8", VOCATION_SLOTS, whose)[job], str(edit.rank).encode())
+            if edit.rank == RANK_MAX:
+                put(_values(xml, s, e, "mJobNextExp", "u32", VOCATION_SLOTS, whose)[job], b"0")
+        if edit.points is not None:
+            for at in _values(xml, s, e, "mJobPoint", "s32", VOCATION_SLOTS, whose):
+                put(at, str(edit.points).encode())
+        for name, value in edit.stats.items():
+            put(_scalar(xml, s, e, name, "f32", whose), f"{value:.6f}".encode())
+        if edit.skills:
+            lv1 = _values(xml, s, e, "mSkillLv1", "u32", SKILL_WORDS, whose)
+            lv2 = _values(xml, s, e, "mSkillLv2", "u32", SKILL_WORDS, whose)
+            w1, w2 = [int(t) for _, _, t in lv1], [int(t) for _, _, t in lv2]
+            for w in weapons:
+                nums = list(tables.numbers(w))
+                for n in nums:
+                    w1[n // 32] |= 1 << (n % 32)
+                    w2[n // 32] |= 1 << (n % 32)
+                slots = _values(xml, s, e, f"mWeaponSkill[nWeapon::{w}]", "s16", PALETTE, whose)
+                have = {int(t) for _, _, t in slots}
+                spare = [n for n in nums if n not in have]
+                for at in slots:
+                    if int(at[2]) < 0 and spare:
+                        put(at, str(spare.pop(0)).encode())
+            for words, at in ((w1, lv1), (w2, lv2)):
+                for k, slot in enumerate(at):
+                    put(slot, str(words[k]).encode())
+    if not edits:
+        return data, 0
+    out, at = [], 0
+    for s, e, text in sorted(edits):
+        out += [xml[at:s], text]
+        at = e
+    out.append(xml[at:])
+    return pack(b"".join(out)), len(edits)
+
+
+def set_arisen_file(save: Path, root: Path, account: str, edit: ArisenEdit, tables: SkillTables | None = None,
+                    game_running: Callable[[], bool] | None = None) -> tuple[Path | None, int]:
+    """Change the Arisen's record in a save file.  Refuses while the game runs and on a save that does not check;
+    the save as it was is kept as a copy first (returned with the count of values changed; nothing is written when
+    there is nothing to change)."""
+    _refuse_while_running(game_running)
+    data = _complete(save, save.name)
+    new, n = set_arisen(data, edit, tables)
     if not n:
         return None, 0
     check(new, deep=True)

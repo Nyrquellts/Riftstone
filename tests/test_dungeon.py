@@ -317,6 +317,7 @@ class FuzzTargetTest(unittest.TestCase):
             "fuzz_targets_dungeon", Path(__file__).resolve().parents[1] / "fuzz" / "targets.py")
         cls.targets = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.targets)
+        cls.addClassCleanup(lambda: cls.targets.close_caches())     # the stand-in game its targets keep open
 
     def run_case(self, fn, data: bytes):
         try:

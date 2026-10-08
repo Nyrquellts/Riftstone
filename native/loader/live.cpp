@@ -217,14 +217,16 @@ typedef HRESULT(STDMETHODCALLTYPE* CreateDevice_t)(IDirect3D9*, UINT, D3DDEVTYPE
 typedef HRESULT(STDMETHODCALLTYPE* Present_t)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 typedef HRESULT(STDMETHODCALLTYPE* Reset_t)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 typedef UINT(STDMETHODCALLTYPE* GetAvailableTextureMem_t)(IDirect3DDevice9*);
+typedef HRESULT(STDMETHODCALLTYPE* TestCooperativeLevel_t)(IDirect3DDevice9*);
 static Direct3DCreate9_t Real_Direct3DCreate9;
 static CreateDevice_t Real_CreateDevice;
 static Present_t Real_Present;
 static Reset_t Real_Reset;
+static TestCooperativeLevel_t Real_TestCooperativeLevel;
 static void** g_d3dVtable;       // the Direct3D object's table we patched
 static void** g_devVtable;       // the device's table we patched
 
-enum { VT_CREATE_DEVICE = 16, VT_RESET = 16, VT_PRESENT = 17, VT_TEXTURE_MEM = 4 };
+enum { VT_CREATE_DEVICE = 16, VT_RESET = 16, VT_PRESENT = 17, VT_TEXTURE_MEM = 4, VT_TEST_COOPERATIVE_LEVEL = 3 };
 
 static BOOL PatchSlot(void** table, int index, void* hook, void** real) {
     if (table[index] == hook) return TRUE;
@@ -246,6 +248,70 @@ static void NoteParams(const D3DPRESENT_PARAMETERS* pp, HWND focus) {
     if (w) g_gameWindow = w;
 }
 
+// What the device last told the game, for a hang report.  A game whose Present returns D3DERR_DEVICELOST asks
+// for a reset and runs its frames without presenting until TestCooperativeLevel says the device can be reset
+// (DDDA: docs/stability-membrane.md, "The hang of 2026-10-06 14:42"), so "no frame" alone does not say whether
+// the game is stuck or waiting for its device.  Written on the presenting thread, read by the hang watch.
+static volatile LONG g_presentHr = 0, g_presentBad = 0;     // the last Present's result; failures in a row
+static volatile DWORD g_presentBadSince = 0;                // GetTickCount when that run of failures began
+static volatile LONG g_tclHr = 0, g_tclCalls = 0, g_tclBad = 0;
+static volatile DWORD g_tclAt = 0, g_tclBadSince = 0;
+static volatile LONG g_resets = 0, g_resetHr = 0;
+
+static void NoteResult(HRESULT hr, volatile LONG* last, volatile LONG* bad, volatile DWORD* since) {
+    *last = hr;
+    if (SUCCEEDED(hr)) {
+        *bad = 0;
+    } else if (InterlockedIncrement(bad) == 1) {
+        *since = GetTickCount();
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_TestCooperativeLevel(IDirect3DDevice9* dev) {
+    HRESULT hr = Real_TestCooperativeLevel(dev);
+    g_tclAt = GetTickCount();
+    InterlockedIncrement(&g_tclCalls);
+    NoteResult(hr, &g_tclHr, &g_tclBad, &g_tclBadSince);
+    return hr;
+}
+
+const wchar_t* D3dResultName(LONG hr) {
+    switch (hr) {
+    case D3D_OK: return L"D3D_OK";
+    case D3DERR_DEVICELOST: return L"D3DERR_DEVICELOST";
+    case D3DERR_DEVICENOTRESET: return L"D3DERR_DEVICENOTRESET";
+    case D3DERR_DEVICEREMOVED: return L"D3DERR_DEVICEREMOVED";
+    case D3DERR_DEVICEHUNG: return L"D3DERR_DEVICEHUNG";
+    case D3DERR_DRIVERINTERNALERROR: return L"D3DERR_DRIVERINTERNALERROR";
+    case D3DERR_OUTOFVIDEOMEMORY: return L"D3DERR_OUTOFVIDEOMEMORY";
+    case D3DERR_INVALIDCALL: return L"D3DERR_INVALIDCALL";
+    case D3DERR_NOTAVAILABLE: return L"D3DERR_NOTAVAILABLE";
+    case E_OUTOFMEMORY: return L"E_OUTOFMEMORY";
+    case S_PRESENT_OCCLUDED: return L"S_PRESENT_OCCLUDED";
+    case S_PRESENT_MODE_CHANGED: return L"S_PRESENT_MODE_CHANGED";
+    default: return L"another result";
+    }
+}
+
+BOOL GetDeviceState(DeviceState* d) {
+    memset(d, 0, sizeof *d);
+    if (!g_devVtable) return FALSE;
+    DWORD now = GetTickCount();
+    d->frames = g_frames;
+    d->presentHr = g_presentHr;
+    d->presentBad = g_presentBad;
+    d->presentBadMs = d->presentBad ? now - g_presentBadSince : 0;
+    d->tclHooked = Real_TestCooperativeLevel != NULL;
+    d->tclCalls = g_tclCalls;
+    d->tclHr = g_tclHr;
+    d->tclAgoMs = d->tclCalls ? now - g_tclAt : 0;
+    d->tclBad = g_tclBad;
+    d->tclBadMs = d->tclBad ? now - g_tclBadSince : 0;
+    d->resets = g_resets;
+    d->resetHr = g_resetHr;
+    return TRUE;
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* dirty) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -264,12 +330,16 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* dev, const RECT*
         g_vramMb = (LONG)(mem(dev) >> 20);
     }
     OverlayPresent(dev);    // the in-game panel, into the back buffer before it goes out
-    return Real_Present(dev, src, dst, wnd, dirty);
+    HRESULT hr = Real_Present(dev, src, dst, wnd, dirty);
+    NoteResult(hr, &g_presentHr, &g_presentBad, &g_presentBadSince);
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp) {
     OverlayBeforeReset(dev);
     HRESULT hr = Real_Reset(dev, pp);
+    InterlockedIncrement(&g_resets);
+    g_resetHr = hr;
     if (SUCCEEDED(hr)) NoteParams(pp, NULL);
     return hr;
 }
@@ -285,7 +355,13 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* d3d, UINT adapter
         if (g_frameStats && !g_devVtable) {             // frame timing only when [live] frame_stats is on
             BOOL ok = PatchSlot(table, VT_PRESENT, (void*)Hook_Present, (void**)&Real_Present) &&
                       PatchSlot(table, VT_RESET, (void*)Hook_Reset, (void**)&Real_Reset);
-            if (ok) g_devVtable = table;
+            if (ok) {
+                // Only noted (the hang report's "graphics device"); the frame timing does not depend on it.
+                if (!PatchSlot(table, VT_TEST_COOPERATIVE_LEVEL, (void*)Hook_TestCooperativeLevel,
+                               (void**)&Real_TestCooperativeLevel))
+                    Real_TestCooperativeLevel = NULL;
+                g_devVtable = table;
+            }
             LogLine(L"live     Direct3D device %lux%lu %s (flags 0x%lx): frame timing %s", pp ? pp->BackBufferWidth : 0,
                     pp ? pp->BackBufferHeight : 0, pp && pp->Windowed ? L"windowed" : L"fullscreen", flags,
                     ok ? L"on" : L"unavailable");

@@ -23,6 +23,24 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(s.leaf_offset + 10 * s.leaves, len(d))
         self.assertEqual(sbc.positions(d)[1], (9800.0, 5100.0, 300.0))
 
+    def test_triangles_count_vertices_from_their_part(self):
+        pts = [(100.0 * i, 10.0 * i, 50.0 * (i % 2)) for i in range(6)]
+        d = bytearray(helpers.cell_collision(pts, parts=2))               # four triangles, all in part 0
+        s = sbc.parse(bytes(d))
+        self.assertEqual([t[:3] for t in sbc.triangles(bytes(d))],
+                         [(pts[i], pts[i + 1], pts[i + 2]) for i in range(4)])
+        self.assertEqual(sbc.triangles(bytes(d))[0][3], (0.0, 1.0, 0.0))
+        # two triangles and four vertices a part, the second part's from vertex 2: its numbers start over
+        struct.pack_into("<6I", d, s.part_offset(0) + 0x2C, 0, 2, 0, 2, 0, 4)
+        struct.pack_into("<6I", d, s.part_offset(1) + 0x2C, 2, 2, 2, 2, 2, 4)
+        for k, corners in ((2, (0, 1, 2)), (3, (1, 2, 3))):
+            struct.pack_into("<3H", d, s.triangle_offset + k * sbc.TRIANGLE + 12, *corners)
+        self.assertEqual([t[:3] for t in sbc.triangles(bytes(d))],
+                         [(pts[i], pts[i + 1], pts[i + 2]) for i in range(4)])
+        struct.pack_into("<3H", d, s.triangle_offset + 3 * sbc.TRIANGLE + 12, 1, 2, 4)
+        with self.assertRaisesRegex(FormatError, "past the part's 4"):
+            sbc.triangles(bytes(d))
+
     def test_modify_ids_are_not_in_the_file(self):
         # 452 vanilla files count modify ids; the loader reads none of them from the stream
         self.assertEqual(sbc.parse(helpers.cell_collision(modify=5)).vertices, 4)

@@ -36,6 +36,9 @@ class ImportReport:
     written: list[Path] = field(default_factory=list)
 
 
+COMPRESSED = (".zip", ".7z", ".rar")
+
+
 def _inputs(paths: list[Path]) -> list[tuple[Path, Path]]:
     """(archive file, the folder it was found under) for every .arc given or inside a folder given."""
     out = []
@@ -44,9 +47,16 @@ def _inputs(paths: list[Path]) -> list[tuple[Path, Path]]:
         if p.is_file() and p.suffix.lower() == ".arc":
             out.append((p, p.parent))
         elif p.is_dir():
-            out.extend((f, p) for f in sorted(p.rglob("*.arc")))
+            # files only: Riftstone unpacks an archive into a folder named x.arc, which the archive reader cannot open
+            out.extend((f, p) for f in sorted(p.rglob("*")) if f.suffix.lower() == ".arc" and f.is_file())
+        elif p.is_file() and p.suffix.lower() in COMPRESSED:
+            raise RiftError(f"{p} is a compressed file: extract it first (import reads the .arc archives inside, "
+                            "or a folder of them)")
         else:
             raise RiftError(f"{p} is not an archive or a folder of archives")
+    if not out:
+        raise RiftError("no .arc archives in " + ", ".join(str(p) for p in paths) + ": import reads .arc files, "
+                        "or a folder that holds them (extract a zip first)")
     return out
 
 

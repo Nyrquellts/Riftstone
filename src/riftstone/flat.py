@@ -207,16 +207,22 @@ SCHEMAS: dict[str, tuple[int, list]] = {
                                                               S("mParam09", "i32")])]),
                                     S("mSheetName", "string")]),
                       S("mUid", "i32")]),
-    # rRegionStatus (".rst"): per-creature status regions (grab/climb candidates).  Magic is a
-    # date-version 0x20110930, then a list of regions, each carrying a list of 56-byte sub-records.
-    # Layout reversed from PS3 rRegionStatus::load (0x00B07918, named); field names are the
-    # sub-record's engine struct offsets (disk order differs from struct order), meanings not decoded.
-    "rst": (0x20110930, [L("mpRegion", [S("mUnkA", "u32"), S("mUnkB", "u32"),
-                                        L("mpSub", [S("at04", "u32"), S("at08", "u32"),
-                                                    S("at0c", "f32"), S("at10", "f32"), S("at14", "f32"),
-                                                    S("at18", "f32"), S("at1c", "f32"), S("at20", "f32"),
-                                                    S("at24", "f32"), S("at2c", "u32"), S("at30", "u32"),
-                                                    S("at28", "u32"), S("at58", "f32"), S("at5c", "f32")])])]),
+    # rRegionStatus (".rst", charparam\em\em<id>[_xx].rst): a creature's health.  Magic is a date-version
+    # 0x20110930, then mRegionStatusList: each cRegionStatus is a mNo, a mType (which set of regions an enemy
+    # uses: initRegionStatus 0x00770910 takes the first whose mType is asked for, nearly always 0) and its
+    # mElementList of cRegionStatusElement (56 bytes on disk): mHPMax is the creature's base health, the
+    # first element's is what getHp reads (docs/enemy-hp.md).  The names are DDDA.exe's own (the function at
+    # 0x00CDA9A0 that registers the element's properties), in disk order; before 2026-10-02 this table called
+    # them mpRegion, mUnkA, at0c and so on (LEGACY_KEYS maps those, so a rst/1 file still loads).
+    "rst": (0x20110930, [L("mRegionStatusList", [S("mNo", "u32"), S("mType", "u32"),
+                                                 L("mElementList", [S("mNo", "u32"), S("mId", "u32"),
+                                                                    S("mHPMax", "f32"), S("mDPMax", "f32"),
+                                                                    S("mDPSpeed", "f32"), S("mBPMax", "f32"),
+                                                                    S("mBPSpeed", "f32"), S("mDamageAdj", "f32"),
+                                                                    S("mHitStopAdj", "f32"), S("mSurface", "u32"),
+                                                                    S("mSeSurface", "u32"), S("mAttr", "u32"),
+                                                                    S("mDPResetTimerMax", "f32"),
+                                                                    S("mBPResetTimerMax", "f32")])])]),
     # rStagePlaceName (".spn"): per-stage table of named sub-areas.  Magic "spn\0", a constant
     # (loader requires 0x30), then a list of 30-byte region records.  Reversed from PS3
     # rStagePlaceName::load (0x00B20DA4).  mPlaceNameId indexes id/DDN/message/common/map_placelist:
@@ -403,6 +409,22 @@ SCHEMAS: dict[str, tuple[int, list]] = {
 # own magic. The parsed Flat then carries the revision's key, so its YAML tag and rebuild follow it.
 REVISIONS: dict[str, tuple[str, ...]] = {"ajp": ("ajp-ddo",)}
 
+# A format whose field names changed: the YAML tag's version moves on (`rst/2`) and the older version's key
+# names still load, renamed as the file is read (the old name -> today's, whichever block it sits in).
+YAML_VERSION: dict[str, str] = {"rst": "2"}
+LEGACY_KEYS: dict[str, dict[str, str]] = {
+    "rst": {"mpRegion": "mRegionStatusList", "mUnkA": "mNo", "mUnkB": "mType", "mpSub": "mElementList",
+            "at04": "mNo", "at08": "mId", "at0c": "mHPMax", "at10": "mDPMax", "at14": "mDPSpeed",
+            "at18": "mBPMax", "at1c": "mBPSpeed", "at20": "mDamageAdj", "at24": "mHitStopAdj",
+            "at2c": "mSurface", "at30": "mSeSurface", "at28": "mAttr", "at58": "mDPResetTimerMax",
+            "at5c": "mBPResetTimerMax"},
+}
+
+# A line under the YAML's own header for a format where the first question is "which number is it?".
+YAML_NOTES: dict[str, str] = {
+    "rst": "mHPMax is a creature's base health; the game's getHp reads the first element of the mType 0 region.",
+}
+
 
 # -- engine ----------------------------------------------------------------------------------
 def _read(buf, off, elem):
@@ -586,7 +608,9 @@ def to_yaml(f: Flat, name: str | None = None) -> str:
     head = [f"Riftstone {f.ext} parameter file" + (f" -- {name}" if name else ""),
             "A flat MT Framework table. Edit the numbers; keep the structure. Arrays grow and shrink;",
             "fixed-size groups must keep their length. Rebuilds byte-for-byte when untouched."]
-    items = [(Scalar("riftstone"), Scalar(f.ext + "/1"))]
+    if f.ext in YAML_NOTES:
+        head.append(YAML_NOTES[f.ext])
+    items = [(Scalar("riftstone"), Scalar(f"{f.ext}/{YAML_VERSION.get(f.ext, '1')}"))]
     if name:
         items.append((Scalar("resource"), Scalar(name, "double")))
     for fld in fields:
@@ -684,10 +708,25 @@ def from_yaml(text: str, source: str | None = None) -> Flat:
     tag = doc.get("riftstone") if isinstance(doc, Map) else None
     if not isinstance(tag, Scalar) or "/" not in tag.text:
         raise ParamError("not a Riftstone flat parameter file (missing 'riftstone:' tag)", 1, 1, source)
-    ext = tag.text.split("/")[0]
+    ext, _, version = tag.text.partition("/")
     if ext not in SCHEMAS:
         raise ParamError(f"unknown flat format {ext!r}", 1, 1, source)
+    if version == "1" and ext in LEGACY_KEYS:
+        _rename_keys(doc, LEGACY_KEYS[ext])
     return Flat(ext, SCHEMAS[ext][0], _from_block(SCHEMAS[ext][1], doc, source))
+
+
+def _rename_keys(node, names: dict[str, str]):
+    """Change the keys of a parsed YAML tree from a format's older names to today's, in place."""
+    from .yamlish import Map, Seq
+
+    if isinstance(node, Map):
+        for k, v in node.items:
+            k.text = names.get(k.text, k.text)
+            _rename_keys(v, names)
+    elif isinstance(node, Seq):
+        for it in node.items:
+            _rename_keys(it, names)
 
 
 def yaml_to_bytes(text: str, source: str | None = None) -> bytes:

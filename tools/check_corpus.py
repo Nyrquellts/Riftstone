@@ -47,7 +47,8 @@ sbc   every collision mesh: its sections add up to the file under the loader's l
       part keeps its vertices inside its box, a move by a Gransys cell corner changes only the positional
       floats (boxes, tree lanes, vertices), moving back restores every one of them within float32
       rounding (half a float32 step of the moved value plus half a step of the value moved back), and
-      moving twice gives the same bytes
+      moving twice gives the same bytes; every triangle belongs to one part and names three of that part's
+      vertices (sbc.triangles), counted with how many stored normals are their corners' own
 fsm   every AI state machine: the readable view and fsmcheck (the game's own transition rules, read in
       the executables and run in native/fsm_exec) on every machine; counts what the checks find, and
       each finding names a state and link the file has
@@ -595,10 +596,20 @@ def check_sbc(game, report):
     from riftstone import sbc
 
     t0 = time.time()
-    exact = failed = nodes = floats = vertices = restored_files = changed = 0
+    exact = failed = nodes = floats = vertices = restored_files = changed = triangles = own_normal = flat = 0
     worst = 0.0
     failures = []
     corner = (-150000.0, 0.0, -30000.0)                       # cell 47m35n's
+
+    def facing(a, b, c, n):
+        """None for a triangle with no area, else whether its stored normal is its corners' own (either side)."""
+        u, v = (b[0] - a[0], b[1] - a[1], b[2] - a[2]), (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+        cr = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+        size = math.sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2])
+        if not size > 1e-6:
+            return None
+        return abs(cr[0] * n[0] + cr[1] * n[1] + cr[2] * n[2]) / size >= 0.99
+
     back_by = tuple(-v for v in corner)
     for r in corpus.resources(game, [typemap.BY_EXT["sbc"]]):
         try:
@@ -627,6 +638,13 @@ def check_sbc(game, report):
                 raise AssertionError("moving back changed a byte that is not a position")
             if sbc.bounds_problems(w):
                 raise AssertionError("the moved file breaks its own boxes")
+            tris = sbc.triangles(r.data)                      # refuses a vertex number past its part's
+            if len(tris) != s.triangles:
+                raise AssertionError(f"the parts hold {len(tris)} of the file's {s.triangles} triangles")
+            faces = [facing(*tri) for tri in tris]
+            triangles += len(tris)
+            own_normal += faces.count(True)
+            flat += faces.count(None)
             exact += 1
             nodes += sum(t.nodes for t in s.trees)
             floats += len(moved)
@@ -639,13 +657,16 @@ def check_sbc(game, report):
             if len(failures) < 40:
                 failures.append({"resource": r.label, "why": f"{type(e).__name__}: {e}"})
     report["sbc"] = {"distinct": exact + failed, "layout_exact": exact, "tree_nodes": nodes, "vertices": vertices,
-                     "moved_floats": floats, "moved_back_floats_changed": changed,
+                     "moved_floats": floats, "moved_back_floats_changed": changed, "triangles": triangles,
+                     "triangles_whose_normal_is_their_corners": own_normal, "triangles_without_area": flat,
                      "moved_back_largest_change_cm": worst, "moved_back_files_byte_exact": restored_files,
                      "failed": failed, "failures": failures, "seconds": round(time.time() - t0, 1),
                      "claim": f"every collision mesh follows the loader's layout to its last byte; a move by a "
                               f"cell corner changes only boxes, tree lanes and vertices; moving back restores every "
                               f"value within float32 rounding (largest change {worst:g} cm; {restored_files} of "
-                              f"{exact} files byte for byte), and moving twice gives the same bytes"}
+                              f"{exact} files byte for byte), and moving twice gives the same bytes; every one of "
+                              f"{triangles:,} triangles names three vertices of its own part, and the stored normal "
+                              f"is the corners' own for {own_normal:,} ({flat:,} have no area)"}
     return _absent(game, "sbc", exact, failed, "sbc", report)
 
 

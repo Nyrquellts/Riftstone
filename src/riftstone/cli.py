@@ -50,10 +50,15 @@ The world, mapped
   riftstone world enemy goblin         where an enemy spawns
   riftstone encounter 424 goblin --count 100 --at group:5 --mod "My Mod"
                                        100 goblins as a new group (the game's own horde setting)
+  riftstone multiply 2                 twice as many enemies everywhere (3: three times ...)
 
 Enemies and objects
   riftstone spawns list scr/st100/etc/st100_45m55n_e143.lot
   riftstone spawns copy scr/st100/etc/st100_45m55n_e143.lot 0 --at 58600,42716,-45360 --mod "My Mod"
+  riftstone arrange st100_45m55n_e143.lot --shape camp
+                                       enemies pasted in one spot set out on the ground, facing a way
+  riftstone export "My Mod" --out MyModFiles
+                                       the mod as files to copy over the game's own (its nativePC folder)
 
 Monsters between Dark Arisen and Online
   riftstone monster list               every enemy family, its counterpart in the other game, the verdict
@@ -212,7 +217,7 @@ def _resource_type_from_filename(path: Path) -> int | None:
 
 
 # commands that make the mod they are given when it is not there yet, and the game each is for
-_MAKES_MOD = {"import": None, "ddo": "ddo", "playtest": "ddda"}
+_MAKES_MOD = {"import": None, "ddo": "ddo", "playtest": "ddda", "multiply": "ddda"}
 
 
 def _mod_names(args) -> None:
@@ -619,7 +624,8 @@ def cmd_import(args) -> int:
     root = Path(args.mod)
     game = _game(args)
     paths = [Path(x) for x in args.paths]
-    files = importer._inputs(paths)             # a missing input is refused before a new mod is made
+    # a missing or compressed input, or none that holds an archive, is refused before a new mod is made
+    files = importer._inputs(paths)
     if (root / MOD_FILE).is_file():
         m = Mod.load(root)
         if m.game != game.kind:
@@ -953,6 +959,11 @@ def _apply(game: Game, roots: list[Path], dry_run: bool) -> int:
               f"({', '.join(rep.loose_written[:2])}{' ...' if len(rep.loose_written) > 2 else ''})")
     if rep.loose_removed:
         ui.ok(f"{'Would remove' if dry_run else 'Removed'} {len(rep.loose_removed)} loose file(s) no mod has any more")
+    if rep.stage_enemies:
+        from . import stage_enemies
+
+        for level, line in stage_enemies.describe(rep.stage_enemies):
+            (ui.ok if level == "ok" else ui.warn)(line)
     if not (rep.written or rep.restored or rep.server_written or rep.server_restored or rep.loose_written
             or rep.loose_removed):
         ui.ok("Nothing to do: the game already matches your mods")
@@ -970,7 +981,6 @@ def _enabled(game: Game) -> list[Path]:
 def cmd_compat(args) -> int:
     from . import compat_pack
     from .game import find_game
-    from .index import Index
 
     if args.compat_action == "list":
         for s in compat_pack.ALCHEMIST:
@@ -986,7 +996,7 @@ def cmd_compat(args) -> int:
               "both games: for this computer only, never shared (docs/compat-layer.md)")
     ui.step(f"Converting {', '.join(skills)} from {ddo.title} for {ddda.title}"
             + ("" if args.effects else " (without effects)"))
-    pack = compat_pack.build(compat_pack.Source(ddo, Index(ddo)), compat_pack.Source(ddda, Index(ddda)), skills,
+    pack = compat_pack.build(compat_pack.Source(ddo, _index(ddo)), compat_pack.Source(ddda, _index(ddda)), skills,
                              effects=args.effects)
     from .studio import default_workspace
 
@@ -2665,6 +2675,368 @@ def cmd_encounter(args) -> int:
         idx.close()
 
 
+def cmd_multiply(args) -> int:
+    """N times as many enemies wherever the game places them: copies of its own placements, written into a mod."""
+    from . import encounter, multiply
+    from . import mod as modlib
+
+    game = _game(args)
+    if game.is_ddo:
+        raise RiftError("riftstone multiply is for Dragon's Dogma: Dark Arisen (Online's enemies come from the "
+                        "server's spawn table: riftstone ddo, riftstone encounter --game ddo)")
+    idx = _index(game)
+    try:
+        w = _world(game, idx)
+        stages = [encounter.parse_stage(s) for s in args.stage] if args.stage else None
+        enemies = [w.find_enemy(e) for e in args.enemy] if args.enemy else None
+        bar = []
+
+        def progress(stage: int, done: int, of: int) -> None:
+            if not bar:
+                bar.append(ui.Progress(of, "placing the copies"))
+            bar[0].advance(1, f"stage {stage}")
+
+        p = multiply.plan(game, idx, w, args.factor, stages=stages, enemies=enemies, bosses=args.bosses,
+                          spread=args.spread, plain=args.plain, champions=not args.no_champions, progress=progress)
+        if bar:
+            bar[0].done()
+        first, *rest = p.summary()
+        ui.ok(first)
+        for line in rest:
+            ui.info(line.strip())
+        if p.copies:
+            arcs, size = multiply.footprint(game, idx, p)
+            ui.info(f"installed, it is {arcs:,} of the game's archives rebuilt in the loader's overlay, about "
+                    f"{size / 1e9:.1f} GB on disk (--stage keeps it to the stages you name)")
+        if args.dry_run:
+            ui.info("dry run: nothing written")
+            return 0
+        if not p.copies:
+            return 1
+        root = Path(args.mod) if args.mod else modlib.locate(multiply.MOD_NAME, modlib.mods_folders("ddda"),
+                                                           _mods_folder_for("ddda"))
+        if (root / modlib.MOD_FILE).is_file():
+            m = modlib.Mod.load(root)
+            if m.game != "ddda":
+                raise RiftError(f"{m.name} is a {KINDS[m.game]['title']} mod; the multiplier needs a Dark Arisen one")
+        else:
+            m = modlib.Mod.create(root, None, "", "ddda")
+            ui.ok(f"Created {game.title} mod '{m.name}' at {m.root}")
+        files = multiply.write(p, m.root)
+        ui.ok(f"{len(files):,} layouts and group lists written into {m.root.name}. riftstone install \"{m.root.name}\" "
+              "puts it into the game; run this again with another number to change it.")
+        ui.info("the game holds 10 enemies at once; the enemy_cap feature raises that to 30 (up to 64): "
+                "riftstone plugins on enemy_cap")
+        return 0
+    finally:
+        idx.close()
+
+
+def _refuse_in_game(path: Path, what: str) -> None:
+    g = _inside_game(path.resolve())
+    if g is not None:
+        raise RiftError(f"{path} is inside the game folder ({g.root}). Riftstone does not change the game's files "
+                        f"by hand: copy {what} out, run this on the copy and copy it back yourself, or put the "
+                        "layout in a mod ('riftstone install' keeps a verified original to restore)")
+
+
+def _keep_original(path: Path) -> None:
+    """The first original of a file a command rewrites in place, kept beside it as <name>.bak."""
+    bak = path.with_name(path.name + ".bak")
+    if path.is_file() and not bak.exists():
+        arcfolder.write_file(bak, path.read_bytes())
+        ui.info(f"the original {path.name} is kept as {bak.name}")
+
+
+def _layout_name_arg(text: str) -> tuple[bytes, int]:
+    """A layout as the command line names it: scr/st424/etc/st424_00m00n_e09(.lot, .lot.yaml), or just
+    st424_00m00n_e09."""
+    from . import arrange
+
+    rel = text.replace("\\", "/")
+    if rel.lower().endswith(".yaml"):
+        rel = rel[:-5]
+    if not rel.lower().endswith(".lot"):
+        rel += ".lot"
+    s = arrange.stage_of(rel)
+    if "/" not in rel and s is not None:
+        rel = f"scr/st{s:03d}/etc/{rel}"
+    name, tid = fsmap.decode_path(rel)
+    if tid != typemap.BY_EXT["lot"]:
+        raise RiftError(f"{text} is not a layout (.lot)")
+    return name, tid
+
+
+def _lot_file(f: Path) -> tuple[bytes, bool]:
+    """(a .lot or .lot.yaml file's layout bytes, whether it is YAML)."""
+    from . import lot
+
+    raw = f.read_bytes()
+    if f.name.lower().endswith(".yaml"):
+        return lot.yaml_to_bytes(params.decode_text(raw, str(f)), str(f)), True
+    return raw, False
+
+
+def _print_arranged(r, dry: bool, many: bool = False) -> None:
+    if many and not r.moved:
+        return                  # of several layouts, one line at the end counts those with nothing to set out
+    if r.moved:
+        ui.ok(f"{r.label}: {r.moved} placement{'s' if r.moved != 1 else ''} "
+              + ("would be " if dry else "") + f"set out in {len(r.stacks)} stack{'s' if len(r.stacks) != 1 else ''}")
+        for st in r.stacks:
+            ui.info(st.summary())
+            for n in st.notes:
+                ui.warn(n)
+    for n in r.notes:
+        ui.info(n)
+
+
+def cmd_arrange(args) -> int:
+    """Enemies pasted in one spot set out on the ground in a shape (src/riftstone/arrange.py)."""
+    from . import arrange, lot, modfiles
+    from .mod import Mod
+
+    game = _game(args)
+    if game.is_ddo:
+        raise RiftError("riftstone arrange sets out Dark Arisen's layouts; Dragon's Dogma Online's enemies stand "
+                        "where the server's spawn table puts them ('riftstone ddo')")
+    LOT = typemap.BY_EXT["lot"]
+    records = arrange.parse_records(args.records) if args.records else None
+    toward = arrange.parse_point(args.toward) if args.toward else None
+    if toward is not None and args.heading is not None:
+        raise RiftError("give --toward or --heading, not both")
+    stage = None
+    if args.stage is not None:
+        from . import encounter
+
+        stage = encounter.parse_stage(args.stage)
+    opts = {"shape": args.shape, "spread": args.spread, "heading": args.heading, "toward": toward,
+            "records": records}
+    dry = args.dry_run
+    idx = _index(game)
+    try:
+        root = Mod.load(Path(args.mod)).root if args.mod else None
+        ar = arrange.Arranger(game, idx, _world(game, idx), root)
+        target = Path(args.target) if args.target else None
+        done = []
+        seen = 0
+        if target is not None and target.exists():
+            if target.is_file() and target.name.lower().endswith(".arc"):
+                a = arc.Archive.read(target)
+                entries = [e for e in a.entries if e.type_id == LOT]
+                if records is not None and len(entries) != 1:
+                    raise RiftError(f"--records names records of one layout; {target.name} holds {len(entries)}")
+                changed = []
+                for e in entries:
+                    name = e.name.decode("latin-1")
+                    ln = lot.parse_name(name)
+                    r = ar.layout(e.data(), name, stage if stage is not None else ln.stage if ln else None, **opts)
+                    _print_arranged(r, dry, len(entries) > 1)
+                    seen += 1
+                    if r.moved:
+                        changed.append((e, r.data))
+                        done.append(r)
+                if changed and not dry:
+                    _refuse_in_game(target, "the archive")
+                    expected = {e.key: arc.sha256(e.data()) for e in a.entries}
+                    for e, data in changed:
+                        a.put(e.name, e.type_id, data)
+                        expected[e.key] = arc.sha256(data)
+                    built = a.build()
+                    arc.verify_build(built, expected)
+                    _keep_original(target)
+                    arcfolder.write_file(target, built)
+                    ui.info(f"-> {target} (every resource verified)")
+            else:
+                files = [target] if target.is_file() else sorted(
+                    f for f in target.rglob("*") if f.is_file() and f.name.lower().endswith((".lot", ".lot.yaml")))
+                if not files:
+                    raise RiftError(f"{target} holds no layout (.lot or .lot.yaml)")
+                if records is not None and len(files) != 1:
+                    raise RiftError(f"--records names records of one layout; {target} holds {len(files)}")
+                for f in files:
+                    data, is_yaml = _lot_file(f)
+                    r = ar.layout(data, f.name, stage, **opts)
+                    _print_arranged(r, dry, len(files) > 1)
+                    seen += 1
+                    if r.moved and not dry:
+                        _refuse_in_game(f, "the file")
+                        _keep_original(f)
+                        if is_yaml:
+                            s = r.stage
+                            stem = f.name[:-len(".lot.yaml")] if f.name.lower().endswith(".lot.yaml") else f.stem
+                            nm = f"scr\\st{s:03d}\\etc\\{stem}" if s is not None and lot.parse_name(
+                                f"scr\\st{s:03d}\\etc\\{stem}") else None
+                            arcfolder.write_file(f, lot.to_yaml(lot.parse(r.data), nm).encode("utf-8"))
+                        else:
+                            arcfolder.write_file(f, r.data)
+                        ui.info(f"-> {f}")
+                    if r.moved:
+                        done.append(r)
+        else:
+            if target is not None:
+                if arrange.stage_of(str(args.target)) is None or target.suffix.lower() == ".arc":
+                    raise RiftError(f"{target} does not exist (a layout is named like st424_00m00n_e09)")
+                names = [_layout_name_arg(str(args.target))]
+            elif root is not None:
+                names = [(n.encode("latin-1"), LOT) for n, _ in modfiles.resources(root, LOT)]
+                if not names:
+                    raise RiftError(f"{root.name} holds no layout; name one (riftstone arrange st424_00m00n_e09 "
+                                    "--mod ...) or give a file")
+            else:
+                raise RiftError("say what to arrange: a layout and its mod (--mod), a .lot or .lot.yaml file, a "
+                                "folder of them, or an archive")
+            if root is None and not dry:
+                raise RiftError("say which mod gets the change (--mod), or add --dry-run to see it on the game's "
+                                "own copy")
+            if records is not None and len(names) != 1:
+                raise RiftError(f"--records names records of one layout; {root.name} holds {len(names)}")
+            for name, tid in names:
+                data, out = modfiles.load(game, idx, root, name, tid)
+                r = ar.layout(data, name.decode("latin-1"), stage, **opts)
+                _print_arranged(r, dry, len(names) > 1)
+                seen += 1
+                if r.moved:
+                    done.append(r)
+                    if not dry:
+                        modfiles.save(out, r.data, name, tid)
+                        ui.info(out.relative_to(root).as_posix())
+        moved = sum(r.moved for r in done)
+        if seen > 1 and seen > len(done):
+            ui.info(f"{seen - len(done)} of the {seen} layouts hold nothing to set out (no stack, or only the "
+                    "game's own): left as they are")
+        if not moved:
+            ui.info("nothing set out")
+            return 1
+        ui.ok(f"{moved} placement{'s' if moved != 1 else ''} in {len(done)} layout{'s' if len(done) != 1 else ''} "
+              + ("would be set out (dry run: nothing written)" if dry else "set out")
+              + "; in game UNKNOWN until played")
+        return 0
+    finally:
+        idx.close()
+
+
+EXPORT_README = "READ ME - Riftstone export.txt"
+EXPORT_MANIFEST = "riftstone-export.json"
+EXPORT_LINES = "stage_enemies lines.ini"
+
+
+def cmd_export(args) -> int:
+    """Mods as files to copy over the game's own: nativePC\\ archives built from this PC's game, loose files, the
+    stage_enemies lines, a manifest and a READ ME (no install, the game untouched)."""
+    import hashlib
+    import json
+
+    from . import legal, stage_enemies
+    from . import mod as modlib
+
+    game = _game(args)
+    if game.is_ddo:
+        raise RiftError("riftstone export makes Dark Arisen files to copy over the game's; an Online mod already "
+                        "installs by replacing the client's archives (riftstone install keeps verified backups)")
+    out = Path(args.out)
+    _refuse_in_game(out, "nothing")
+    if out.exists() and any(out.iterdir()) and not args.force:
+        raise RiftError(f"{out} already holds files; pick an empty folder, or add --force to write over what is "
+                        "there")
+    idx = _index(game)
+    try:
+        mods = [modlib.Mod.load(Path(m)) for m in args.mods]
+        if any(m.game != "ddda" for m in mods):
+            raise RiftError("riftstone export takes Dark Arisen mods")
+        p = modlib.plan(game, idx, mods)
+        modlib.check_plan(p)
+        _print_merges(p)
+        _print_plan_conflicts(p.conflicts)
+        rows: list[dict] = []
+        bar = ui.Progress(len(p.archives), "building")
+        for a, changes in sorted(p.archives.items()):
+            b = modlib.build_archive(game, a, changes)
+            rel = "nativePC/" + a.replace("\\", "/") + ".arc"
+            arcfolder.write_file(out / rel, b.data)
+            orig = game.vanilla_arc(a)
+            rows.append({"path": rel, "bytes": len(b.data), "sha256": hashlib.sha256(b.data).hexdigest(),
+                         "replaces": hashlib.sha256(orig.read_bytes()).hexdigest() if orig.is_file() else None,
+                         "changed": len(b.replaced), "added": len(b.added)})
+            bar.advance(1, a)
+        bar.done(f"Built {len(p.archives)} archive{'s' if len(p.archives) != 1 else ''}, all verified")
+        loose: dict[str, tuple[str, bytes]] = {}
+        for m in mods:
+            for rel, data in modlib.collect_loose(m).items():
+                if rel in loose and loose[rel][1] != data:
+                    ui.warn(f"{rel}: {loose[rel][0]} and {m.name} both have it; {m.name}'s copy is written")
+                loose[rel] = (m.name, data)
+        for rel, (_, data) in sorted(loose.items()):
+            dest = ("riftstone/overlay/" if rel.lower().startswith("compat/") else "nativePC/") + rel
+            arcfolder.write_file(out / dest, data)
+            rows.append({"path": dest, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                         "replaces": None, "loose": True})
+        enemy_rows = stage_enemies.for_plan(game, idx, p)
+        lines = stage_enemies.block_lines(enemy_rows)
+        if lines:
+            arcfolder.write_file(out / EXPORT_LINES,
+                                 ("[" + stage_enemies.SECTION + "]\r\n" + "\r\n".join(lines) + "\r\n").encode("utf-8"))
+        manifest = {"schema": "riftstone-export/1", "game": game.kind, "mods": [m.name for m in mods],
+                    "files": rows, "stage_enemies": enemy_rows}
+        arcfolder.write_file(out / EXPORT_MANIFEST, (json.dumps(manifest, indent=1, ensure_ascii=False) + "\n")
+                             .encode("utf-8"))
+        arcfolder.write_file(out / EXPORT_README, _export_readme(mods, rows, enemy_rows, legal).encode("utf-8"))
+        n_arc = sum(1 for r in rows if not r.get("loose"))
+        ui.ok(f"Exported {', '.join(m.name for m in mods)}: {n_arc} archive{'s' if n_arc != 1 else ''}"
+              + (f", {len(loose)} loose file{'s' if len(loose) != 1 else ''}" if loose else "")
+              + f" ({ui.human(sum(r['bytes'] for r in rows))}); the game is untouched")
+        if lines:
+            ui.warn(f"these mods place enemies in stages that never load them: \"{EXPORT_LINES}\" holds the "
+                    "stage_enemies lines they need (Riftstone's loader and its stage_enemies feature)")
+        ui.info(f"-> {out}  (\"{EXPORT_README}\" says how to use them)")
+        return 0
+    finally:
+        idx.close()
+
+
+def _export_readme(mods, rows, enemy_rows, legal) -> str:
+    n_arc = sum(1 for r in rows if not r.get("loose"))
+    text = [
+        "Riftstone export",
+        "================",
+        "",
+        "Mods: " + ", ".join(m.name for m in mods),
+        "",
+        "What this is",
+        "------------",
+        f"{n_arc} of Dark Arisen's archives with these mods built in, and the mods' loose files, laid out the way",
+        "the game folder holds them. Copy the nativePC folder over the game's nativePC folder (the one next to",
+        "DDDA.exe) to play them the overwrite way; no loader is needed for the archives.",
+        "",
+        "Before you copy: keep the game's own copies of the files listed below (or use Steam's Verify integrity",
+        "of game files to get them back). 'riftstone install' does the same without overwriting anything, keeps",
+        "verified originals and merges mods that change the same layouts, so other mods keep working.",
+        "",
+        "The archives were built from this PC's own copy of the game: they are the game's files, for your own",
+        "game only. Do not share them. To share a mod, use 'riftstone package', which carries no game data.",
+        "",
+    ]
+    if enemy_rows:
+        text += [
+            "Enemies new to a stage",
+            "----------------------",
+            "These mods place enemies in stages that never load them. Dark Arisen loads enemy models per stage, so",
+            "without Riftstone's loader and its stage_enemies feature those enemies never appear (no crash). With",
+            f"the loader installed, add the lines of \"{EXPORT_LINES}\" to riftstone\\plugins\\stage_enemies.ini",
+            "under [stage_enemies] and turn the feature on (riftstone plugins on stage_enemies).",
+            "",
+        ]
+        for r in enemy_rows:
+            text.append(f"  stage {r['stage']}: {', '.join(r['enemies'])}")
+        text.append("")
+    text += ["Files (" + EXPORT_MANIFEST + " has each one's SHA-256 and the game file it replaces)",
+             "-----"]
+    for r in rows:
+        text.append(f"  {r['path']}" + ("  (new loose file)" if r.get("loose") else ""))
+    text += ["", legal.DISCLAIMER, ""]
+    return "\r\n".join(text)
+
+
 def _report_encounter(enc) -> None:
     ui.ok(f"Stage {enc.stage}: {enc.total} x {enc.enemy} {enc.enemy_name} as new enemy group {enc.group}, "
           f"{enc.points} spawn point(s) around [{enc.at[0]:.0f}, {enc.at[1]:.0f}, {enc.at[2]:.0f}]")
@@ -3784,6 +4156,8 @@ def cmd_saves(args) -> int:
 
     if args.action == "knowledge":
         return _saves_knowledge(args, game, found, plugin_root)
+    if args.action == "arisen":
+        return _saves_arisen(args, game, found, plugin_root)
 
     listed = saves.backups(plugin_root, account=args.account)
 
@@ -3857,6 +4231,82 @@ def cmd_saves(args) -> int:
     ui.ok(f"Restored {b.name} ({b.kind}) to {target.parent}")
     ui.info(f"what it replaced is kept as {kept}" if kept else "the save already held these bytes; nothing changed")
     ui.info("If Steam reports a cloud conflict when the game starts, keep the files on this PC.")
+    return 0
+
+
+def _saves_arisen(args, game, found, plugin_root) -> int:
+    """riftstone saves arisen [--level N --rank N --points N --hp N ... --skills all | --max] [--yes]: the Arisen's
+    level, vocation rank, discipline, stats and skills, in both copies of the player's data the save holds."""
+    from . import install, saves
+    if not found:
+        raise RiftError("no DDDA.sav found under Steam's userdata; pass --save <file>")
+    if len(found) > 1:
+        raise RiftError(f"saves of several accounts ({', '.join(a for a, _ in found)}); choose one with --account")
+    account, save = found[0]
+    stats: dict[str, float] = {}
+    if args.max:   # what the showcase save of 2026-10-06 got; the stats are round numbers, not the game's caps
+        args.level, args.rank, args.points, args.skills = saves.LEVEL_MAX, saves.RANK_MAX, 999999, "all"
+        stats.update(mHp=5500.0, mHpMax=5500.0, mHpMaxWhite=5500.0, mStamina=4500.0, mStaminaLv=3860.0,
+                     mBasicAttack=999.0, mBasicDefend=999.0, mBasicMgcAttack=999.0, mBasicMgcDefend=999.0)
+    if args.hp is not None:
+        stats.update(mHp=args.hp, mHpMax=args.hp, mHpMaxWhite=args.hp)
+    for name, value in (("mStamina", args.stamina), ("mBasicAttack", args.attack), ("mBasicDefend", args.defence),
+                        ("mBasicMgcAttack", args.magick), ("mBasicMgcDefend", args.magick_defence)):
+        if value is not None:
+            stats[name] = value
+    for item in args.stat or []:
+        name, _, value = item.partition("=")
+        if name not in saves.STATS or not value:
+            raise RiftError(f"--stat {item}: NAME=VALUE with NAME one of " + ", ".join(saves.STATS))
+        try:
+            stats[name] = float(value)
+        except ValueError:
+            raise RiftError(f"--stat {item}: {value!r} is not a number") from None
+    edit = saves.ArisenEdit(level=args.level, rank=args.rank, points=args.points, stats=stats,
+                            skills=args.skills == "all", vocation=args.vocation,
+                            weapons=tuple(w.upper() for w in args.weapons or ()))
+    tables = None
+    if game is not None and not game.is_ddo:
+        try:
+            tables = saves.skill_tables(game.exe)
+        except RiftError as e:
+            if edit.skills:
+                raise
+            ui.warn(f"{e}; the skills learned are not counted")
+    elif edit.skills:
+        raise RiftError("the skill tables are read from DDDA.exe, and Dark Arisen was not found "
+                        "(pass --game \"C:\\path\\to\\DDDA\")")
+    if edit.empty:
+        seen = saves.arisen(save.read_bytes(), tables)
+        if args.json:
+            print(json.dumps({"account": account, "save": str(save), "copies": seen}, indent=1))
+            return 0
+        for copy, r in seen.items():
+            st = r["stats"]
+            ui.ok(f"{copy}: level {r['level']}, {r['vocation']} ({r['job']}) rank {r['rank']}, "
+                  f"{max(r['points'])} discipline")
+            ui.info(f"  HP {st['mHpMax']:.0f} (now {st['mHp']:.0f}), stamina {st['mStamina']:.0f}, "
+                    f"attack {st['mBasicAttack']:.0f}, defence {st['mBasicDefend']:.0f}, "
+                    f"magick {st['mBasicMgcAttack']:.0f}, magick defence {st['mBasicMgcDefend']:.0f}")
+            for w, d in r["skills"].items():
+                palette = " ".join(str(n) if n >= 0 else "-" for n in d["equipped"])
+                learned = f", {d['learned']} of {d['of']} learned" if "learned" in d else ""
+                ui.info(f"  {saves.WEAPON_NAMES[w]}: palette {palette}{learned}")
+        ui.info("change it with:  riftstone saves arisen --level 200 --rank 9 --skills all --yes   "
+                "(or --max; close the game first)")
+        return 0
+    if not args.yes:
+        ui.warn(f"this changes the Arisen's record in {save}, in both copies of the player's data the save holds. "
+                "The save as it is now is kept as a copy first. Run again with --yes to do it.")
+        return 1
+    running = install.game_running(game) if game is not None else False
+    kept, n = saves.set_arisen_file(save, plugin_root, account, edit, tables, game_running=lambda: running)
+    if not n:
+        ui.ok("nothing to change: the record already holds these values")
+        return 0
+    ui.ok(f"changed {n} values of the Arisen in {save}")
+    ui.info(f"the save as it was is kept as {kept} ('riftstone saves restore' puts it back)")
+    ui.info("Not yet seen in game. If Steam reports a cloud conflict when the game starts, keep the files on this PC.")
     return 0
 
 
@@ -4012,6 +4462,9 @@ def _port(text: str) -> int:
 # A value may start with a minus: positions (--at -100,-350,-8800; half of Gransys has negative x), which
 # argparse takes for an unknown option unless it is a plain number like -5.
 _NEGATIVE = re.compile(r"^-\.?\d")
+
+
+_MULTIPLY_MOD = "Spawn Multiplier"            # multiply.MOD_NAME (the parser is built before that module loads)
 
 
 def _takes_negatives(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -4240,6 +4693,46 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the new group loads whenever the stage does: clear the copied group's lot-flag condition "
                         "(every group of stages 420-447 loads only under one)")
     p.add_argument("--dry-run", action="store_true", help="show the plan, write nothing")
+    p = add("multiply", cmd_multiply, "N times as many enemies everywhere: riftstone multiply 2 doubles every spawn "
+                                      "(a mod of the game's own layouts with more placements in them)")
+    p.add_argument("factor", type=int, help="how many times as many enemies, 2 to 10")
+    p.add_argument("--mod", help=f'the mod that gets it (default: "{_MULTIPLY_MOD}", made when it is not there; '
+                                 "running again replaces what the last run wrote)")
+    p.add_argument("--stage", action="extend", nargs="+", metavar="STAGE",
+                   help="only these stages, by number: --stage 100 424 (st424 works too)")
+    p.add_argument("--enemy", action="extend", nargs="+", metavar="ENEMY",
+                   help='only these enemies, by name or id: --enemy goblin em0200 "dire wolf"')
+    p.add_argument("--bosses", action="store_true",
+                   help="big monsters too (cyclopes, chimeras, drakes ...); never the Dragon, the Ur-Dragon or Daimon")
+    p.add_argument("--spread", type=float, default=150.0,
+                   help="centimetres between a copy and its original (default 150)")
+    p.add_argument("--plain", action="store_true",
+                   help="exact copies: no change of facing or size, no champions")
+    p.add_argument("--no-champions", action="store_true",
+                   help="no champion (a larger one with twice the health) in each pack")
+    p.add_argument("--dry-run", action="store_true", help="show the counts, write nothing")
+    p = _takes_negatives(add("arrange", cmd_arrange, "enemies pasted in one spot set out on the ground in a shape "
+                                                     "(scatter, ring, camp, line, wedge, flank), facing a way"))
+    p.add_argument("target", nargs="?", help="a .lot or .lot.yaml file, a folder of them, an archive (.arc), or a "
+                                             "layout of the mod (st424_00m00n_e09); none: every layout of --mod")
+    p.add_argument("--mod", help="the mod whose layouts change (a layout named without a file)")
+    p.add_argument("--shape", choices=["scatter", "ring", "camp", "line", "wedge", "flank"], default="scatter",
+                   help="scatter (default), ring (facing out), camp (facing in), line, wedge, flank (an ambush "
+                        "either side of the path)")
+    p.add_argument("--spread", type=float, help="centimetres between neighbours (default: each enemy's own "
+                                                "spacing in the game's layouts)")
+    p.add_argument("--toward", metavar="X,Z", help="face this point (x,z or x,y,z in the layout's centimetres)")
+    p.add_argument("--heading", type=float, metavar="DEG",
+                   help="face this way, the game's own angle in degrees (0 = +Z, 90 = +X)")
+    p.add_argument("--records", metavar="N,N-M", help="set out these records ('riftstone spawns list' numbers) "
+                                                      "instead of the stacks it finds")
+    p.add_argument("--stage", help="the stage, when a file's name does not say it")
+    p.add_argument("--dry-run", action="store_true", help="show where they would stand, write nothing")
+    p = add("export", cmd_export, "mods as files to copy over the game's own (nativePC archives built from this "
+                                  "PC's game, loose files, a manifest, a READ ME); the game is not touched")
+    p.add_argument("mods", nargs="+")
+    p.add_argument("--out", required=True, help="an empty folder outside the game folder")
+    p.add_argument("--force", action="store_true", help="write into a folder that already holds files")
     p = add("compat", cmd_compat, "Dragon's Dogma Online skills for Dark Arisen: convert what the compat plugin "
                                    "runs them with into a mod (pack), or list the skills it knows (list)", game=False)
     p.add_argument("compat_action", choices=["pack", "list"])
@@ -4369,7 +4862,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="--plugins-only: do not include Ninput in the package")
     p.add_argument("--all-on", action="store_true", dest="all_on",
                    help="--plugins-only: switch every plugin on in the zip (by default Riftstone's features start "
-                        "off, in riftstone\\plugins\\off, and only the save backup is on)")
+                        "off, in riftstone\\plugins\\off; only the save backup and collision_cap are on)")
     p.add_argument("--plugin", action="append", help="make: a native plugin to include (.asi; its .ini comes along); "
                                                      "repeat for more")
     p.add_argument("--name", help="make: the package's title (default: the mods' names)")
@@ -4472,17 +4965,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mod", help="guard-mod: the mod folder to write (made if it is not a mod yet)")
     p.add_argument("--json", action="store_true", help="every item as JSON")
     p = add("saves", cmd_saves, "your save: list every copy of it (the loader's and the save_backup plugin's), "
-                                "copy it now, put a copy back, or see and raise your main pawn's enemy knowledge", aliases=("save",))
-    p.add_argument("action", nargs="?", choices=["list", "backup", "restore", "knowledge"], default="list")
+                                "copy it now, put a copy back, see and raise your main pawn's enemy knowledge, or see and set your "
+                                "Arisen's level, vocation rank, discipline, stats and skills", aliases=("save",))
+    p.add_argument("action", nargs="?", choices=["list", "backup", "restore", "knowledge", "arisen"], default="list")
     p.add_argument("which", nargs="?", help="restore: a copy's number from 'saves list' (1 = the account's newest) "
                                             "or its name")
-    p.add_argument("--yes", action="store_true", help="with 'restore' or 'knowledge --grant': really do it")
+    p.add_argument("--yes", action="store_true", help="with 'restore', 'knowledge --grant' or 'arisen': really do it")
     p.add_argument("--grant", action="store_true", help="with 'knowledge': raise the main pawn's knowledge "
                                                         "counters to the game's top thresholds")
     p.add_argument("--account", help="the Steam account (its folder under Steam\\userdata) when there are several")
     p.add_argument("--save", help="the save file (default: each account's Steam\\userdata\\...\\remote\\DDDA.sav)")
     p.add_argument("--folder", help="where the save_backup plugin's copies are (default: save_backup.ini's Folder, "
                                     "else %%LOCALAPPDATA%%\\Riftstone\\saves)")
+    p.add_argument("--level", type=int, help="arisen: the level (1-200)")
+    p.add_argument("--rank", type=int, help="arisen: the vocation's rank (1-9)")
+    p.add_argument("--points", type=int, help="arisen: discipline points")
+    p.add_argument("--hp", type=float, help="arisen: health (mHp, mHpMax, mHpMaxWhite)")
+    p.add_argument("--stamina", type=float, help="arisen: mStamina")
+    p.add_argument("--attack", type=float, help="arisen: mBasicAttack")
+    p.add_argument("--defence", type=float, help="arisen: mBasicDefend")
+    p.add_argument("--magick", type=float, help="arisen: mBasicMgcAttack")
+    p.add_argument("--magick-defence", type=float, help="arisen: mBasicMgcDefend")
+    p.add_argument("--stat", action="append", metavar="NAME=VALUE",
+                   help="arisen: any f32 field of the record: mHp mHpMax mHpMaxWhite mStamina mStaminaLv mBasicAttack "
+                        "mBasicDefend mBasicMgcAttack mBasicMgcDefend (repeat for more)")
+    p.add_argument("--skills", choices=["all"], help="arisen: every skill of the vocation's weapons learned at "
+                                                      "both tiers, a palette's empty slots filled")
+    p.add_argument("--vocation", type=int, help="arisen: whose rank and weapons (1-9; default: the save's own)")
+    p.add_argument("--weapons", nargs="+", metavar="WEAPON",
+                   help="arisen: the palettes --skills fills instead of the vocation's (SWORD MACE GSWORD DAGGER "
+                        "WAND WAND_DX HAMMER SHIELD SHIELD_L BOW BOW_L BOW_MG)")
+    p.add_argument("--max", action="store_true",
+                   help="arisen: level 200, rank 9, 999999 discipline, HP 5500, stamina 4500, attack and defence 999, "
+                        "every skill: what the showcase save got (round numbers, not the game's measured caps)")
     p.add_argument("--json", action="store_true")
     p = add("studio", cmd_studio, "open Riftstone Studio in your browser")
     p.add_argument("--port", type=_port, default=0, help="0 (the default): any free port")

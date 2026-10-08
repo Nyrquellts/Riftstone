@@ -144,6 +144,21 @@ objects in registers (engine classes)
   ECX   0x0A1B2C3D  -> sResource object
 """
 
+# the loader's "graphics device" section, as stability.cpp writes it for a device that was lost
+HANG_LOST = HANG + (
+    "\r\ngraphics device\r\n"
+    "  frames presented     4512\r\n"
+    "  last Present         0x88760868 D3DERR_DEVICELOST, failing 1 times in a row for 250312 ms\r\n"
+    "  TestCooperativeLevel 15020 calls, the last 3 ms ago: 0x88760868 D3DERR_DEVICELOST, not OK 15020 times"
+    " in a row for 250300 ms\r\n"
+    "  Reset                never called\r\n"
+    "  window               exclusive full screen, in front, not minimized\r\n"
+    "  the game's gates     active 1 (+0x20 0), reset requests 0x10, device-lost flag 0\r\n"
+    "  VERDICT              the device is lost: a full-screen game loses it when another window takes the\r\n"
+    "                       screen, or the driver resets it.\r\n"
+    "\r\nmemory\r\n"
+    "  address space used   1200 MB of 4096 MB\r\n")
+
 
 class LiveTest(unittest.TestCase):
     def test_round_trip_of_the_page(self):
@@ -375,6 +390,19 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(r["kind"], "hang")
         self.assertEqual(r["main_thread"], "0x00cf1234 (DDDA.exe+0x8f1234)")
         self.assertIn("sResource", "\n".join(runtime.explain(r)))
+        self.assertEqual(r["device"], {})              # reports before the graphics device section
+
+    def test_hang_with_a_lost_device(self):
+        r = runtime.parse_report(HANG_LOST)
+        dev = r["device"]
+        self.assertEqual((dev["frames"], dev["present"], dev["present_failing_ms"]), (4512, "D3DERR_DEVICELOST", 250312))
+        self.assertEqual(dev["tcl"], "D3DERR_DEVICELOST")
+        self.assertEqual(dev["window"], "exclusive full screen, in front, not minimized")
+        self.assertEqual((dev["active"], dev["forced"], dev["reset_requests"], dev["lost_flag"]), (1, 0, 0x10, 0))
+        self.assertTrue(dev["verdict"].startswith("the device is lost") and dev["verdict"].endswith("resets it."))
+        self.assertFalse(r["out_of_memory"])          # the device's verdict is not the memory one
+        self.assertEqual(r["memory"]["used_mb"], 1200)
+        self.assertIn("Its graphics device: the device is lost", "\n".join(runtime.explain(r)))
 
     def test_anything_else_is_harmless(self):
         # fuzz (report target): an uptime of dots crashed the float conversion

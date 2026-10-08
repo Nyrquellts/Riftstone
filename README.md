@@ -38,12 +38,21 @@ save backup are on); `Riftstone - Start Here.cmd` turns each one on when you wan
   For about 12 seconds after the game starts, a small **RUNNING** notice in the top-right corner shows that
   Riftstone is loaded.
 - **DXVK integration** — chains DXVK's `d3d9.dll` to relieve the 32-bit game's address-space pressure.
+- **Collision crash guard** (1.0.4, on) — a frame with more hit shapes than the game's table of 800 (a city
+  full of Archydras) made the game read past its table and crash; the table now holds 4,096 and the read stops
+  at its end.
+- **Any enemy in any stage** (1.0.4) — the game loads enemy models per stage, so an Archydra placed in the
+  Tower never appeared. `stage_enemies` makes a stage also load the enemies it is given (up to 16 a stage: an
+  Archydra, Chimeras and Drakes together, say), and installing a mod writes those lines for it.
+- **Bigger memory pools** (1.0.4, off) — the game's fixed pools for enemies, physics, collision and effects
+  made larger before the game builds them, and every request a full pool refuses logged.
 
 > **Honesty:** every plugin is verified in a test harness against the *real* game code; their *in-game
 > feel* is still being playtested. The file-format toolkit below, by contrast, is byte-for-byte proven
-> across the entire game. The start-up notice and the Insert panel (1.0.3) are drawn and read back in the
-> loader's test harness; in the actual game they have not been seen yet, and `riftstone\logs\loader.log`
-> records whether they were.
+> across the entire game. The start-up notice (1.0.3) has been drawn in the actual game (`loader.log`,
+> 2026-10-07). Of 1.0.4's: the collision guard has patched the game in play (its log); an Archydra, Chimeras
+> and Drakes loading together in a stage that never had them are proven in the test harness, not yet seen in
+> game.
 
 **2. A full modding toolkit (Studio)** — a local browser app (sends nothing anywhere), or the CLI:
 
@@ -52,11 +61,15 @@ save backup are on); `Riftstone - Start Here.cmd` turns each one on when you wan
 - Place enemies, encounters, scripted waves, and **whole procedurally-generated dungeons** on a stage's
   real walkable ground (its navigation mesh, decoded from the exe), with every spawn point checked
   reachable on foot.
+- Set out enemies you pasted on one spot in a shape (scatter, ring, camp, line, wedge, flank) on that
+  ground, each facing the way the shape says, as far apart as the game spaces them (1.0.4). Or export mods
+  as files to copy over the game's own, for your own game (to share a mod, make a package).
 - Add custom items (shops, recipes, drops); rebalance any enemy.
 - Port resources and body-matched monsters between Dark Arisen and DDO.
 - Share mods as **packages with no game data**: deltas and recipes that each player's Riftstone turns back
   into the mod from their own game. Mods that change the same group lists or layouts **merge** instead of
-  hiding each other.
+  hiding each other. Installing someone else's mod also loads the enemies it places in stages that never had
+  them (1.0.4).
 
 **3. Dragon's Dogma Online preservation** (if you own DDO) — solo rebalance, a monster bridge, and gear
 dyes, all generated from *your own* DDO files. See [docs/ddo-solo.md](docs/ddo-solo.md).
@@ -73,10 +86,13 @@ dyes, all generated from *your own* DDO files. See [docs/ddo-solo.md](docs/ddo-s
 
 Download the player package and unzip everything into your game folder (where `DDDA.exe` is). Then
 double-click **`Riftstone - Start Here.cmd`** (it needs no Python): **1** checks the install and says what
-to fix, **2** turns features on, one at a time (they start off; only the save backup is on). Start the
+to fix, **2** turns features on, one at a time (they start off; the save backup and the collision crash guard
+are on). Start the
 game: for about 12 seconds a small **RUNNING** notice shows in the top-right corner, and **Insert** opens
 the diagnostics panel. To uninstall, delete `dinput8.dll`, `riftstone_loader.ini`, the `riftstone` folder
-and the Start Here file. `optional\ninput` holds Ninput, an experimental plugin host: it stays off unless you
+and the Start Here file. Want one feature only? Each is also a zip of its own on the release page
+(`Riftstone-Plugin-<name>-<version>.zip`, the loader and that feature): unzip it the same way, on its own or
+over the player package. `optional\ninput` holds Ninput, an experimental plugin host: it stays off unless you
 copy its `xinput1_3.dll` next to `DDDA.exe` (its README says more).
 
 ## Use the toolkit

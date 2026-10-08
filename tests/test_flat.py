@@ -114,6 +114,47 @@ class FlatTest(unittest.TestCase):
             self.assertEqual(flat.yaml_to_bytes(flat.to_yaml(f, "x")), raw, ext)
             self.assertEqual(params.yaml_to_resource(params.resource_to_yaml(raw, "x", typemap.BY_EXT[ext])), raw, ext)
 
+    def test_region_status_is_a_creatures_health(self):
+        # rst (rRegionStatus, charparam\em\em<id>.rst): mHPMax is the base health (docs/enemy-hp.md).  A type 0
+        # region of two elements, a type 10 region of one; the first element's health is 1234.5.
+        el = {"mNo": 0, "mId": 0, "mHPMax": 1234.5, "mDPMax": 100.0, "mDPSpeed": 0.3, "mBPMax": 100.0,
+              "mBPSpeed": 0.3, "mDamageAdj": 1.0, "mHitStopAdj": 1.0, "mSurface": 1, "mSeSurface": 0, "mAttr": 280,
+              "mDPResetTimerMax": 75.0, "mBPResetTimerMax": 30.0}
+        d = {"mRegionStatusList": [{"mNo": 0, "mType": 0, "mElementList": [el, dict(el, mNo=1, mId=1)]},
+                                   {"mNo": 1, "mType": 10, "mElementList": [dict(el, mHPMax=99.0)]}]}
+        f = flat.Flat("rst", flat.SCHEMAS["rst"][0], d)
+        raw = self.rt(f)
+        self.assertEqual(len(raw), 8 + (12 + 2 * 56) + (12 + 56))          # 56 bytes an element
+        self.assertEqual(struct.unpack_from("<II", raw, 0), (0x20110930, 2))
+        self.assertEqual(struct.unpack_from("<f", raw, 8 + 12 + 8)[0], 1234.5)      # region 0, element 0, +8
+        y = flat.to_yaml(flat.parse(raw, "rst"), "charparam/em/em0100.rst")
+        self.assertIn("riftstone: rst/2", y)
+        self.assertIn("mHPMax: 1234.5", y)
+        self.assertIn("mType: 10", y)
+        # an edit of the health goes through the YAML and nothing else moves
+        new = flat.yaml_to_bytes(y.replace("mHPMax: 1234.5", "mHPMax: 4321.0", 1))
+        self.assertEqual(struct.unpack_from("<f", new, 8 + 12 + 8)[0], 4321.0)
+        self.assertEqual(new[:20 + 8] + new[20 + 12:], raw[:20 + 8] + raw[20 + 12:])
+
+    def test_region_status_yaml_written_with_the_old_names_still_loads(self):
+        # until 2026-10-02 this format's fields were mpRegion, mUnkA, at0c and so on (rst/1); such a file
+        # still loads, and a file that says rst/2 must use today's names
+        old = ("riftstone: rst/1\nmpRegion:\n  - mUnkA: 0\n    mUnkB: 0\n    mpSub:\n"
+               "      - at04: 0\n        at08: 0\n        at0c: 1234.5\n        at10: 100.0\n        at14: 0.3\n"
+               "        at18: 100.0\n        at1c: 0.3\n        at20: 1.0\n        at24: 1.0\n        at2c: 1\n"
+               "        at30: 0\n        at28: 280\n        at58: 75.0\n        at5c: 30.0\n")
+        want = (struct.pack("<II", 0x20110930, 1) + struct.pack("<III", 0, 0, 1)
+                + struct.pack("<IIfffffffIIIff", 0, 0, 1234.5, 100.0, 0.3, 100.0, 0.3, 1.0, 1.0, 1, 0, 280, 75.0, 30.0))
+        self.assertEqual(flat.yaml_to_bytes(old), want)
+        self.assertEqual(params.yaml_to_resource(old), want)
+        again = flat.to_yaml(flat.parse(want, "rst"))
+        self.assertIn("mElementList:", again)
+        self.assertNotIn("mpRegion", again)
+        self.assertEqual(flat.yaml_to_bytes(again), want)
+        with self.assertRaises(ParamError) as cm:
+            flat.yaml_to_bytes(old.replace("rst/1", "rst/2"), "m.yaml")
+        self.assertIn("unexpected field 'mpRegion'", str(cm.exception))
+
     def test_dispatch(self):
         raw = flat.build(flat.Flat("ajp", 0, {"version": 1, "mpArray": [1.0]}))
         self.assertTrue(params.is_editable_resource(raw))              # by magic

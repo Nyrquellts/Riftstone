@@ -91,7 +91,9 @@ class CompatPackGameTest(unittest.TestCase):
         except Exception as e:  # noqa: BLE001
             raise unittest.SkipTest(f"needs both games: {e}")
         cls.src = compat_pack.Source(ddo, Index(ddo))
+        cls.addClassCleanup(cls.src.idx.close)
         cls.dst = compat_pack.Source(ddda, Index(ddda))
+        cls.addClassCleanup(cls.dst.idx.close)
         cls.pack = compat_pack.build(cls.src, cls.dst, ["alma_wave"], effects=True)
 
     def test_without_effects(self):

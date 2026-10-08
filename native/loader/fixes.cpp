@@ -31,9 +31,11 @@
 //   ragdolls           [guard] ragdoll_bodies (DDDA build 2364871): the "walk a ragdoll's bodies" idiom
 //                      reads the packed count [bodydata+0x68] (>>8) through bodydata = [holder+0x38] with no
 //                      null-check; the game's own accessor 0x010805D0 answers 0 without data.  Four bespoke
-//                      sites (two enemy setter functions + two inline walks), then the whole family that a
-//                      scan of the exe found (55 more, byte-verified) trampolined to that same answer.  Live
-//                      goblin-horde crashes: 0x00794942 (the four) and 0x007945B4 (the family), 2026-09-27.
+//                      sites (two enemy setter functions + two inline walks), then the whole family
+//                      tools/ragdoll_sites.py finds in the exe (62 more, ragdoll_sites.inc, byte-verified)
+//                      trampolined to that same answer.  Live crashes: 0x00794942 (the four) and 0x007945B4
+//                      (the family), goblin hordes 2026-09-27; 0x00794AA2 (a dying goblin's ragdoll at
+//                      Devil's Firegrove, 2026-10-06, a copy the first scan missed).
 #include "runtime.h"
 #include "exit_sites.h"
 #include <stdio.h>
@@ -255,6 +257,35 @@ BOOL ResourceTable(int* used, int* size) {
     }
     *size = (int)RES_SLOTS;
     return TRUE;
+}
+
+// The main loop's reasons to run no frame (0x00DF0D20; docs/stability-membrane.md, "The hang of 2026-10-06
+// 14:42"): it sleeps while sApp's active byte (+0x2566, cleared by WM_ACTIVATEAPP false) and +0x20 are both 0,
+// and skips the frame while sRender+0x433E68 is set; sRender+0x433E54 holds the reset requests (0x10: a Present
+// returned D3DERR_DEVICELOST).  sApp lives on WinMain's stack; [0x018D0F50] points at it.
+static const DWORD_PTR S_APP = 0x018D0F50;
+static const DWORD_PTR S_RENDER = 0x018D08F4;
+
+static BOOL ReadFrameGatesUnsafe(FrameGates* g) {
+    DWORD_PTR app = *(const DWORD_PTR*)S_APP;
+    DWORD_PTR render = *(const DWORD_PTR*)S_RENDER;
+    if (!app || !render || !Readable((const void*)app, 0x2567) || !Readable((const void*)(render + 0x433E54), 0x15))
+        return FALSE;
+    g->appActive = *(const BYTE*)(app + 0x2566);
+    g->appForced = *(const BYTE*)(app + 0x20);
+    g->resetBits = *(const DWORD*)(render + 0x433E54);
+    g->deviceLost = *(const BYTE*)(render + 0x433E68);
+    return TRUE;
+}
+
+BOOL ReadFrameGates(FrameGates* g) {
+    memset(g, 0, sizeof *g);
+    if (!g_knownBuild || !Readable((const void*)S_APP, 4) || !Readable((const void*)S_RENDER, 4)) return FALSE;
+    __try {
+        return ReadFrameGatesUnsafe(g);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,78 +1070,55 @@ static void ApplyRagdollGuard() {
 // ---------------------------------------------------------------------------
 // the ragdoll body-count family (DDDA build 2364871): the four sites above are hand-written because each
 // does more than read the count (two set a field on every body, two are inline walks with their own loop).
-// A scan of DDDA.exe for the same idiom -- read [bodydata+0x68] through bodydata = [holder+0x38] with no
-// null-check -- found 55 more copies the compiler inlined across the enemy, physics and character update
-// code (tools were used to list them; docs/stability-membrane.md).  Two shapes, told apart by their bytes:
-//   'T'  test dword [reg+0x68], 0xFFFFFF00     (7 bytes: the "any bodies?" test before a walk; 47 sites)
-//   'C'  mov reg2,[reg+0x68] ; shr reg2, 8     (6 bytes: a count read feeding a loop; 8 sites)
+// Every other inlined copy of the idiom -- read [bodydata+0x68] through bodydata = [holder+0x38] with no
+// null-check -- is in ragdoll_sites.inc, which tools/ragdoll_sites.py writes from the exe by following each
+// read of +0x68 back to the instruction that loaded its pointer (docs/stability-membrane.md).  Three shapes:
+//   'T'  test dword [reg+0x68], 0xFFFFFF00     (7 bytes: the "any bodies?" test before a walk)
+//   'C'  mov reg2,[reg+0x68] ; shr reg2, 8     (6 bytes: a count read feeding a loop)
+//   'M'  test dword [reg+0x68], M              (3 bytes, M = 0xFFFFFF00 in a register: the span starts `pre`
+//                                               bytes earlier, at straight-line instructions the stub runs first)
 // Each site keeps its exact bytes, so the guard reproduces the game's own instruction when bodydata is set
 // and its "0 without data" answer when it is null, without needing to know the site's skip target: for 'T'
-// the null case leaves the flags an all-zero count would (test reg,reg on a null reg == test 0,imm), so
-// whatever branch follows takes its no-bodies path; for 'C' the null case leaves the count register 0.
+// and 'M' the null case leaves the flags an all-zero count would (test reg,reg on a null reg == test 0,mask),
+// so whatever branch follows takes its no-bodies path; for 'C' the null case leaves the count register 0.
 struct FamilySite {
-    DWORD_PTR va;
-    char kind;                                   // 'T' or 'C'
-    BYTE bytes[8];                               // the game's own instruction(s): 7 for 'T', 6 for 'C'
+    DWORD_PTR va;                                // where the patch starts
+    char kind;                                   // 'T', 'C' or 'M'
+    BYTE len;                                    // bytes replaced: 7 for 'T', 6 for 'C', pre + 3 for 'M'
+    BYTE pre;                                    // bytes before the read, run first in the stub (0 but for 'M')
+    BYTE bytes[10];                              // the game's own instruction(s)
 };
-static const FamilySite FAMILY_SITES[] = {
-    {0x004C8ECB, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x004C8F06, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00794132, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x0079415F, 'C', {0x8B, 0x51, 0x68, 0xC1, 0xEA, 0x08}},
-    {0x0079419D, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x007941CF, 'C', {0x8B, 0x51, 0x68, 0xC1, 0xEA, 0x08}},
-    {0x0079421D, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x0079427C, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x007942ED, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00794354, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00794581, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x007945B4, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x0079469F, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x007946EA, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x007948CD, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00857323, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x0088D149, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x0088D179, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x0088D1B2, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x0088D2D5, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x0088D665, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x0088D6D6, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x009C0977, 'C', {0x8B, 0x70, 0x68, 0xC1, 0xEE, 0x08}}, {0x009C0B8D, 'C', {0x8B, 0x51, 0x68, 0xC1, 0xEA, 0x08}},
-    {0x009CA2EE, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x009CC086, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x009D53FF, 'C', {0x8B, 0x78, 0x68, 0xC1, 0xEF, 0x08}}, {0x00A1D58A, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00A1D5CB, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00A20147, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00A20186, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00A2358A, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00A235C2, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00A23D53, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00A23D8F, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00A2E0BA, 'C', {0x8B, 0x42, 0x68, 0xC1, 0xE8, 0x08}},
-    {0x00A2E14D, 'C', {0x8B, 0x42, 0x68, 0xC1, 0xE8, 0x08}}, {0x00A2E181, 'C', {0x8B, 0x42, 0x68, 0xC1, 0xE8, 0x08}},
-    {0x00AA951D, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00AA9554, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00BADF6C, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C1E100, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00C293AF, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C29A51, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00C2A20D, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C2A2CB, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00C2A330, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C2B785, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00C2CF16, 'T', {0xF7, 0x40, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C2D3D4, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00C446F9, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C45E3D, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00C46698, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}}, {0x00C524C8, 'T', {0xF7, 0x42, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-    {0x00C52755, 'T', {0xF7, 0x41, 0x68, 0x00, 0xFF, 0xFF, 0xFF}},
-};
+#include "ragdoll_sites.inc"
 
 // A body walk that would have read through a null bodydata: counted (any thread, cheap), like the four above.
 extern "C" void __stdcall RagdollFamilyHit(DWORD site) { GuardHit(GUARD_RAGDOLL_BODIES, site, NULL); }
 
-// Emit one trampoline into `cur` (advanced) and return its entry.  `orig`/`len` are the site's own bytes;
-// `back` is where both paths continue (the site just past `orig`); `hit` is called only in the null case.
-//   test R,R ; jz null ; <orig> ; jmp back ; null: pushad;pushfd; push siteVA; call hit; popfd;popad;
+// Emit one trampoline into `cur` (advanced) and return its entry.  `orig`/`len` are the site's own bytes, the
+// first `pre` of them straight-line instructions before the read; `back` is where both paths continue (the site
+// just past `orig`); `hit` is called only in the null case.
+//   <pre> ; test R,R ; jz null ; <read> ; jmp back ; null: pushad;pushfd; push siteVA; call hit; popfd;popad;
 //   ['C' only] xor reg2,reg2 ; jmp back
-// R is the base of the read (orig[1] & 7); for 'C' reg2 is the count register ((orig[1] >> 3) & 7).
-static BYTE* EmitFamilyStub(BYTE*& cur, char kind, const BYTE* orig, int len, DWORD_PTR siteVA, DWORD_PTR back,
-                            void* hit) {
-    BYTE R = orig[1] & 7;
+// R is the base of the read (orig[pre+1] & 7); for 'C' reg2 is the count register ((orig[pre+1] >> 3) & 7).
+static BYTE* EmitFamilyStub(BYTE*& cur, char kind, const BYTE* orig, int len, int pre, DWORD_PTR siteVA,
+                            DWORD_PTR back, void* hit) {
+    BYTE R = orig[pre + 1] & 7;
     BYTE* entry = cur;
+    memcpy(cur, orig, pre); cur += pre;                                       // the instructions before the read
     *cur++ = 0x85; *cur++ = (BYTE)(0xC0 + R * 9);                              // test R, R
     *cur++ = 0x74; BYTE* jz = cur++;                                          // jz null (rel8, filled below)
-    memcpy(cur, orig, len); cur += len;                                       // the game's own instruction(s)
+    memcpy(cur, orig + pre, len - pre); cur += len - pre;                     // the game's own read
     *cur++ = 0xE9; { int32_t r = (int32_t)(back - ((DWORD_PTR)cur + 4)); memcpy(cur, &r, 4); cur += 4; }  // jmp back
     *jz = (BYTE)(cur - (jz + 1));                                             // null:
     *cur++ = 0x60; *cur++ = 0x9C;                                             // pushad; pushfd
     *cur++ = 0x68; memcpy(cur, &siteVA, 4); cur += 4;                         // push siteVA
     *cur++ = 0xE8; { int32_t r = (int32_t)((DWORD_PTR)hit - ((DWORD_PTR)cur + 4)); memcpy(cur, &r, 4); cur += 4; }  // call hit
     *cur++ = 0x9D; *cur++ = 0x61;                                            // popfd; popad
-    if (kind == 'C') { BYTE r2 = (orig[1] >> 3) & 7; *cur++ = 0x33; *cur++ = (BYTE)(0xC0 + r2 * 9); }     // xor reg2,reg2
+    if (kind == 'C') { BYTE r2 = (orig[pre + 1] >> 3) & 7; *cur++ = 0x33; *cur++ = (BYTE)(0xC0 + r2 * 9); }  // xor reg2,reg2
     *cur++ = 0xE9; { int32_t r = (int32_t)(back - ((DWORD_PTR)cur + 4)); memcpy(cur, &r, 4); cur += 4; }  // jmp back
     return entry;
 }
 
-static const int RAG_CAVE_SIZE = 4096;           // 55 stubs of at most 36 bytes fit in one page
+static const int RAG_CAVE_SIZE = 4096;           // 62 stubs of at most 36 bytes fit in one page
 static BYTE* g_ragCave = NULL;
 static int g_ragFamilyCount = 0, g_ragFamilySkipped = 0;
 
@@ -1129,18 +1137,19 @@ static void ApplyRagdollFamily() {
     }
     BYTE* cur = g_ragCave;
     for (const FamilySite& s : FAMILY_SITES) {
-        int len = s.kind == 'T' ? 7 : 6;
+        int len = s.len;
         BYTE* at = (BYTE*)s.va;
         if (!Readable(at, len) || memcmp(at, s.bytes, len) != 0) {
             g_ragFamilySkipped++;
             LogLine(L"ragdoll  family site 0x%08lx is not what build 2364871 has; left unguarded", (DWORD)s.va);
             continue;
         }
-        if (cur + 48 > g_ragCave + RAG_CAVE_SIZE) {
+        if (cur + 64 > g_ragCave + RAG_CAVE_SIZE) {
             LogLine(L"ragdoll  family cave full after %d sites", g_ragFamilyCount);
             break;
         }
-        BYTE* stub = EmitFamilyStub(cur, s.kind, s.bytes, len, (DWORD_PTR)s.va, s.va + len, (void*)RagdollFamilyHit);
+        BYTE* stub = EmitFamilyStub(cur, s.kind, s.bytes, len, s.pre, (DWORD_PTR)s.va, s.va + len,
+                                     (void*)RagdollFamilyHit);
         DWORD old;
         if (!VirtualProtect(at, len, PAGE_EXECUTE_READWRITE, &old)) {
             g_ragFamilySkipped++;

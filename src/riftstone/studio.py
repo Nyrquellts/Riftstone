@@ -622,9 +622,14 @@ class Studio:
                 what = (f"record {r['record']} of {r['layout']} is record {r['as']}" if "record" in r else
                         f"group {r['group']} of stage {r['stage']} ({r['type']}) is group {r['as']}")
                 self.log("info", f"{r['mod']}: {what} in the game (another mod adds the same number there)")
+            from . import stage_enemies
+            enemy_lines = stage_enemies.describe(rep.stage_enemies or {})
+            for level, line in enemy_lines:
+                self.log(level, line)
             return {"ok": True, "message": msg, "written": rep.written, "restored": rep.restored,
                     "conflicts": rep.conflicts, "mode": rep.mode, "merged": rep.merged,
-                    "renumbered": rep.renumbered, "unmoved": rep.unmoved}
+                    "renumbered": rep.renumbered, "unmoved": rep.unmoved,
+                    "stage_enemies": [line for _, line in enemy_lines]}
         if route == "restore" and method == "POST":
             done = install.restore_all(self.need_game())
             self.log("ok", f"Restored {len(done)} archive(s) to the originals")

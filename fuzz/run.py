@@ -208,6 +208,7 @@ def _synthetic() -> dict[str, list[bytes]]:
                 b'<?xml version="1.0" encoding="utf-8"?>\n<class name="dd_savedata"><u32 name="n" value="%d"/></class>\n'
                 % n) for n in (1, 2)],
             "save_knowledge": _knowledge_seeds(),
+            "save_arisen": _arisen_seeds(),
             "lot_ddo": _ddo_lot_seeds(), "lot_ddo_yaml": [_lot_ddo_yaml()],
             **_weather_camera_seeds(),
             "ddo_tables": [struct.pack("<II", 1, 1) + struct.pack("<4I", 1, 0, 1, 0x010100),
@@ -219,6 +220,7 @@ def _synthetic() -> dict[str, list[bytes]]:
                       b"event/st330/ev10/FSM/Em0100_cons_00.fsm", b"goblins", b"gran soren", b"stage 424", b"0100", b"ox"],
             "mod_names": [b"Harder Goblins", b"hydrastorm  mk", b"HydraStormMK", b"b", b"c", b"..", b"...", b"../outside",
                           b"mods\\x", b"CON", b"New Mod", b"not a mod", b" padded "],
+            "import_inputs": [bytes(range(8)), bytes([0, 1, 7 | 8, 2 | 16, 0 | 8]), b"\x00", b"\x02", b"\x07", b""],
             "port": [bytes([0]) + _tex_seed, bytes([4]) + _ddo_tex_seed(), bytes([1]) + gmd_raw,
                      bytes([3]) + _mrl.build(_mrl.Mrl(0x20, 0xb46006d5, [], [], b""))],
             "dye": __import__("targets").dye_seeds(), "dye_tables": __import__("targets").dye_table_seeds(),
@@ -289,6 +291,45 @@ def _synthetic() -> dict[str, list[bytes]]:
                 {"op": "machine", "stage": 100, "links": [[294, [0], 255], [1, [1], None]]},
                 {"op": "machine", "stage": 803, "links": [[0, [0], 121], [2, [0], None]]},
                 {"stage": 800, "after": 0, "waves": [["goblin", 2]]})],
+            # everything twice; three times with the big ones; one enemy; the field's cell; no variety; a run again
+            "multiply": [json.dumps(c).encode() for c in (
+                {"factor": 2},
+                {"factor": 3, "bosses": True, "again": 2},
+                {"factor": 2, "stages": [424], "enemies": ["em0100"], "spread": 90.5},
+                {"factor": 4, "stages": [100, 426], "plain": True},
+                {"factor": 10, "stages": [426], "champions": False, "again": 5},
+                {"factor": 2, "enemies": ["em0600"], "spread": 1000, "again": 3},
+                {"factor": 2, "stages": [425]},
+                {"factor": 1}, {"factor": 2, "stages": [999]}, {"factor": 2, "enemies": ["em9999"]})],
+            # a stack on the corridor's mesh in every shape; mixed with a big one; harpies; the field; no stage;
+            # named records; one off the mesh; hostile options
+            "arrange": [json.dumps(c).encode() for c in (
+                {"stage": 424, "stacks": [["em0100", 8, [0, -350, -9250]]]},
+                {"stage": 424, "stacks": [["em0100", 6, [0, -350, -9250]], ["em5200", 1, [0, -350, -9250]]],
+                 "shape": "camp", "toward": [0, 0]},
+                {"stage": 424, "stacks": [["em0600", 4, [0, 450, -9250]], ["em0100", 3, [500, -350, -9250]]],
+                 "shape": "ring", "heading": -90},
+                {"stage": 424, "stacks": [["em0100", 12, [4500, -350, -9250]]], "shape": "line", "spread": 400},
+                {"stage": 424, "stacks": [["em0101", 9, [-500, -350, -8800]]], "shape": "wedge"},
+                {"stage": 424, "stacks": [["em1002", 7, [0, -350, -9250]]], "shape": "flank", "toward": [0, -350, 0]},
+                {"stage": 100, "label": "st100_45m55n_e150.lot", "stacks": [["em0100", 6, [54000, 5118, -46000]]]},
+                {"stage": None, "stacks": [["em0100", 3, [0, 0, 0]]]},
+                {"stage": 424, "stacks": [["em0100", 2, [0, -350, -9250]], ["em0100", 1, [900, -350, -9250]]],
+                 "records": [0, 2]},
+                {"stage": 424, "stacks": [["em0100", 3, [0, -350, 30000]]]},
+                {"stage": 424, "stacks": [["em0100", 2, [0, -350, -9250]]], "spread": 1e9},
+                {"stage": 424, "stacks": [["em0100", 2, [0, -350, -9250]]], "shape": "blob"},
+                {"stage": 424, "stacks": [["em0100", 2, [0, -350, -9250]]], "records": [9]})],
+            "export": [json.dumps(c).encode() for c in (
+                {"mods": [{"paste": [[0, -350, -9250], [300, -350, -9250]]}]},
+                {"mods": [{"paste": [[0, -350, -9250]], "loose": {"scr/st424/note.gmd": "loose"}},
+                          {"paste": [[600, -350, -9250]]}]},
+                {"mods": [{"loose": {"compat/a.skills": "x", "scr/st424/n.gmd": "a"}}, {"loose": {"scr/st424/n.gmd": "b"}}]},
+                {"mods": [{"files": {"scr/st424/etc/st424_00m00n_e07.lot.yaml": "riftstone: lot/2"}}]},
+                {"mods": [{"loose": {"../x.gmd": "x"}}]},
+                {"mods": [{"files": {"rom/em/em0100.arc": "x"}}]},
+                {"mods": [{"paste": [[0, -350, -9250]]}], "inside": True},
+                {"mods": [{}]})],
             **_level_seeds(),
             "skintex": [_skin_tex, _skin_tex[:4] + struct.pack("<I", 0x2000209D) + _skin_tex[8:],
                         _tex.to_dds(_tex.parse(_skin_tex))],
@@ -316,7 +357,8 @@ def _synthetic() -> dict[str, list[bytes]]:
             "pe": [helpers.pe_file(), helpers.pe_file(machine=0x8664, plus=True), helpers.pe_file(dll=False, laa=True),
                    helpers.pe_file(exports=()), helpers.pe_file(exports=("Direct3DCreate9", "Direct3DCreate9Ex", "x"))],
             "d3d9_source": _d3d9_sources(),
-            "report": [test_runtime.CRASH.encode(), test_runtime.FATAL.encode(), test_runtime.HANG.encode()],
+            "report": [test_runtime.CRASH.encode(), test_runtime.FATAL.encode(), test_runtime.HANG.encode(),
+                       test_runtime.HANG_LOST.encode()],
             "session": [test_runtime.STATE_CLOSED.encode(), test_runtime.STATE_RUNNING.encode(),
                         test_runtime.STATE_KILLED.encode(),
                         (test_runtime.STATE_CLOSING + "\n#note\nkind=crash\nuptime_ms=2590000\n"
@@ -371,6 +413,13 @@ def _synthetic() -> dict[str, list[bytes]]:
             "graphics_ini": [b"[PROXY]\r\nEnableProxyLibrary=false\r\nProxyLibrary=\r\n#set\nPROXY\0ProxyLibrary\0riftstone\\dxvk\\d3d9.dll",
                              b"[GRAPHICS]\nHDR=DEFAULT\n[DISPLAY]\nVSYNC = ON\n#set\ndisplay\0vsync\0OFF",
                              "﻿[A]\r\nK=1\r\n".encode("utf-16-le") + b"\n#set\nA\0K\x002"],
+            "stage_enemies_ini": [
+                b"[stage_enemies]\r\nEnabled = 1\r\n;370 = em5301\r\n\r\n[x]\r\nk=1\r\n#rows\n370 Tower Trio: em5301, em5200",
+                b"[stage_enemies]\nEnabled = 1\n; -- end of riftstone install's lines --\n#rows\n424 A: em5900\n425 B: em0100",
+                b"; -- riftstone install: enemies the installed mods place in stages that never load them. Install "
+                b"rewrites\r\n370 = em5301\r\n[stage_enemies]\r\n#rows\n100 C: em0900",
+                "\ufeff[stage_enemies]\r\nEnabled = 1\r\n".encode("utf-16-le") + b"\n#rows\n370 D: em5301",
+                b"\xff\xfe[\x00s\x00\n#rows\n1 E: em1"],
             "plugin_ini": [b"; enemy_cap -- more enemies\n[enemy_cap]\nslots = 30\nrecord = 1\n#set\nenemy_cap\0enemy_cap\0slots\x0048",
                            b"[lod]\n; on\nEnabled = 1\nPopPixels = 24\nScale = auto\n#set\nlod_tuner\0lod\0Scale\0auto",
                            b"[fps]\nmax_fps = 165\n[overlay]\nkey = F10\n#set\nloader\0overlay\0key\0f7",
@@ -706,6 +755,17 @@ def _knowledge_seeds() -> list[bytes]:
     make = __import__("test_saves").knowledge_save
     part = make(main=2, frames=[float(g * 13 % 50) for g in range(saves.GROUPS)],
                 kills=[g % 9 for g in range(saves.GROUPS)], feats=[i % 4 for i in range(saves.FEAT_SLOTS)])
+    return [saves.unpack(make()), saves.unpack(part)]
+
+
+def _arisen_seeds() -> list[bytes]:
+    """Save XML holding an Arisen in both copies of the player's data (the unit tests' stand-in save): a fresh
+    Warrior, and one part-way with skills equipped and learned."""
+    from riftstone import saves
+
+    make = __import__("test_saves").arisen_save
+    part = make(level=120, rank=6, points=4321, palettes={"GSWORD": [103, -1, 100, -1, -1, -1], "WAND": [30, 31, 32, 33, -1, -1]},
+                learned=(100, 103, 30, 31, 32, 33), base_level=118, base_job=7)
     return [saves.unpack(make()), saves.unpack(part)]
 
 

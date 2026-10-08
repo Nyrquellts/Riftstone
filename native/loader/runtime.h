@@ -17,7 +17,7 @@
 #include <windows.h>
 #include <stdint.h>
 
-#define RIFTSTONE_VERSION_A "1.0.3"             // the one version: the log, reports, the live page, the panel
+#define RIFTSTONE_VERSION_A "1.0.4"             // the one version: the log, reports, the live page, the panel
 #define RIFTSTONE_LOADER_VERSION L"" RIFTSTONE_VERSION_A
 
 // ---- loader.cpp -------------------------------------------------------------------------------
@@ -107,6 +107,18 @@ extern volatile LONG g_frames;
 extern volatile LONG g_fallbacks;
 extern HWND g_gameWindow;
 extern volatile LONG g_d3dWindowed;             // -1 unknown, 0 fullscreen, 1 windowed (from CreateDevice)
+// What the Direct3D device last told the game (a hang report's "graphics device"); FALSE before a device.
+struct DeviceState {
+    LONG frames;                                // Presents so far
+    LONG presentHr, presentBad;                 // the last Present's result; failures in a row
+    DWORD presentBadMs;                         // how long they have been failing
+    BOOL tclHooked;                             // TestCooperativeLevel is watched
+    LONG tclCalls, tclHr, tclBad;               // its calls, last result, failures in a row
+    DWORD tclAgoMs, tclBadMs;                   // since the last call; since the failures began
+    LONG resets, resetHr;                       // Reset calls and the last one's result
+};
+BOOL GetDeviceState(DeviceState* d);
+const wchar_t* D3dResultName(LONG hr);
 
 // ---- fixes.cpp --------------------------------------------------------------------------------
 enum GameKind { GAME_OTHER = 0, GAME_DDDA = 1, GAME_DDO = 2 };
@@ -127,6 +139,10 @@ void BackupSaves();                             // before the game reads its sav
 BOOL EnemySlots(int* active, int* usable, int* slots);
 // The current stage number, and sResource's table use (DDDA build 2364871 only); FALSE when unknown.
 BOOL CurrentStage(int* stage);
+// The main loop's own reasons to run no frame (DDDA build 2364871 only; docs/stability-membrane.md, "The hang
+// of 2026-10-06 14:42"): sApp's active byte and +0x20, sRender's reset-request bits and its device-lost flag.
+struct FrameGates { int appActive, appForced; unsigned resetBits; int deviceLost; };
+BOOL ReadFrameGates(FrameGates* g);
 BOOL ResourceTable(int* used, int* size);
 // The guard, asked when a read-only open under nativePC finds no file: the resource's own bytes from its
 // archive (resources.cpp), else a stand-in for a texture.

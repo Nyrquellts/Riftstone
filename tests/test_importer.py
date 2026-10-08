@@ -6,6 +6,7 @@ from pathlib import Path
 
 import helpers  # noqa: F401 (sys.path)
 from riftstone import arc, gmd, importer, mod, typemap
+from riftstone.errors import RiftError
 from riftstone.game import Game
 from riftstone.index import Index
 
@@ -67,6 +68,26 @@ class ImportTest(unittest.TestCase):
                 self.assertEqual(gmd.parse(built.find(b"ui\\x", GMD).data()).messages[0].text, "new", a)
         finally:
             idx.close()
+
+    def test_a_folder_given_yields_its_archive_files_only(self):
+        """Riftstone unpacks an archive into a folder named x.arc: such a folder is no archive to read (it used to
+        reach the archive reader and stop with a PermissionError, after the mod had been made)."""
+        src = self.base / "old mod"
+        (src / "nativePC" / "rom").mkdir(parents=True)
+        (src / "nativePC" / "rom" / "a.arc").write_bytes(b"x")
+        (src / "nativePC" / "rom" / "B.ARC").write_bytes(b"x")
+        (src / "nativePC" / "rom" / "notes.txt").write_bytes(b"x")
+        (src / "unpacked.arc" / "ui").mkdir(parents=True)
+        (src / "unpacked.arc" / "ui" / "x.gmd").write_bytes(b"x")
+        got = importer._inputs([src])
+        self.assertEqual({f.relative_to(src).as_posix().lower() for f, _ in got},
+                         {"nativepc/rom/a.arc", "nativepc/rom/b.arc"})
+        self.assertTrue(all(base == src for _, base in got))
+        only = self.base / "unpacked only"
+        (only / "model.arc").mkdir(parents=True)
+        with self.assertRaises(RiftError) as caught:
+            importer._inputs([only])
+        self.assertIn("no .arc archives", str(caught.exception))
 
 
 if __name__ == "__main__":

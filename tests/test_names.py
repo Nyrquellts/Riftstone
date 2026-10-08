@@ -131,6 +131,7 @@ class FromTheGameTest(unittest.TestCase):
             arc.Entry.from_data(b"charparam\\em\\em0100", t["prp"], test_prp.sample_prp()),
             arc.Entry.from_data(b"charparam\\em\\em0100_cmn", t["prp"], test_prp.sample_prp()),
             arc.Entry.from_data(b"charparam\\em\\em01000_cmn", t["prp"], test_prp.sample_prp()),   # another id
+            arc.Entry.from_data(b"charparam\\em\\em0100", t["rst"], b"x"),                         # its health
             arc.Entry.from_data(b"param\\em0100", t["shl"], b"x"),
             arc.Entry.from_data(b"collision\\em\\e01\\e0100\\e0100_00", t["ocl"], b"x"),
             arc.Entry.from_data(b"model\\em\\e01\\e0100\\e0100", t["mod"], b"x"),
@@ -162,9 +163,9 @@ class FromTheGameTest(unittest.TestCase):
     def test_an_enemys_files_start_with_the_stats_that_hold_the_numbers(self):
         files = names.enemy_files(self.idx, "em0100")
         self.assertEqual([f["path"] for f in files],
-                         ["charparam/em/em0100_cmn.prp", "charparam/em/em0100.prp", "param/em0100.shl",
-                          "collision/em/e01/e0100/e0100_00.ocl", "model/em/e01/e0100/e0100.mod"])
-        self.assertEqual([f["kind"] for f in files][:3], ["stats", "stats", "shells (projectiles)"])
+                         ["charparam/em/em0100_cmn.prp", "charparam/em/em0100.prp", "charparam/em/em0100.rst",
+                          "param/em0100.shl", "collision/em/e01/e0100/e0100_00.ocl", "model/em/e01/e0100/e0100.mod"])
+        self.assertEqual([f["kind"] for f in files][:4], ["stats", "stats", "health", "shells (projectiles)"])
         self.assertEqual(names.enemy_files(self.idx, "em7777"), [])
         self.assertEqual(names.enemy_files(self.idx, "goblin"), [])
 

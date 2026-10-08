@@ -58,8 +58,8 @@ CATALOG: dict[str, dict] = {
     },
     "compat": {
         "title": "Online skills (experimental)",
-        "summary": "Runs Dragon's Dogma Online skills (the Alchemist's) in place of the skills you equip; "
-                   "their files are converted on your computer from your own Online client.",
+        "summary": "Runs Online skills (the Alchemist's) in place of the ones you equip, converted here from "
+                   "your own Online client.",
         "own": True,
     },
     "free_sprint": {
@@ -79,14 +79,26 @@ CATALOG: dict[str, dict] = {
     },
     "stage_enemies": {
         "title": "Enemies in any stage",
-        "summary": "For mod makers: loads an enemy's model in a stage the game never uses it in, so a mod can put an "
-                   "Archydra in the Tower. Does nothing until a stage is listed in its .ini.",
+        "summary": "Loads enemies in stages that never have them (an Archydra in the Tower), as its .ini lists. "
+                   "Mods list them.",
         "own": True,
     },
     "portcrystals": {
         "title": "More Portcrystals",
         "summary": "Place 15 Portcrystals instead of the game's 10 (10 to 32); the ones past ten are kept beside "
                    "your save.",
+        "own": True,
+    },
+    "collision_cap": {
+        "title": "More hit shapes a frame",
+        "summary": "Room for 4096 hit shapes a frame, not the game's 800: a crowded frame (Gran Soren, big "
+                   "monsters) no longer crashes.",
+        "own": True,
+    },
+    "pool_cap": {
+        "title": "Bigger memory pools",
+        "summary": "The game's memory pools for enemies, physics, collision and effects made 4x larger, with a "
+                   "log of refused requests.",
         "own": True,
     },
     LOADER: {
@@ -116,6 +128,15 @@ _RULES: dict[tuple[str, str, str], tuple] = {
     ("compat", "levels", "level3"): ("int", 1, 10),
     ("compat", "test", "level"): ("int", 1, 10),
     ("portcrystals", "portcrystals", "slots"): ("int", 10, 32),
+    ("collision_cap", "collision_cap", "entry_nodes"): ("int", 800, 16384),
+    ("pool_cap", "pool_cap", "unit"): ("int", 64, 1024),
+    ("pool_cap", "pool_cap", "physics"): ("int", 12, 256),
+    ("pool_cap", "pool_cap", "collision"): ("int", 24, 512),
+    ("pool_cap", "pool_cap", "effect"): ("int", 5, 128),
+    ("pool_cap", "pool_cap", "array_string"): ("int", 6, 128),
+    ("pool_cap", "pool_cap", "gui"): ("int", 5, 64),
+    ("pool_cap", "pool_cap", "temp"): ("int", 64, 256),
+    ("pool_cap", "pool_cap", "system"): ("int", 64, 256),
     ("free_sprint", "sprint", "mode"): ("choice", "out_of_battle", "always", "off"),
     ("free_sprint", "sprint", "who"): ("choice", "party", "arisen"),
     ("draw_distance", "draw", "enabled"): ("int", 0, 1),

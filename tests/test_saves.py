@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import struct
 import tempfile
 import time
@@ -501,6 +502,186 @@ class KnowledgeTest(unittest.TestCase):
                 code, text = run("--grant", "--yes")
                 self.assertEqual(code, 0, text)
                 self.assertEqual(saves.knowledge(save.read_bytes(), TABLES)["complete"], 3)
+
+
+SKILLS = saves.SkillTables(first=(0, 10, 10, 100, 20, 30, 30, 100, 40, 50, 60, 70, 60),   # stand-in categories
+                           count=(0, 4, 4, 10, 4, 4, 4, 10, 2, 2, 2, 2, 2))
+
+
+def param_block(level=50, job=7, rank=1, points=100, palettes=None, learned=()) -> str:
+    def arr(name, kind, vals):
+        return (f'<array name="{name}" type="{kind}" count="{len(vals)}">\n'
+                + "".join(f'<{kind} value="{v}"/>\n' for v in vals) + "</array>\n")
+    ranks, nxt, w1 = [1] * 10, [500] * 10, [0] * saves.SKILL_WORDS
+    ranks[job], nxt[job] = rank, 0 if rank == 9 else 800
+    for n in learned:
+        w1[n // 32] |= 1 << (n % 32)
+    stats = dict(zip(saves.STATS, (480.0, 500.0, 500.0, 540.0, 0.0, 100.0, 90.0, 80.0, 70.0)))
+    return ('<class name="mParam" type="cSAVE_DATA_PARAM">\n'
+            + f'<u8 name="mLevel" value="{level}"/>\n<u8 name="mJob" value="{job}"/>\n' + arr("mJobLevel", "u8", ranks)
+            + "".join(arr(f"mWeaponSkill[nWeapon::{w}]", "s16", (palettes or {}).get(w, [-1] * 6)) for w in saves.WEAPONS)
+            + arr("mSkillLv1", "u32", w1) + arr("mSkillLv2", "u32", [0] * saves.SKILL_WORDS)
+            + "".join(f'<f32 name="{n}" value="{v:.6f}"/>\n' for n, v in stats.items())
+            + arr("mJobExp", "u32", [0] * 10) + arr("mJobNextExp", "u32", nxt) + arr("mJobPoint", "s32", [points] * 10)
+            + "</class>\n")
+
+
+def pl_record(name: str, **kw) -> str:
+    return (f'<class name="{name}" type="cSAVE_DATA_PL">\n<class name="mEdit" type="cSAVE_DATA_EDIT">\n'
+            '<u8 name="mHairNo" value="3"/>\n</class>\n' + param_block(**kw) + "</class>\n")
+
+
+def arisen_save(level=50, job=7, rank=1, points=100, palettes=None, learned=(), base_level=48, base_job=5) -> bytes:
+    """An Arisen (a Warrior) in the manual copy, an older Magick Archer in the base copy, a pawn beside each and
+    the system data's copy of the Arisen: only the two mPl records are the Arisen's."""
+    def copy(name, lv, jb):
+        pawn = ('<class type="cSAVE_DATA_CMC">\n' + param_block(30, 3, 2, 100)
+                + '<s32 name="mPawnType" value="1"/>\n</class>\n')
+        return (f'<class name="{name}" type="sSave::playerData">\n'
+                '<class name="mPlCmcEditAndParam" type="sSave::playerEditAndParam">\n'
+                + pl_record("mPl", level=lv, job=jb, rank=rank, points=points, palettes=palettes, learned=learned)
+                + f'<array name="mCmc" type="class" count="1">\n{pawn}</array>\n</class>\n</class>\n')
+    xml = ('<?xml version="1.0" encoding="utf-8"?>\n<class name="dd_savedata1018" type="sSave::saveDataAllDA">\n'
+           + copy("mPlayerDataManual", level, job) + copy("mPlayerDataBase", base_level, base_job)
+           + '<class name="mSystemData" type="sSave::systemData">\n'
+           + pl_record("mLastClearPlayerData", level=level, job=job, rank=rank, points=points, palettes=palettes,
+                       learned=learned) + "</class>\n</class>\n")
+    return saves.pack(xml.encode())
+
+
+class ArisenTest(unittest.TestCase):
+    def test_read(self):
+        data = arisen_save(palettes={"GSWORD": [100, 101, -1, -1, -1, -1]}, learned=(100, 101, 107))
+        seen = saves.arisen(data, SKILLS)
+        self.assertEqual(list(seen), ["mPlayerDataManual", "mPlayerDataBase"])
+        a = seen["mPlayerDataManual"]
+        self.assertEqual((a["level"], a["job"], a["vocation"], a["rank"], max(a["points"])), (50, 7, "Warrior", 1, 100))
+        self.assertEqual(a["skills"]["GSWORD"], {"equipped": [100, 101, -1, -1, -1, -1], "learned": 3, "of": 10})
+        self.assertEqual(a["skills"]["HAMMER"], {"equipped": [-1] * 6, "learned": 3, "of": 10})
+        self.assertEqual((a["stats"]["mHpMax"], a["stats"]["mBasicMgcDefend"]), (500.0, 70.0))
+        b = seen["mPlayerDataBase"]
+        self.assertEqual((b["level"], b["vocation"], list(b["skills"])), (48, "Magick Archer", ["DAGGER", "BOW_MG"]))
+        self.assertNotIn("learned", saves.arisen(data)["mPlayerDataManual"]["skills"]["GSWORD"])   # no tables
+
+    def test_set_changes_both_copies_and_nothing_else(self):
+        data = arisen_save(palettes={"GSWORD": [103, -1, 100, -1, -1, -1]}, learned=(100, 103))
+        edit = saves.ArisenEdit(level=200, rank=9, points=999999, stats={"mHpMax": 5500.0, "mHp": 5500.0}, skills=True)
+        new, n = saves.set_arisen(data, edit, SKILLS)
+        old_lines, new_lines = saves.unpack(data).split(b"\n"), saves.unpack(new).split(b"\n")
+        self.assertEqual(len(old_lines), len(new_lines))
+        changed = [i for i, (a, b) in enumerate(zip(old_lines, new_lines)) if a != b]
+        self.assertEqual(len(changed), n)
+        self.assertTrue(all(new_lines[i].split(b'value="')[0] == old_lines[i].split(b'value="')[0] for i in changed))
+        seen = saves.arisen(new, SKILLS)
+        for copy, r in seen.items():
+            self.assertEqual((r["level"], r["ranks"][7], r["points"], r["stats"]["mHpMax"], r["stats"]["mHp"],
+                              r["stats"]["mStamina"]), (200, 9, [999999] * 10, 5500.0, 5500.0, 540.0), copy)
+        a, b = seen["mPlayerDataManual"], seen["mPlayerDataBase"]
+        # the slots the player chose stay; the empty ones take the lowest unused numbers of the category
+        self.assertEqual(a["skills"]["GSWORD"], {"equipped": [103, 101, 100, 102, 104, 105], "learned": 10, "of": 10})
+        self.assertEqual(a["skills"]["HAMMER"]["equipped"], [100, 101, 102, 103, 104, 105])
+        self.assertEqual((b["job"], b["vocation"]), (5, "Magick Archer"))         # the vocation itself is kept
+        self.assertEqual(b["skills"]["DAGGER"], {"equipped": [-1] * 6, "learned": 0, "of": 4})   # not its weapons
+        xml = saves.unpack(new)
+        manual = xml.split(b'name="mPlayerDataBase"')[0]
+        nxt = manual.split(b'<array name="mJobNextExp" type="u32" count="10">')[1].split(b"</array>")[0]
+        self.assertEqual(nxt.split(b"\n")[1:11], [b'<u32 value="500"/>'] * 7 + [b'<u32 value="0"/>']
+                         + [b'<u32 value="500"/>'] * 2)                                 # rank 9: no next rank
+        self.assertEqual(saves.set_arisen(new, edit, SKILLS), (new, 0))            # nothing left to change
+        pawn = manual.split(b'name="mCmc"')[1]
+        self.assertIn(b'<u8 name="mLevel" value="30"/>', pawn)                      # the pawn beside it: untouched
+        self.assertNotIn(b'value="999999"', pawn)
+        system = xml.split(b'name="mSystemData"')[1]
+        self.assertIn(b'<u8 name="mLevel" value="50"/>', system)                    # the system data's copy: untouched
+        self.assertNotIn(b'value="200"', system)
+        # a vocation and weapons of one's own
+        new2, n2 = saves.set_arisen(data, saves.ArisenEdit(rank=5, vocation=2, skills=True, weapons=("WAND",)), SKILLS)
+        r = saves.arisen(new2, SKILLS)["mPlayerDataManual"]
+        self.assertEqual((r["ranks"][2], r["ranks"][7], n2), (5, 1, 2 * (1 + 4 + 2 * 2)))  # rank, 4 slots, 2 words x 2 tiers
+        self.assertEqual(saves.arisen(new2, SKILLS)["mPlayerDataBase"]["ranks"][2], 5)
+
+    def test_only_values_change(self):
+        """Named scalars (mLevel, a stat) and array entries are the only text an edit touches."""
+        data = arisen_save()
+        xml = saves.unpack(data)
+        new, n = saves.set_arisen(data, saves.ArisenEdit(level=61, stats={"mHpMax": 109.0}), SKILLS)
+        after = saves.unpack(new)
+        values = re.compile(rb'<(f32|u32|u8|s16|s32)(?: name="[^"]*")? value="([^"]*)"/>')
+        blank = rb'<\1 value=""/>'
+        self.assertEqual(values.sub(blank, xml), values.sub(blank, after))
+        changed = [(a.group(2), b.group(2)) for a, b in zip(values.finditer(xml), values.finditer(after))
+                   if a.group(2) != b.group(2)]
+        self.assertEqual(n, len(changed))
+        self.assertEqual(changed, [(b"50", b"61"), (b"500.000000", b"109.000000"), (b"48", b"61"), (b"500.000000", b"109.000000")])
+
+    def test_refusals(self):
+        empty = saves.pack(b'<?xml version="1.0"?>\n<class name="dd_savedata1018" type="x">\n</class>\n')
+        with self.assertRaisesRegex(RiftError, "no Arisen"):
+            saves.arisen(empty)
+        for bad in (dict(level=0), dict(level=201), dict(rank=0), dict(rank=10), dict(points=-1), dict(points=2 ** 31),
+                    dict(stats={"mLuck": 1.0}), dict(stats={"mHp": -1.0}), dict(stats={"mHp": float("nan")}),
+                    dict(weapons=("AXE",)), dict(vocation=0)):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RiftError):
+                    saves.ArisenEdit(**bad)
+        with self.assertRaisesRegex(RiftError, "skill tables"):
+            saves.set_arisen(arisen_save(), saves.ArisenEdit(skills=True))
+        with self.assertRaisesRegex(RiftError, "vocation 0"):
+            saves.set_arisen(arisen_save(job=0), saves.ArisenEdit(level=2))
+        xml = saves.unpack(arisen_save())
+        with self.assertRaisesRegex(FormatError, "as the game writes"):
+            saves.arisen(saves.pack(xml.replace(b'<u8 name="mLevel" value="50"/>', b'<u8 name="mLevel" value="abc"/>', 1)))
+        with self.assertRaisesRegex(FormatError, "as the game writes"):
+            saves.arisen(saves.pack(xml.replace(b'<s16 value="-1"/>', b'<s16 value="-40000"/>', 1)))
+        short = xml.replace(b'<array name="mSkillLv1" type="u32" count="14">\n<u32 value="0"/>\n',
+                            b'<array name="mSkillLv1" type="u32" count="14">\n', 1)
+        with self.assertRaisesRegex(FormatError, "13 values, not 14"):
+            saves.set_arisen(saves.pack(short), saves.ArisenEdit(skills=True), SKILLS)
+        with self.assertRaisesRegex(FormatError, "open"):
+            saves.arisen(saves.pack(xml + b'<class name="x">\n'))
+        self.assertTrue(saves.ArisenEdit().empty)
+        self.assertFalse(saves.ArisenEdit(level=3).empty)
+
+    def test_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Game(Path(tmp) / "game")
+            (game.root / "nativePC" / "rom").mkdir(parents=True)
+            (game.root / "DDDA.exe").write_bytes(b"stub")
+            save = Path(tmp) / "remote" / "DDDA.sav"
+            save.parent.mkdir()
+            save.write_bytes(arisen_save())
+
+            def run(*argv):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    code = cli.main(["saves", "arisen", *argv, "--save", str(save),
+                                     "--folder", str(Path(tmp) / "c"), "--game", str(game.root)])
+                return code, out.getvalue()
+            with mock.patch.object(saves, "skill_tables", lambda exe: SKILLS), \
+                    mock.patch.object(install, "game_running", lambda g: False):
+                code, text = run("--json")
+                self.assertEqual(code, 0, text)
+                self.assertEqual(json.loads(text)["copies"]["mPlayerDataManual"]["skills"]["GSWORD"]["learned"], 0)
+                code, text = run()
+                self.assertEqual(code, 0, text)
+                self.assertIn("Warrior (7) rank 1", text)
+                self.assertEqual(run("--max")[0], 1)                                     # --yes is required
+                self.assertEqual(saves.arisen(save.read_bytes())["mPlayerDataManual"]["level"], 50)
+                code, text = run("--max", "--yes")
+                self.assertEqual(code, 0, text)
+                a = saves.arisen(save.read_bytes(), SKILLS)["mPlayerDataManual"]
+                self.assertEqual((a["level"], a["rank"], max(a["points"]), a["stats"]["mHpMax"], a["stats"]["mStaminaLv"],
+                                  a["skills"]["HAMMER"]["learned"]), (200, 9, 999999, 5500.0, 3860.0, 10))
+                code, text = run("--max", "--yes")
+                self.assertEqual((code, "nothing to change" in text), (0, True), text)
+                code, text = run("--hp", "600", "--stat", "mStaminaLv=10", "--yes")
+                self.assertEqual(code, 0, text)
+                a = saves.arisen(save.read_bytes())["mPlayerDataBase"]
+                self.assertEqual((a["stats"]["mHp"], a["stats"]["mHpMaxWhite"], a["stats"]["mStaminaLv"]), (600.0, 600.0, 10.0))
+                self.assertNotEqual(run("--stat", "mLuck=1", "--yes")[0], 0)
+                self.assertNotEqual(run("--level", "300", "--yes")[0], 0)
+                kept = sorted((Path(tmp) / "c").rglob("*.sav"))
+                self.assertEqual(len(kept), 2, kept)                                     # one copy per write
 
 
 if __name__ == "__main__":

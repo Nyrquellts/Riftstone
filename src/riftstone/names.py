@@ -32,7 +32,7 @@ KINDS: dict[str, str] = {
     "eap": "AI actions",               # help.py: which enemy AI action fires under which conditions
     "sap": "stage AI actions",         # help.py: stage AI actions, gated by scenario and hour
     "fsm": "AI state machine",         # help.py: AI state machine (rAIFSM)
-    "rst": "grab and climb regions",   # help.py: per-creature status regions (grab / climb candidates)
+    "rst": "health",                   # flat.py: mHPMax, a creature's base HP per region (docs/enemy-hp.md)
     "lot": "placements",               # help.py: where enemies, NPCs and objects stand
     "gpl": "groups",                   # help.py: a stage's groups
     "spn": "room names",               # help.py: the stage -> room-name map
@@ -47,8 +47,8 @@ KINDS: dict[str, str] = {
     "ist": "item sets and drops",      # help.py: item sets / drop tables
     "imx": "recipes",                  # help.py
 }
-# the files that shape an enemy, in the order a modder reaches for them: stats, attacks, AI, body
-ENEMY_FILES = ("prp", "ajp", "shl", "ocl", "eap", "gop", "sn2", "stg", "fsm", "rst", "mod")
+# the files that shape an enemy, in the order a modder reaches for them: stats and health, attacks, AI, body
+ENEMY_FILES = ("prp", "rst", "ajp", "shl", "ocl", "eap", "gop", "sn2", "stg", "fsm", "mod")
 FOLDER_FILES = ("ocl", "mod")          # taken from the enemy's model folder too: the body's hit shapes, its models
 LANGUAGES = {"eng": "English", "fre": "French", "ger": "German", "ita": "Italian", "spa": "Spanish",
              "jpn": "Japanese", "zht": "Chinese"}      # the text files' language codes (world.LANGS)
@@ -207,7 +207,7 @@ def enemy_files(idx, em: str) -> list[dict]:
     """The files that shape one enemy -- stats, attacks, AI, its body -- as [{"path", "ext", "kind"}] in
     ENEMY_FILES order: every file whose name carries its id (``em0100``), and its model folder's hit shapes
     and models (``collision/em/e01/e0100/``, ``model/em/e01/e0100/``).  The ``_cmn`` stats come first:
-    they hold the numbers (docs/re-size-scaling.md)."""
+    they hold the numbers (docs/re-size-scaling.md), then the health (``em0100.rst``, docs/enemy-hp.md)."""
     m = re.fullmatch(r"em(\d{4})", str(em).lower())
     if not m:
         return []
