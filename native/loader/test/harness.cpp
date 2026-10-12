@@ -27,6 +27,10 @@
 //   hanglock     some frames, then the main thread holds the loader lock for 6 s and draws nothing
 //   crashhang    some frames, then a thread crashes and the game takes its time to end (as under Windows Error
 //                Reporting): no frames, and no hang report; then frames again and a stop, which is a hang
+//   hangheap     some frames, then none while a thread holds the process heap's lock half the time, until the
+//                driver writes drawagain; then frames ("drew-again"): no report's dump may stop the game
+//   crashheap    a thread holds the process heap's lock half the time, then a fault: the report and its dump
+//                must be written and the process must end
 //   window       creates the game window; prints its style and size, and whether focus loss reached it
 //   addon        loads riftstone_loader.dll the way another loader would
 //   close <how>  a window and a message loop like DDDA's, closed one way (see CloseMode below)
@@ -226,6 +230,22 @@ static DWORD WINAPI CrashLinger(LPVOID) {
     } __except (UnhandledExceptionFilter(GetExceptionInformation())) {
         printf("crash-handed-on\n");
         fflush(stdout);
+    }
+    return 0;
+}
+
+// A thread that holds the process heap's lock half the time (a tick of about 16 ms held, one let go), as the
+// game's allocating threads do between them.  A minidump of the running process suspends it at some moment; when
+// that moment is inside the lock, dbghelp, which allocates, waits for a thread it stopped, for good, and so does
+// every thread of the process (the alt-tab freeze a player reported on 2026-10-12).
+static volatile LONG g_heapHogStop = 0;
+static DWORD WINAPI HeapHog(LPVOID) {
+    HANDLE heap = GetProcessHeap();
+    while (!g_heapHogStop) {
+        HeapLock(heap);
+        for (ULONGLONG until = GetTickCount64() + 1; GetTickCount64() <= until;) YieldProcessor();
+        HeapUnlock(heap);
+        for (ULONGLONG until = GetTickCount64() + 1; GetTickCount64() <= until;) YieldProcessor();
     }
     return 0;
 }
@@ -1475,6 +1495,42 @@ int main(int argc, char** argv) {
         WaitForDone(exe);
         if (dev) dev->Release();
         DestroyWindow(w);
+        return 3;
+    }
+    if (strcmp(mode, "hangheap") == 0) {
+        HWND w = MakeWindow(WS_OVERLAPPEDWINDOW);
+        IDirect3DDevice9* dev = Draw(w, 30, 5);
+        HANDLE hog = CreateThread(NULL, 0, HeapHog, NULL, 0, NULL);
+        printf("ready\n");
+        fflush(stdout);
+        // no frames until the driver has the hang report and its snapshots, all with the heap busy (90 s at most)
+        wchar_t again[MAX_PATH];
+        swprintf_s(again, L"%s\\drawagain", exe);
+        for (int i = 0; i < 1800 && GetFileAttributesW(again) == INVALID_FILE_ATTRIBUTES; i++) Sleep(50);
+        InterlockedExchange(&g_heapHogStop, 1);
+        if (hog) {
+            WaitForSingleObject(hog, 5000);
+            CloseHandle(hog);
+        }
+        for (int i = 0; dev && i < 30; i++) {
+            dev->Present(NULL, NULL, NULL, NULL);
+            Sleep(5);
+        }
+        printf("drew-again\n");
+        fflush(stdout);
+        WaitForDone(exe);
+        if (dev) dev->Release();
+        DestroyWindow(w);
+        return 0;
+    }
+    if (strcmp(mode, "crashheap") == 0) {
+        SetUnhandledExceptionFilter(GameFilter);
+        HANDLE hog = CreateThread(NULL, 0, HeapHog, NULL, 0, NULL);
+        printf("hog %s\n", hog ? "running" : "missing");
+        fflush(stdout);
+        Sleep(300);
+        volatile int* p = (int*)0x10;
+        *p = 1;   // the loader reports with the heap busy, then calls GameFilter, and the process ends
         return 3;
     }
     if (strcmp(mode, "hanglock") == 0) {

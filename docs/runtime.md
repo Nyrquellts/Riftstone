@@ -20,7 +20,7 @@ fixes eleven faults a review found in 0.3.2, each reproduced in the harness firs
 |---|---|---|---|
 | Crash reports | `riftstone\logs\crash-<time>.txt` + `.dmp`: the fault, which plugin or module it is in, the **engine class** of each object in the registers and on the stack (`uEm5200`, `sSetManager`...), memory headroom with a verdict when the game ran out of address space, the stage, the last files opened, the files it looked for and did not find. A stack overflow gets one too (written from a helper thread) | on | both |
 | Fatal-error reports | the game's own "Failed open file" box becomes `fatal-<time>.txt` (the missing file, what it means) and the box gains one line naming it | on | both |
-| Hang reports | no frame for 20 s while the game is in front, or while Windows calls it not responding (since 1.0.2: a frozen fullscreen game is usually behind the desktop by the time its player got out, and one ended at shutdown on 2026-09-27 left no report): `hang-<time>.txt` with where the main thread waits and what the Direct3D device last told the game, and with `minidump = 1` every thread's state in `hang-<time>.dmp`, written on a thread of its own that the watch gives 30 s. The game is not touched | on | both |
+| Hang reports | no frame for 20 s while the game is in front, or while Windows calls it not responding (since 1.0.2: a frozen fullscreen game is usually behind the desktop by the time its player got out, and one ended at shutdown on 2026-09-27 left no report): `hang-<time>.txt` with where the main thread waits and what the Direct3D device last told the game, and with `minidump = 1` every thread's state in `hang-<time>.dmp`, written on a thread of its own that the watch gives 30 s, from a snapshot of the process (since 1.0.5; a dump of the running game could stop it for good, "Minidumps from a snapshot" below). The game is not touched | on | both |
 | **Snapshots** (1.0.2) | `riftstone snapshot` sets `Local\RiftstoneSnapshot-<pid>` (the live thread creates it and checks it every quarter second): the same report as a hang, `snapshot-<time>.txt`, and every thread in `snapshot-<time>.dmp` while the game goes on (its main thread is paused only while its registers and stack are read, and every thread while the dump is written); `riftstone threads` reads any of the loader's dumps and groups the threads by what they are in. Snapshots are not problems: `doctor`, `playtest` and Studio leave them out | with live stats | both |
 | **Why the game closed** | a normal exit leaves no report, so the loader watches it happen: Alt+F4 (and whether the key came from the keyboard or a program), the close button or window menu, a close message from another program, Windows ending the session, the game's own exit menu, its fatal error. `loader.log` gets an `exit` line and the exit summary ends `ended by: ...`; `runtime-state.ini` keeps it; `Riftstone.cmd crash`, `doctor` and Studio's Game tab say it, and whether it was a crash | on | both (the exit menu: DDDA 2364871) |
 | Report rotation | the newest 10 of each kind; `loader.prev.log` keeps the last session's log | on | both |
@@ -277,8 +277,8 @@ safe mode and the window fixes need no engine address at all.
 - **Crashes on several threads at once.** The game's job threads can fault together. At Gran Soren on
   2026-10-06, three crashes left three reports each, stamped within the same second, and 8 of their 9
   minidumps were 0 bytes (only `crash-20261006-150244-3.dmp`, 966,903 bytes, was whole). A stage 220 crash of
-  2026-09-28 left a 0-byte third one too. dbghelp is single-threaded, and a minidump
-  stops the process's other threads while it is written. A thread past the three reports went straight on to
+  2026-09-28 left a 0-byte third one too. dbghelp is single-threaded, and a minidump of the process itself
+  stopped its other threads while it was written (now one comes from a snapshot, below). A thread past the three reports went straight on to
   the game's filter, which ends the process, while the others were still writing. So the reports take turns:
   a crashing thread takes the turn before it writes. After its own report (or none) it waits until no other
   crashing thread is still writing before it calls the game's filter. A hang dump takes the same turn. A
@@ -306,6 +306,38 @@ safe mode and the window fixes need no engine address at all.
   harness's `hanglost` puts stand-ins for Present and TestCooperativeLevel into Windows' own device table,
   under the loader's hooks. It then plays DDDA's lost-device path: one Present that says `D3DERR_DEVICELOST`,
   then only TestCooperativeLevel. The report names the device as lost. In game: UNKNOWN.
+- **Minidumps from a snapshot (1.0.5).** `MiniDumpWriteDump` given the process itself suspends every
+  other thread of it while it writes, then resumes them. dbghelp allocates from the process heap as it writes.
+  When a suspended thread holds that heap's lock (or the loader's), the writer waits for a thread it stopped.
+  The dump stays at 0 bytes and every thread of the game stays suspended. The game never draws or ends again
+  (it can still be ended from outside). A frozen exclusive full-screen game keeps the screen, the likely reason
+  a player of 2026-10-12 could not reach Task Manager and had to sign out.
+  Any hang report (20 s with no frame in front: an alt-tab, a device reset, a present chain compiling its
+  effects), any snapshot and any crash could end that way. A crashing thread wrote its own dump with no time
+  limit, so a crash that hit it never reached the game's filter and never ended.
+  - **Measured** (the loader harness's `dumps`, 2026-10-12): the stand-in game's thread holds the
+    heap lock half the time (one tick of about 16 ms held, one let go). With the 1.0.4 loader, over two runs,
+    3 of 7 dumps froze the game for good: both runs of the hang case ended frozen (the first at its hang
+    report's dump, the second at its first snapshot's), and 1 of 4 crashes never ended (90 s). Ending the
+    frozen stand-in from outside worked each time. With the loader since, over three runs: 24 of 24 dumps
+    written (15 from a hang report or a snapshot, 9 from a crash), the game drawing again and every crash ending.
+  - **On record**: the owner's `hang-20261007-105930.dmp` is 0 bytes (its report says the main thread was idle
+    in the message loop), and so are crash dumps of 2026-10-06 (above).
+  - **Now** every `.dmp` (crash, hang, snapshot) is written from `PssCaptureSnapshot` (kernel32, Windows 8.1 and
+    later): a copy-on-write clone of the address space, threads and their contexts, made in the kernel without
+    stopping a thread. dbghelp reads the clone; the snapshot handle goes to `MiniDumpWriteDump` with a callback
+    that answers `IsProcessSnapshotCallback`, and dbghelp is loaded from System32 (an old copy in the game's
+    folder would not know a snapshot). A crash's dump is written on a helper thread that the crashing thread
+    waits for 30 s at most, so the game's filter always runs; the exception record and context are copied for
+    it. A crashing thread that holds the loader lock writes it itself. Without a snapshot (Windows 7 and 8), or
+    when one fails (a clone needs commit for the game's private memory), there is no `.dmp`, and `loader.log`
+    says why (`no .dmp: ...`, `the .dmp could not be written (error N)`); the report stands without it.
+  - **The harness** (`run_tests.py --only dumps`): with the heap busy, a hang report and four snapshots each
+    get a dump that `minidump.threads` reads back and the game draws again; three crashes each end the
+    process with the access violation, one report and a dump whose exception stream names the fault at the
+    faulting instruction. dbghelp still takes the loader lock while it writes, so a hang with the main thread
+    holding it (`hang-lock`) gets its dump once the lock is let go; held for good, the report stands and
+    `loader.log` says after 30 s that the dump did not finish. In game: UNKNOWN.
 - **Safe mode.** `riftstone\runtime-state.ini` remembers how each session ended; the crash handler
   leaves `riftstone\logs\last-crash.txt` (uptime, faulting module). "Start-up" means the first two
   minutes. A clean exit, or a run past two minutes, resets the count. The setup fingerprint covers

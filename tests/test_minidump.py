@@ -123,8 +123,8 @@ class SnapshotRequestTest(unittest.TestCase):
     def sleep(self, s):
         self.now += s
 
-    def answer(self, dumped=True):
-        """A stand-in loader: the report, its log line, then the dump and the line that says so."""
+    def answer(self, dumped=True, note=None):
+        """A stand-in loader: the report, its log line, then the dump and the line that says so (or `note`)."""
         def signal(pid):
             self.assertEqual(pid, 4242)
             report = self.logs / "snapshot-20260927-190000.txt"
@@ -134,6 +134,8 @@ class SnapshotRequestTest(unittest.TestCase):
                 if dumped:
                     (self.logs / "snapshot-20260927-190000.dmp").write_bytes(dump([WORKER]))
                     f.write("19:00:01.300  snapshot every thread's state written beside it (.dmp)\n")
+                elif note:
+                    f.write(f"19:00:01.300  snapshot {note}\n")
             return True
         return signal
 
@@ -163,6 +165,23 @@ class SnapshotRequestTest(unittest.TestCase):
             runtime.request_snapshot(self.logs, pid=4242, signal=lambda pid: True, timeout=3, clock=self.clock,
                                      sleep=self.sleep)
         self.assertIn("did not write a snapshot in 3 s", str(e.exception))
+
+    def test_the_loader_says_why_there_is_no_dump(self):
+        # The loader since 1.0.5 writes its dumps from a snapshot of the process; without one (Windows 7 and 8), or
+        # when it fails, loader.log says so, and the request ends there instead of waiting out its time.
+        for note in ("no .dmp: it is written from a snapshot of the game, which needs Windows 8.1 or later",
+                     "the .dmp could not be written (error 8); the report stands without it",
+                     "the dump of every thread did not finish in 30 s; the report stands without it"):
+            with self.subTest(note=note):
+                for old in self.logs.glob("snapshot-20260927-190000.*"):
+                    old.unlink()
+                (self.logs / "loader.log").write_text("18:59:00.000  live     snapshots on request\n", encoding="utf-8")
+                self.now = 0.0
+                r = runtime.request_snapshot(self.logs, pid=4242, signal=self.answer(dumped=False, note=note),
+                                             timeout=45, clock=self.clock, sleep=self.sleep)
+                self.assertIsNone(r["dump"])
+                self.assertEqual(r["dump_note"], note)
+                self.assertLess(self.now, 1.0)
 
 
 if __name__ == "__main__":

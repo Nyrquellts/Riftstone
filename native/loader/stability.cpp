@@ -13,7 +13,9 @@
 //   snapshot-<time>.txt (+ .dmp)  asked for from outside while the game runs (riftstone snapshot sets
 //                              Local\RiftstoneSnapshot-<pid>, live.cpp): the same, and the game goes on
 //
-// Only the newest [loader] keep_reports of each kind are kept.
+// Every .dmp is written from a snapshot of the process (Windows 8.1 and later), which stops none of its
+// threads; without one there is no .dmp (SnapshotDump below).  Only the newest [loader] keep_reports of each
+// kind are kept.
 //
 // Safe mode.  riftstone\runtime-state.ini remembers how each session ended.  A plugin whose code
 // was at fault in two start-up crashes (the first two minutes) in a row is skipped until its file
@@ -28,6 +30,7 @@
 #include "runtime.h"
 #include <d3d9.h>
 #include <dbghelp.h>
+#include <processsnapshot.h>
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -293,6 +296,124 @@ typedef BOOL(WINAPI* StackWalk64_t)(DWORD, HANDLE, HANDLE, LPSTACKFRAME64, PVOID
                                     PFUNCTION_TABLE_ACCESS_ROUTINE64, PGET_MODULE_BASE_ROUTINE64, PTRANSLATE_ADDRESS_ROUTINE64);
 typedef BOOL(WINAPI* SymInitialize_t)(HANDLE, PCSTR, BOOL);
 
+// ---- minidumps from a snapshot ------------------------------------------------------------------------
+//
+// MiniDumpWriteDump given the process itself suspends every other thread of it while it writes.  When one of them
+// holds a lock the writer needs (the process heap's, which dbghelp allocates under, or the loader's), the writer
+// waits for a thread it has stopped: the dump stays at 0 bytes and every thread of the game stays suspended for
+// good.  The game then never draws or exits again, and a frozen exclusive full-screen game keeps the screen; a
+// stall of 20 s in front (the hang report's) or any crash could end that way.  In the harness's `dumps` (a thread
+// that holds the heap lock half the time) 3 of 7 dumps written that way froze the stand-in game (docs/runtime.md,
+// "Minidumps from a snapshot"; the owner's hang-20261007-105930.dmp and crash dumps of 2026-10-06 are 0 bytes).
+// So every dump is written from a snapshot: PssCaptureSnapshot clones the address space copy-on-write in the
+// kernel, stopping nothing, and dbghelp reads the clone.  Windows 7 and 8 have no snapshot: no .dmp there.
+typedef DWORD(WINAPI* PssCaptureSnapshot_t)(HANDLE, PSS_CAPTURE_FLAGS, DWORD, HPSS*);
+typedef DWORD(WINAPI* PssFreeSnapshot_t)(HANDLE, HPSS);
+static PssCaptureSnapshot_t g_pssCapture;
+static PssFreeSnapshot_t g_pssFree;
+
+enum { DUMP_FAILED = 0, DUMP_WRITTEN = 1, DUMP_NO_SNAPSHOT = 2 };
+#define DUMP_WAIT_MS 30000                           // the longest a report waits for its dump
+static volatile LONG g_dumpError = 0;                // why the last dump failed (a Win32 error)
+
+static int DumpFailed(DWORD error) {
+    InterlockedExchange(&g_dumpError, (LONG)error);
+    return DUMP_FAILED;
+}
+
+static void LogDump(const wchar_t* kind, int result) {
+    if (result == DUMP_NO_SNAPSHOT)
+        LogLine(L"%-8s no .dmp: it is written from a snapshot of the game, which needs Windows 8.1 or later", kind);
+    else if (result != DUMP_WRITTEN)
+        LogLine(L"%-8s the .dmp could not be written (error %ld); the report stands without it", kind, g_dumpError);
+}
+
+static BOOL CALLBACK SnapshotCallback(PVOID, const PMINIDUMP_CALLBACK_INPUT in, PMINIDUMP_CALLBACK_OUTPUT out) {
+    if (in->CallbackType == IsProcessSnapshotCallback) out->Status = S_FALSE;      // the handle is a snapshot
+    return TRUE;
+}
+
+// The .dmp beside `report` (every thread, and with `ep` the exception raised on `thread`), from a snapshot.
+// dbghelp from System32: an old copy in the game's folder would take the snapshot for a process handle.
+static int SnapshotDump(const wchar_t* report, DWORD thread, EXCEPTION_POINTERS* ep) {
+    if (!g_pssCapture || !g_pssFree) return DUMP_NO_SNAPSHOT;
+    wchar_t lib[MAX_PATH];
+    UINT n = GetSystemDirectoryW(lib, MAX_PATH);
+    if (!n || n >= MAX_PATH - 16) return DumpFailed(GetLastError());
+    wcscat_s(lib, MAX_PATH, L"\\dbghelp.dll");
+    HMODULE dbg = LoadLibraryW(lib);
+    auto dump = dbg ? (MiniDumpWriteDump_t)GetProcAddress(dbg, "MiniDumpWriteDump") : NULL;
+    if (!dump) return DumpFailed(GetLastError());
+    HPSS snap = NULL;
+    DWORD err = g_pssCapture(GetCurrentProcess(),
+                             (PSS_CAPTURE_FLAGS)(PSS_CAPTURE_VA_CLONE | PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT |
+                                                 PSS_CREATE_BREAKAWAY_OPTIONAL | PSS_CREATE_BREAKAWAY |
+                                                 PSS_CREATE_RELEASE_SECTION | PSS_CREATE_USE_VM_ALLOCATIONS),
+                             CONTEXT_ALL, &snap);
+    if (err != ERROR_SUCCESS) return DumpFailed(err);
+    wchar_t path[MAX_PATH];
+    HANDLE d = OpenDump(report, path);
+    BOOL ok = FALSE;
+    if (d != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei = {thread, ep, FALSE};
+        MINIDUMP_CALLBACK_INFORMATION cb = {SnapshotCallback, NULL};
+        ok = dump((HANDLE)snap, GetCurrentProcessId(), d,
+                  (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory | MiniDumpWithThreadInfo),
+                  ep ? &mei : NULL, NULL, &cb);
+        if (!ok) DumpFailed(GetLastError());
+        CloseHandle(d);
+    } else {
+        DumpFailed(GetLastError());
+    }
+    g_pssFree(GetCurrentProcess(), snap);
+    return ok ? DUMP_WRITTEN : DUMP_FAILED;
+}
+
+// A crash's dump on a helper thread, so that the crashing thread waits DUMP_WAIT_MS for it at most and then goes on
+// to the game's filter.  The exception is copied: the helper may outlive the frame that holds it.  The crashing thread
+// holding the loader lock writes it itself (a new thread cannot start until that lock is free).
+static BOOL HoldsLoaderLock();
+static volatile LONG g_crashDumpBusy = 0;            // a helper is still writing a crash's dump
+static wchar_t g_crashDumpFor[MAX_PATH];
+static DWORD g_crashDumpThread;
+static EXCEPTION_RECORD g_crashDumpRecord;
+static CONTEXT g_crashDumpContext;
+static EXCEPTION_POINTERS g_crashDumpPointers;
+
+static DWORD WINAPI CrashDumpThread(LPVOID) {
+    DWORD r = (DWORD)SnapshotDump(g_crashDumpFor, g_crashDumpThread, &g_crashDumpPointers);
+    InterlockedExchange(&g_crashDumpBusy, 0);
+    return r;
+}
+
+static void CrashDump(const wchar_t* report, EXCEPTION_POINTERS* ep, DWORD thread) {
+    if (HoldsLoaderLock()) {
+        LogDump(L"crash", SnapshotDump(report, thread, ep));
+        return;
+    }
+    if (InterlockedExchange(&g_crashDumpBusy, 1)) {
+        LogLine(L"crash    no .dmp: an earlier crash's is still being written");
+        return;
+    }
+    wcscpy_s(g_crashDumpFor, MAX_PATH, report);
+    g_crashDumpThread = thread;
+    g_crashDumpRecord = *ep->ExceptionRecord;
+    g_crashDumpContext = *ep->ContextRecord;
+    g_crashDumpPointers.ExceptionRecord = &g_crashDumpRecord;
+    g_crashDumpPointers.ContextRecord = &g_crashDumpContext;
+    HANDLE t = CreateThread(NULL, 1024 * 1024, CrashDumpThread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!t) {
+        InterlockedExchange(&g_crashDumpBusy, 0);
+        LogLine(L"crash    no .dmp: no thread to write it (error %lu)", GetLastError());
+        return;
+    }
+    DWORD code = DUMP_FAILED;
+    BOOL done = WaitForSingleObject(t, DUMP_WAIT_MS) == WAIT_OBJECT_0 && GetExitCodeThread(t, &code);
+    CloseHandle(t);
+    if (!done) LogLine(L"crash    the .dmp did not finish in %d s; the report stands without it", DUMP_WAIT_MS / 1000);
+    else LogDump(L"crash", (int)code);
+}
+
 // The report of the exception `ep`, raised on thread `thread` (this one, or one that waits for this).
 static void WriteCrashReport(EXCEPTION_POINTERS* ep, DWORD thread) {
     wchar_t stamp[32], path[MAX_PATH], where[MAX_PATH], faultModule[MAX_PATH];
@@ -368,19 +489,7 @@ static void WriteCrashReport(EXCEPTION_POINTERS* ep, DWORD thread) {
     ModulesSection(f);
     CloseHandle(f);
     LogLine(L"crash    report written to %s", path);
-    if (g_minidump && dbg) {
-        auto dump = (MiniDumpWriteDump_t)GetProcAddress(dbg, "MiniDumpWriteDump");
-        wchar_t report[MAX_PATH];
-        wcscpy_s(report, MAX_PATH, path);
-        HANDLE d = OpenDump(report, path);
-        if (dump && d != INVALID_HANDLE_VALUE) {
-            MINIDUMP_EXCEPTION_INFORMATION mei = {thread, ep, FALSE};
-            dump(GetCurrentProcess(), GetCurrentProcessId(), d,
-                 (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory | MiniDumpWithThreadInfo),
-                 &mei, NULL, NULL);
-        }
-        if (d != INVALID_HANDLE_VALUE) CloseHandle(d);
-    }
+    if (g_minidump) CrashDump(path, ep, thread);
 }
 
 // Exceptions that are not crashes: debugger traffic, and the probes anti-tamper wrappers raise on
@@ -413,8 +522,9 @@ static BOOL NotACrash(const EXCEPTION_RECORD* er) {
 #define HELPER_WAIT_MS 30000                         // the longest the crashing thread waits for it
 
 // One report at a time.  The game's job threads fault together (three reports in the same moment at Gran
-// Soren, 2026-10-06, three times): dbghelp is single-threaded and a minidump stops the process's other threads
-// while it is written, and every one of those dumps but at most one came out empty.  So a crashing thread
+// Soren, 2026-10-06, three times): dbghelp is single-threaded and a minidump of the process itself stopped its
+// other threads while it was written (now one is written from a snapshot, which stops nothing), and every one
+// of those dumps but at most one came out empty.  So a crashing thread
 // takes the turn before it writes, and after its own report (or none: past three, or no turn in time) it
 // waits until no other crashing thread is still writing, since the game's filter it calls next ends the
 // process; the thread past the three reports used to end it while the others wrote (crashrace in the
@@ -671,25 +781,16 @@ static int WINAPI Hook_MessageBoxA(HWND owner, LPCSTR text, LPCSTR caption, UINT
 // ---------------------------------------------------------------------------
 // hangs
 
-// The hang's minidump, written on a thread of its own: MiniDumpWriteDump (and loading dbghelp) can wait for a
-// lock the stuck game holds, and the watch that called it must go on.  One at a time: the watch writes one
+// The hang's minidump (from a snapshot, SnapshotDump), written on a thread of its own: loading dbghelp can wait
+// for a lock the stuck game holds, and the watch that called it must go on.  One at a time: the watch writes one
 // report a hang.
 static wchar_t g_hangDumpFor[MAX_PATH];
 
 static DWORD WINAPI HangDumpThread(LPVOID) {
-    if (!TakeReportTurn(GetTickCount64() + 10000)) return 0;     // a crash report is being written
-    HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
-    auto dump = dbg ? (MiniDumpWriteDump_t)GetProcAddress(dbg, "MiniDumpWriteDump") : NULL;
-    wchar_t path[MAX_PATH];
-    HANDLE d = OpenDump(g_hangDumpFor, path);
-    BOOL ok = FALSE;
-    if (dump && d != INVALID_HANDLE_VALUE)
-        ok = dump(GetCurrentProcess(), GetCurrentProcessId(), d,
-                  (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory | MiniDumpWithThreadInfo),
-                  NULL, NULL, NULL);
-    if (d != INVALID_HANDLE_VALUE) CloseHandle(d);
+    if (!TakeReportTurn(GetTickCount64() + 10000)) return DumpFailed(ERROR_BUSY);     // a crash report is being written
+    int r = SnapshotDump(g_hangDumpFor, 0, NULL);
     GiveReportTurn();
-    return ok ? 1 : 0;
+    return (DWORD)r;
 }
 
 // What the graphics device and the main loop's own gates said when the frames stopped: stuck, or waiting for its
@@ -820,10 +921,12 @@ static void ThreadReport(const wchar_t* kind, const wchar_t* title, const wchar_
         wcscpy_s(g_hangDumpFor, path);
         HANDLE t = CreateThread(NULL, 0, HangDumpThread, NULL, 0, NULL);
         if (t) {
-            DWORD code = 0;
-            BOOL done = WaitForSingleObject(t, 30000) == WAIT_OBJECT_0 && GetExitCodeThread(t, &code) && code;
-            LogLine(done ? L"%-8s every thread's state written beside it (.dmp)"
-                         : L"%-8s the dump of every thread did not finish in 30 s; the report stands without it", kind);
+            DWORD code = DUMP_FAILED;
+            BOOL done = WaitForSingleObject(t, DUMP_WAIT_MS) == WAIT_OBJECT_0 && GetExitCodeThread(t, &code);
+            if (!done) LogLine(L"%-8s the dump of every thread did not finish in %d s; the report stands without it", kind,
+                               DUMP_WAIT_MS / 1000);
+            else if (code == DUMP_WRITTEN) LogLine(L"%-8s every thread's state written beside it (.dmp)", kind);
+            else LogDump(kind, (int)code);
             CloseHandle(t);
         }
     }
@@ -845,7 +948,7 @@ void WriteHangReport(DWORD thread, DWORD seconds, BOOL notResponding) {
                  L"stop or change the game. If it recovers, it was a long load; if not, this is where its main\r\n"
                  L"thread was waiting%s.",
                  seconds, notResponding ? L"and stopped answering Windows (\"not responding\")" : L"while it was the window in front",
-                 g_minidump ? L", and the .dmp beside this report holds every thread" : L"");
+                 g_minidump && g_pssCapture ? L", and the .dmp beside this report holds every thread" : L"");
     _snwprintf_s(logged, _countof(logged), _TRUNCATE, L"no frame for %lu s%s", seconds,
                  notResponding ? L", not responding" : L"");
     ThreadReport(L"hang", L"Riftstone hang report", intro, logged, thread, g_minidump);
@@ -1113,7 +1216,13 @@ void StabilityStart() {
     _snwprintf_s(g_stateIni, _countof(g_stateIni), _TRUNCATE, L"%s\\runtime-state.ini", g_stateDir);
     _snwprintf_s(g_marker, _countof(g_marker), _TRUNCATE, L"%s\\last-crash.txt", g_logDir);
     if (g_inFilter == TLS_OUT_OF_INDEXES) g_inFilter = TlsAlloc();
-    g_stackLimits = (StackLimits_t)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetCurrentThreadStackLimits");
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    g_stackLimits = (StackLimits_t)GetProcAddress(k32, "GetCurrentThreadStackLimits");
+    g_pssCapture = (PssCaptureSnapshot_t)GetProcAddress(k32, "PssCaptureSnapshot");      // Windows 8.1 and later
+    g_pssFree = (PssFreeSnapshot_t)GetProcAddress(k32, "PssFreeSnapshot");
+    if (g_minidump && (!g_pssCapture || !g_pssFree))
+        LogLine(L"loader   no .dmp beside crash and hang reports: they are written from a snapshot of the game, which "
+                L"needs Windows 8.1 or later (a dump of the running game stops its threads)");
     Rotate(L"crash");
     Rotate(L"fatal");
     Rotate(L"hang");

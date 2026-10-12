@@ -17,7 +17,7 @@
 #include <windows.h>
 #include <stdint.h>
 
-#define RIFTSTONE_VERSION_A "1.0.4"             // the one version: the log, reports, the live page, the panel
+#define RIFTSTONE_VERSION_A "1.0.5"             // the one version: the log, reports, the live page, the panel
 #define RIFTSTONE_LOADER_VERSION L"" RIFTSTONE_VERSION_A
 
 // ---- loader.cpp -------------------------------------------------------------------------------

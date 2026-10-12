@@ -146,7 +146,8 @@ def _open_mapping(name: str) -> bytes | None:
 
 SNAPSHOT_EVENT = "Local\\RiftstoneSnapshot-{pid}"     # live.cpp creates it (auto-reset); one set, one snapshot
 _DUMP_NOTE = re.compile(r"snapshot\s+(every thread's state written beside it \(\.dmp\)"
-                        r"|the dump of every thread did not finish in 30 s[^\r\n]*)")
+                        r"|the dump of every thread did not finish in \d+ s[^\r\n]*"
+                        r"|no \.dmp:[^\r\n]*|the \.dmp could not be written[^\r\n]*)")   # since 1.0.5: none, or it failed
 
 
 def _signal_snapshot(pid: int) -> bool:

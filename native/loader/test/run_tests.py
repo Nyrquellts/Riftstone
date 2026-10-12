@@ -32,6 +32,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from ctypes import wintypes
 from pathlib import Path
@@ -733,6 +734,16 @@ def test_live(work: Path) -> None:
                 plain = text.replace("\r\n", "\n")
                 check(rep["device"].get("present") == "D3D_OK" and "\nplugins\n" in plain and "\nlast files opened" in plain,
                       "the device, plugins and files sections are there too")
+            # dbghelp takes the loader lock while it writes, even from a snapshot: the dump waits for the lock, not
+            # for a thread it stopped, so it is written once the stand-in lets the lock go (6 s after "ready")
+            line = "hang     every thread's state written beside it (.dmp)"
+            deadline = time.time() + 30
+            while line not in log_of(root) and time.time() < deadline:
+                time.sleep(0.25)
+            dmp = found[0].with_suffix(".dmp") if found else None
+            ts = minidump.threads(dmp.read_bytes()) if dmp and dmp.is_file() and dmp.stat().st_size else []
+            check(line in log_of(root) and len(ts) >= 3,
+                  f"the hang report's dump waits for the loader lock and is written once it is let go ({len(ts)} threads)")
         else:
             print("  skip  Direct3D 9 could not draw on this machine; the loader lock case not checked")
     finally:
@@ -788,6 +799,116 @@ def test_live(work: Path) -> None:
     finally:
         (root / "done").write_text("")
         p.wait(timeout=60)
+
+
+class _Lines:
+    """A stand-in's output, read on a thread of its own: waiting for a line keeps its deadline when the process froze
+    (a plain readline would wait with it)."""
+
+    def __init__(self, p: subprocess.Popen):
+        self.lines: list[str] = []
+        self._p = p
+        self._t = threading.Thread(target=self._read, daemon=True)
+        self._t.start()
+
+    def _read(self) -> None:
+        for line in self._p.stdout:
+            self.lines.append(line.strip())
+
+    def wait(self, want: str, timeout: float) -> bool:
+        end = time.time() + timeout
+        while time.time() < end and want not in self.lines and self._t.is_alive():
+            time.sleep(0.05)
+        return want in self.lines
+
+
+def _dump_exception(d: bytes) -> tuple[int, int, int, int] | None:
+    """A minidump's exception stream (MINIDUMP_EXCEPTION_STREAM): thread id, code, address, its context's EIP."""
+    at, size = minidump._streams(d).get(6, (0, 0))
+    if size < 168:
+        return None
+    tid, code = struct.unpack_from("<I4xI", d, at)
+    address = struct.unpack_from("<Q", d, at + 24)[0]
+    ctx_size, ctx_rva = struct.unpack_from("<II", d, at + 160)
+    eip = (struct.unpack_from("<I", d, ctx_rva + minidump.X86_CONTEXT_EIP)[0]
+           if ctx_size >= minidump.X86_CONTEXT_EIP + 4 and ctx_rva + ctx_size <= len(d) else 0)
+    return tid, code, address, eip
+
+
+def test_dumps(work: Path) -> None:
+    # A minidump of the running process suspends its other threads while it is written.  One stopped inside the
+    # process heap's lock left dbghelp, which allocates, waiting for it for good, and every thread of the game with it:
+    # the dump stayed at 0 bytes and the game never drew or ended again (a player's alt-tab freeze with ReShade,
+    # 2026-10-12: the screen froze and Task Manager could not end the game; the owner's 0-byte hang and crash dumps).
+    # The loader writes every dump from a snapshot of the process, which stops nothing.  The stand-in's thread holds
+    # the heap lock half the time; the 1.0.4 loader froze it at 3 of 7 dumps over two runs (docs/runtime.md).
+    print("a minidump never stops the game (a thread holding the heap lock): hang report and four snapshots")
+    root = game(work / "hang-heap", ini="[live]\nhang_seconds = 2\nhang_needs_front = 0\n")
+    logs = root / "riftstone" / "logs"
+    p = subprocess.Popen([str(root / "DDDA.exe"), "hangheap"], cwd=root, stdout=subprocess.PIPE, text=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    out = _Lines(p)
+    frozen = False
+    try:
+        out.wait("ready", 60)
+        drew = any(s.startswith("presented") for s in out.lines)
+        if drew:
+            time.sleep(3.0)                          # the hang report at 2 s, and its dump
+            snaps = []
+            for i in range(4):
+                try:
+                    snaps.append(runtime.request_snapshot(logs, pid=p.pid, timeout=40))
+                except Exception as e:               # noqa: BLE001 -- reported as a failed check
+                    check(False, f"snapshot {i + 1} with the heap busy ({e})")
+                    break
+            (root / "drawagain").write_text("")
+            frozen = not out.wait("drew-again", 30)
+            check(not frozen, "the game draws again after its hang report and four snapshots with the heap busy")
+            found = reports(root, "hang")
+            check(len(found) == 1, f"one hang report ({len(found)})")
+            dumps = [f.with_suffix(".dmp") for f in found] + [s["dump"] for s in snaps if s["dump"]]
+            check(len(snaps) == 4 and all(s["dump_note"] == "every thread's state written beside it (.dmp)" for s in snaps),
+                  f"every snapshot's dump written ({[s['dump_note'] for s in snaps]})")
+            check("hang     every thread's state written beside it (.dmp)" in log_of(root),
+                  "the hang report's dump written")
+            for d in dumps:
+                ts = minidump.threads(d.read_bytes()) if d.is_file() and d.stat().st_size else []
+                check(len(ts) >= 3 and any("DDDA.exe" in t.where or any("DDDA.exe" in f for f in t.frames) for t in ts),
+                      f"{d.name} reads back ({len(ts)} threads, the stand-in game's among them)")
+        else:
+            print("  skip  Direct3D 9 could not draw on this machine; the hang dump with the heap busy not checked")
+    finally:
+        (root / "done").write_text("")
+        (root / "drawagain").write_text("")
+        try:
+            p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            frozen = True
+            p.kill()
+            p.wait(timeout=30)
+        check(not frozen, "the stand-in game ends by itself")
+
+    print("a crash's minidump with the heap lock held half the time, and the game still ends")
+    for n in range(3):
+        root = game(work / f"crash-heap-{n}")
+        code, r, raw = run(root, "crashheap")
+        check(r.get("hog") == "running" and is_crash_code(code),
+              f"run {n + 1}: the process ends with the access violation (got "
+              f"{'no end in 90 s: frozen' if code == TIMED_OUT else hex(code)})")
+        check("game-filter-called" in raw, f"run {n + 1}: the game's own filter runs after the report")
+        found = reports(root, "crash")
+        dumps = sorted((root / "riftstone/logs").glob("crash-*.dmp"))
+        check(len(found) == 1 and len(dumps) == 1 and dumps[0].stat().st_size > 4096,
+              f"run {n + 1}: one report and its minidump ({[d.stat().st_size for d in dumps]})")
+        if dumps and dumps[0].stat().st_size > 4096:
+            d = dumps[0].read_bytes()
+            exc = _dump_exception(d)
+            game_mod = [m for m in minidump.modules(d) if m[2].lower().endswith("ddda.exe")]
+            ids = {t.id for t in minidump.threads(d)}
+            check(exc is not None and exc[1] == 0xC0000005 and exc[3] == exc[2] and exc[0] in ids
+                  and any(b <= exc[2] < b + size for b, size, _ in game_mod),
+                  f"run {n + 1}: its exception: the access violation, at the faulting instruction in the game, on a "
+                  f"thread of the dump ({exc and [hex(v) for v in exc]})")
 
 
 def test_window(work: Path) -> None:
@@ -2066,7 +2187,7 @@ def test_from_archives(work: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--work")
-    ap.add_argument("--only", help="comma-separated test names (files,reset,hooks,dinputchain,crash,crashrace,"
+    ap.add_argument("--only", help="comma-separated test names (files,reset,hooks,dinputchain,crash,crashrace,dumps,"
                                    "overflow,filters,crashoff,rotation,quarantine,names,safe,state,live,cap,guard,window,"
                                    "saves,foreignsaves,exit,overlay,d3d9,d3d9bench,chain,dxvk,memory,other,engine,"
                                    "archives)")
@@ -2083,7 +2204,7 @@ def main() -> int:
     base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="run-", dir=base))
     tests = {"files": test_files, "reset": test_reset_plugins_off_addon, "hooks": test_foreign_hooks,
-             "dinputchain": test_chain_self, "crash": test_crash, "crashrace": test_crash_race,
+             "dinputchain": test_chain_self, "crash": test_crash, "crashrace": test_crash_race, "dumps": test_dumps,
              "overflow": test_stack_overflow,
              "filters": test_filter_chain, "crashoff": test_crash_reports_off, "rotation": test_rotation,
              "quarantine": test_quarantine, "names": test_plugin_names, "safe": test_safe_mode,

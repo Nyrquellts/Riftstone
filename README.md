@@ -46,13 +46,18 @@ save backup are on); `Riftstone - Start Here.cmd` turns each one on when you wan
   Archydra, Chimeras and Drakes together, say), and installing a mod writes those lines for it.
 - **Bigger memory pools** (1.0.4, off) — the game's fixed pools for enemies, physics, collision and effects
   made larger before the game builds them, and every request a full pool refuses logged.
+- **Reports that never freeze the game** (1.0.5) — after a crash, or 20 seconds with no frame while the game
+  is in front, the loader writes a report with every thread's state. 1.0.4 paused the game to write it and
+  could freeze it for good (an alt-tab with ReShade); 1.0.5 writes it from a snapshot of the game, which
+  pauses nothing.
 
 > **Honesty:** every plugin is verified in a test harness against the *real* game code; their *in-game
 > feel* is still being playtested. The file-format toolkit below, by contrast, is byte-for-byte proven
 > across the entire game. The start-up notice (1.0.3) has been drawn in the actual game (`loader.log`,
 > 2026-10-07). Of 1.0.4's: the collision guard has patched the game in play (its log); an Archydra, Chimeras
 > and Drakes loading together in a stage that never had them are proven in the test harness, not yet seen in
-> game.
+> game. 1.0.5's reports are proven in the harness (24 of 24 written while a thread held the game's memory
+> lock, where 1.0.4 froze at 3 of 7), not yet in game.
 
 **2. A full modding toolkit (Studio)** — a local browser app (sends nothing anywhere), or the CLI:
 

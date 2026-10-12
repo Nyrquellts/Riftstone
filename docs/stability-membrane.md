@@ -268,6 +268,28 @@ the frames (every result fine, every gate open) each show up differently there. 
 game only asks TestCooperativeLevel. Which case the 14:42 hang was is UNKNOWN until a hang under this loader
 is reported.
 
+## A report's dump that froze the game for good (loader, 2026-10-12)
+
+A player reported on 2026-10-12 that with Riftstone and ReShade's `d3d9.dll`, chained or not, an alt-tab and back
+froze the screen, and Task Manager could not end the game (only signing out did). The owner's
+`hang-20261007-105930` (108 s in, no frame for 33 s, the main thread in a window-message call under Steam's
+overlay) has a 0-byte `.dmp`, and so do crash dumps of 2026-10-06.
+
+The loader's part in it: every `.dmp` was written by `MiniDumpWriteDump` on the running process, which suspends
+every other thread while it writes. With one of them suspended inside the process heap's lock, dbghelp waited for
+it for good, and the whole game stayed suspended. The stand-in game under the 1.0.4 loader, with a thread that
+holds the heap lock half the time, froze for good at 3 of 7 dumps over two runs, and was caught with 12 of its 14
+threads suspended; ending the process from outside still worked (the harness's kill). A frozen exclusive full-screen game keeps the screen, the likely
+reason Task Manager could not be reached (for that player: UNKNOWN). So any stall of 20 s with the game in front
+(the hang report's), or any crash, could turn into a freeze that no frame and no exit ever ended. Since 2026-10-12
+every dump is written from a process snapshot, which stops nothing (`docs/runtime.md`, "Minidumps from a
+snapshot"; the harness's `dumps`).
+
+What stopped the frames after the player's alt-tab in the first place (ReShade's reset of its effects, the device
+lost and reset, the game counting itself inactive) is UNKNOWN until that player's `loader.log`, hang report and
+ReShade log are read. The loader holds nothing of the game's device across a reset (the panel releases its
+surfaces after each draw and its state block before `Reset`).
+
 ## Crash reports from several threads at once (loader, 2026-10-07)
 
 At Gran Soren the game's job threads faulted together, and only one of the nine minidumps of those three
