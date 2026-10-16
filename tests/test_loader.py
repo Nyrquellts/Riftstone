@@ -44,6 +44,74 @@ class PluginTest(unittest.TestCase):
         self.assertEqual((d / "lod_tuner.asi").read_bytes(), b"v2")
         self.assertEqual((d / "lod_tuner.ini").read_text(encoding="utf-8"), "[lod]\nPopPixels = 8\n")
 
+    def test_an_update_brings_new_settings_and_keeps_the_owners(self):
+        # 1.0.6's lod_tuner added FadeSeconds; an update through `loader plugin add` kept the owner's file as it was,
+        # so the new setting never showed (Studio's update merged).  Now both merge.
+        (self.build / "lod_tuner.asi").write_bytes(b"v1")
+        (self.build / "lod_tuner.ini").write_bytes(b"[lod]\r\nPopPixels = 24\r\nFarthest = high\r\n")
+        loader.add_plugin(self.game, self.build / "lod_tuner.asi")
+        d = loader.plugins_dir(self.game)
+        (d / "lod_tuner.ini").write_bytes(b"[lod]\r\nPopPixels = 8\r\nFarthest = lod\r\n")
+        (self.build / "lod_tuner.ini").write_bytes(
+            b"[lod]\r\nPopPixels = 24\r\nFarthest = high\r\n\r\n; seconds per swap\r\nFadeSeconds = 0.75\r\n")
+        loader.add_plugin(self.game, self.build / "lod_tuner.asi")
+        self.assertEqual((d / "lod_tuner.ini").read_bytes(),
+                         b"[lod]\r\nPopPixels = 8\r\nFarthest = lod\r\n\r\n; seconds per swap\r\nFadeSeconds = 0.75\r\n")
+        self.assertEqual([p.name for p in d.iterdir() if p.name.endswith(".riftstone-tmp")], [])
+
+    def test_a_section_the_template_has_is_not_added_again(self):
+        # fuzz finding plugin_update-invariant-075e94aa6562: a section the template declares without keys was added
+        # again at the end of every update (the second update changed the file).
+        template = "[a]\n[a]\n[b]\nn = 2\n"
+        once = loader.merge_ini(template, "k = 1\nK = 5\nmine = yes\n[c]\nx = 1\n")
+        self.assertEqual(once, "[a]\n[a]\n[b]\nn = 2\n\n[c]\nx = 1\n")
+        self.assertEqual(loader.merge_ini(template, once), once)
+        self.assertEqual(loader.merge_ini("[a]\n; none yet\n[b]\nn = 2\n", "[a]\nmine = 1\n"),
+                         "[a]\n; none yet\nmine = 1\n[b]\nn = 2\n")
+
+    def test_a_templates_line_stays_as_written_when_its_value_is_kept(self):
+        # fuzz finding plugin_update-invariant-113ce00dfc75: a template line not spelled "key = value" was copied as
+        # it is the first time and respelled the next, since the owner then "had" the key.
+        template = "[a]\nk=1\nj =2\n"
+        once = loader.merge_ini(template, "[a]\nj = 5\n")
+        self.assertEqual(once, "[a]\nk=1\nj = 5\n")
+        self.assertEqual(loader.merge_ini(template, once), once)
+        self.assertEqual(loader.merge_ini(template, "[a]\nk = 1\n"), template)
+
+    def test_only_the_first_of_a_repeated_key_takes_the_owners_value(self):
+        # fuzz finding plugin_update-invariant-9967a95d674a: a key the template gives twice in a section (Windows
+        # reads the first) took the owner's value at the second the next time.  The same for a repeated section.
+        template = "[lod]\nPopPixels = 24\nFarthest = high\nPopPixels = 1.0\n"
+        once = loader.merge_ini(template, "[lod]\nFarthest = lod\n")
+        self.assertEqual(once, "[lod]\nPopPixels = 24\nFarthest = lod\nPopPixels = 1.0\n")
+        self.assertEqual(loader.merge_ini(template, once), once)
+        self.assertEqual(loader.merge_ini("[a]\nk = 1\n[a]\nk = 2\n", "[a]\nk = 9\n"), "[a]\nk = 9\n[a]\nk = 2\n")
+
+    def test_an_empty_ini_of_the_builds_arrives(self):
+        # fuzz crash in plugin_update (the merge's first version): an empty build ini and no owner's file wrote nothing.
+        (self.build / "p.asi").write_bytes(b"MZ")
+        (self.build / "p.ini").write_bytes(b"")
+        loader.add_plugin(self.game, self.build / "p.asi")
+        self.assertEqual((loader.plugins_dir(self.game) / "p.ini").read_bytes(), b"")
+
+    def test_a_section_with_no_name_is_merged_like_the_others(self):
+        # fuzz finding plugin_update-invariant-c73371ef76bc: keys under "[]" were copied as they were and then added
+        # again from the owner's file at every update.
+        once = loader.merge_ini("[]\nPopPixels = 24\n", "[]\nPopPixels = 8\n[lod]\nx = 1\n")
+        self.assertEqual(once, "[]\nPopPixels = 8\n\n[lod]\nx = 1\n")
+        self.assertEqual(loader.merge_ini("[]\nPopPixels = 24\n", once), once)
+
+    def test_a_default_the_owners_code_page_lacks_arrives_as_windows_writes_it(self):
+        # fuzz finding plugin_update-invariant-8d1bda0979fd (the target's check, not the merge): the owner's file is
+        # in the code page, so a new default it cannot hold is written as '?', as WritePrivateProfileStringA would.
+        (self.build / "p.asi").write_bytes(b"MZ")
+        (self.build / "p.ini").write_bytes(b"\xff\xfe" + "[backup]\r\nFolder = D:\\\u65e5\u672c\r\n".encode("utf-16-le"))
+        d = loader.plugins_dir(self.game)
+        d.mkdir(parents=True)
+        (d / "p.ini").write_bytes(b"[lod]\r\nPopPixels = 8\r\n")
+        loader.add_plugin(self.game, self.build / "p.asi")
+        self.assertEqual((d / "p.ini").read_bytes(), b"[backup]\r\nFolder = D:\\??\r\n\r\n[lod]\r\nPopPixels = 8\r\n")
+
     def test_built_loader_skips_an_unreadable_dll(self):
         # A dinput8.dll that is present but momentarily unreadable -- locked by a build in flight or an AV scan --
         # must not crash callers such as Studio's API (fuzz finding studio-crash-c1770614807c: PermissionError out

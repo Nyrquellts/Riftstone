@@ -1,6 +1,6 @@
 """Round-trip every vanilla resource Riftstone claims to understand; report exact results.
 
-    python tools/check_corpus.py [--game PATH] [--only arc,xfs,yaml,ocl,gmd,itl,lot,arcs,tables,flat,gpl,tex,mrl,prp,ean,lmt,weather,lcm,sound,effect,ddo_params,ndp,fca,msgset,sdl,zon,sbc,fsm,nav] [--out report.json]
+    python tools/check_corpus.py [--game PATH] [--only arc,xfs,yaml,ocl,gmd,itl,lot,arcs,tables,flat,gpl,tex,mrl,prp,ean,lmt,weather,lcm,sound,effect,ddo_params,ndp,fca,msgset,sdl,zon,sbc,fsm,nav] [--out report.json] [--jobs N]
 
 --only takes the check names below (and epv, efl, e2d, efs for that part of the effect check); a name that
 is no check is refused (exit 2) rather than silently running nothing.  A check that does not apply to the
@@ -55,6 +55,20 @@ fsm   every AI state machine: the readable view and fsmcheck (the game's own tra
 nav   every navigation mesh: parse -> build, compare bytes; each link's cost against its triangles' centroids;
       links that have their reverse counted; nav.NAV_OF against DDDA.exe's stage table (Dark Arisen)
 
+The checks run as processes side by side (--jobs N at a time, one per CPU up to 16 unless told; --jobs 1 runs them one
+after another in this process): the long ones (xfs+yaml, ocl, sbc, flat, gmd, lot) are split into shards, shard
+I of N taking every resource whose place in a pass is I modulo N (--shard I/N runs one by hand and writes its
+part of the report), so each distinct resource is still parsed, rebuilt and round-tripped exactly once.  The
+report is the one a single process would write: counts added up, the keys of each tally and the failures in the
+order one process would have met them (every shard keeps where it met its own), the verdict worked out from the
+added counts; ``seconds`` is the slowest shard's and ``shards`` says how many there were.  Every shard also
+digests the sequence of resources it walked; shards that did not walk one sequence (the game changed while the run
+was going, or parts run by hand at different times) cannot be added up, so the run fails and the report says
+which check ("shard_mismatch").
+
+Every pass reads every archive's table: the game's index (index.py) is a cache that cannot tell an archive that was
+swapped for another of the same size and time, and a proof does not take a cache's word.
+
 Reads the game only.  Exit 0 when everything is exact, 1 otherwise.
 """
 from __future__ import annotations
@@ -63,12 +77,17 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import re
 import struct
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import zlib
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -83,6 +102,63 @@ CHECKS = ("xfs", "yaml", "ocl", "gmd", "itl", "lot", "arcs", "tables", "flat", "
           "lmt", "weather", "lcm", "sound", "effect", "ddo_params", "ndp", "fca", "msgset", "sdl", "zon", "sbc",
           "fsm", "nav", "arc")
 EFFECT_PARTS = ("epv", "efl", "e2d", "efs")
+
+# This process's share of each pass of the checks that can be split (--shard I/N): the resources whose place in the
+# pass is I modulo N.  None checks everything.  The checks in SHARDS read their resources through _resources.
+SHARD: tuple[int, int] | None = None
+# Where the resource a check is working on stands, in a shard: (which pass of _resources it is -- flat makes one per
+# format -- and its place in that pass).  A shard sees every Nth resource, so what a process would have kept in the
+# order it met things (the failures, the keys of a tally) is kept with this and merge_shards puts it back in order.
+AT = [0, 0]
+# What each pass of this process's check walked (corpus.Walk), in pass order; reported so the shards can be compared.
+WALKS: list = []
+
+
+def _walk(game, types, **kw):
+    """corpus.resources for every read of the corpus: the table of every archive is read, never the index's word
+    for which archives hold the types (an archive swapped for another of the same size and time looks current to
+    it).  This gate is the proof that Riftstone reads the whole game."""
+    return corpus.resources(game, types, indexed=False, **kw)
+
+
+def _resources(game, types):
+    """_walk for the main loop of a check that can run as shards: every resource, or this process's share of them
+    (the others are not even decompressed), each noted as the one the check is working on (``AT``)."""
+    if SHARD is None:
+        yield from _walk(game, types)
+        return
+    AT[0] += 1
+    walk = corpus.Walk()
+    WALKS.append(walk)
+    for r in _walk(game, types, shard=SHARD, walk=walk):
+        AT[1] = r.place
+        yield r
+
+
+def _begin() -> None:
+    """A check that can run as shards starts counting its passes: the first is pass 1, and no walk is kept yet."""
+    AT[:] = [0, 0]
+    WALKS.clear()
+
+
+def _placed(failure: dict) -> dict:
+    """A failure as the report keeps it; in a shard, with where it stands in the passes (merge_shards removes it)."""
+    if SHARD is not None:
+        failure["at"] = [AT[0], AT[1]]
+    return failure
+
+
+def _met(first: dict, key) -> None:
+    """In a shard: ``key`` of a tally was met now.  Remembers the first time -- the pass, the place and the turn
+    among the keys -- which is what puts the merged tally's keys in the order one process would have met them."""
+    if SHARD is not None and key not in first:
+        first[key] = [AT[0], AT[1], len(first)]
+
+
+def _keep_met(section: dict, **first: dict) -> None:
+    """In a shard: the keys of the section's tallies and when each was first met (merge_shards uses and drops it)."""
+    if SHARD is not None:
+        section["first_seen"] = first
 
 
 def parse_only(text: str) -> tuple[list[str], tuple[str, ...]]:
@@ -149,10 +225,12 @@ def check_ocl_ddo(game, report):
     from riftstone import ocl_ddo
 
     t0 = time.time()
+    _begin()
     exact = failed = nodes = shapes = attacks = uid_ok = 0
     kinds: dict[str, int] = {}
+    first: dict[str, list] = {}
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["ocl"]]):
+    for r in _resources(game, [typemap.BY_EXT["ocl"]]):
         name = r.name.decode("latin-1")
         try:
             o = ocl_ddo.parse(r.data)
@@ -168,15 +246,17 @@ def check_ocl_ddo(game, report):
             for n in o.nodes:
                 for g in n["geoms"]:
                     k = ocl_ddo.SHAPES.get(g["mShape"], f"mShape {g['mShape']}")
+                    _met(first, k)
                     kinds[k] = kinds.get(k, 0) + 1
         except Exception as e:  # noqa: BLE001
             failed += 1
             if len(failures) < 40:
-                failures.append({"resource": r.label, "why": f"{type(e).__name__}: {e}"})
+                failures.append(_placed({"resource": r.label, "why": f"{type(e).__name__}: {e}"}))
     report["ocl"] = {"distinct": exact + failed, "byte_exact": exact, "nodes": nodes, "hit_shapes": shapes,
                      "shapes_by_kind": kinds, "attack_params": attacks, "uid_is_path_jamcrc": uid_ok,
                      "failed": failed, "failures": failures, "seconds": round(time.time() - t0, 1),
                      "claim": "parse->build and YAML round trip reproduce every DDO .ocl byte-for-byte"}
+    _keep_met(report["ocl"], shapes_by_kind=first)
     return failed == 0 and exact > 0
 
 
@@ -184,10 +264,12 @@ def check_ocl(game, report):
     if game.is_ddo:
         return check_ocl_ddo(game, report)
     t0 = time.time()
+    _begin()
     exact = failed = groups = nodes = attacks = empty = seqs = 0
     shapes: dict[str, int] = {}
+    first: dict[str, list] = {}
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["ocl"]]):
+    for r in _resources(game, [typemap.BY_EXT["ocl"]]):
         try:
             o = ocl.parse(r.data)
             if ocl.build(o) != r.data:
@@ -202,26 +284,30 @@ def check_ocl(game, report):
             seqs += len(o.seqs)
             for n in o.nodes:
                 k = ocl.SHAPES.get(n["mShape"], f"mShape {n['mShape']}")
+                _met(first, k)
                 shapes[k] = shapes.get(k, 0) + 1
         except Exception as e:  # noqa: BLE001
             failed += 1
             if len(failures) < 40:
-                failures.append({"resource": r.label, "why": f"{type(e).__name__}: {e}"})
+                failures.append(_placed({"resource": r.label, "why": f"{type(e).__name__}: {e}"}))
     report["ocl"] = {"distinct": exact + failed, "byte_exact": exact, "groups": groups, "nodes": nodes,
                      "shapes_by_kind": shapes, "attacks": attacks, "empty_attack_slots": empty,
                      "sequence_entries": seqs, "failed": failed, "failures": failures,
                      "seconds": round(time.time() - t0, 1),
                      "claim": "rObjCollision::load's grammar reads every .ocl to its last byte; parse->build and "
                               "the YAML round trip reproduce every one byte for byte"}
+    _keep_met(report["ocl"], shapes_by_kind=first)
     return _absent(game, "ocl", exact, failed, "ocl", report)
 
 
 def check_gmd(game, report):
     t0 = time.time()
+    _begin()
     exact = failed = messages = labels = 0
     languages = Counter()
+    first: dict[str, list] = {}
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["gmd"]]):
+    for r in _resources(game, [typemap.BY_EXT["gmd"]]):
         try:
             g = gmd.parse(r.data)
             if gmd.build(g) != r.data:
@@ -231,15 +317,17 @@ def check_gmd(game, report):
             exact += 1
             messages += len(g.messages)
             labels += sum(m.label is not None for m in g.messages)
+            _met(first, g.language_name)
             languages[g.language_name] += 1
         except Exception as e:  # noqa: BLE001
             failed += 1
             if len(failures) < 40:
-                failures.append({"resource": r.label, "why": f"{type(e).__name__}: {e}"})
+                failures.append(_placed({"resource": r.label, "why": f"{type(e).__name__}: {e}"}))
     report["gmd"] = {"distinct": exact + failed, "byte_exact": exact, "messages": messages, "labels": labels,
                      "languages": dict(languages), "failed": failed, "failures": failures,
                      "seconds": round(time.time() - t0, 1),
                      "claim": "parse->build and YAML round-trip reproduce every .gmd byte-for-byte"}
+    _keep_met(report["gmd"], languages=first)
     return _absent(game, "gmd", exact, failed, "gmd", report)
 
 
@@ -279,7 +367,7 @@ def check_itl(game, report):
     t0 = time.time()
     why = _not_decoded(game, "itl")
     if why:
-        n = sum(1 for _ in corpus.resources(game, [typemap.BY_EXT["itl"]]))
+        n = sum(1 for _ in _walk(game, [typemap.BY_EXT["itl"]]))
         report["itl"] = {"distinct": n, "not_decoded": why, "seconds": round(time.time() - t0, 1)}
         return True
     exact = failed = records = 0
@@ -287,9 +375,9 @@ def check_itl(game, report):
     # the enhancement tables' row counts, for the rule DDDA.exe's lookup follows (itl.level_table, 0x0045B620)
     from riftstone import flat
     rows = {r.name.decode("latin-1").rsplit("\\", 1)[-1]: len(flat.parse(r.data, "itemlv").data["mpArray"])
-            for r in corpus.resources(game, [typemap.BY_EXT["itemlv"]])}
+            for r in _walk(game, [typemap.BY_EXT["itemlv"]])}
     equipment = {}
-    for r in corpus.resources(game, [typemap.BY_EXT["itl"]]):
+    for r in _walk(game, [typemap.BY_EXT["itl"]]):
         try:
             t = itl.parse(r.data)
             if itl.build(t) != r.data:
@@ -322,10 +410,12 @@ def check_lot_ddo(game, report):
     from riftstone import lot_ddo
 
     t0 = time.time()
+    _begin()
     exact = failed = records = 0
     kinds: dict[str, int] = {}
+    first: dict[str, list] = {}
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["lot"]]):
+    for r in _resources(game, [typemap.BY_EXT["lot"]]):
         try:
             lt = lot_ddo.parse(r.data)
             if lot_ddo.build(lt) != r.data:
@@ -335,15 +425,17 @@ def check_lot_ddo(game, report):
             exact += 1
             records += len(lt.records)
             for rec in lt.records:
+                _met(first, rec.cls)
                 kinds[rec.cls] = kinds.get(rec.cls, 0) + 1
         except Exception as e:  # noqa: BLE001
             failed += 1
             if len(failures) < 40:
-                failures.append({"resource": r.label, "why": f"{type(e).__name__}: {e}"})
+                failures.append(_placed({"resource": r.label, "why": f"{type(e).__name__}: {e}"}))
     report["lot"] = {"distinct": exact + failed, "byte_exact": exact, "records": records, "classes": len(kinds),
                      "records_by_class": dict(sorted(kinds.items(), key=lambda kv: -kv[1])), "failed": failed,
                      "failures": failures, "seconds": round(time.time() - t0, 1),
                      "claim": "parse->build and YAML round-trip reproduce every DDO .lot byte-for-byte"}
+    _keep_met(report["lot"], records_by_class=first)
     return _absent(game, "lot", exact, failed, "lot", report)
 
 
@@ -351,10 +443,12 @@ def check_lot(game, report):
     if game.is_ddo:
         return check_lot_ddo(game, report)
     t0 = time.time()
+    _begin()
     exact = failed = records = named = 0
     kinds: dict[str, int] = {}
+    first: dict[str, list] = {}
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["lot"]]):
+    for r in _resources(game, [typemap.BY_EXT["lot"]]):
         try:
             name = r.name.decode("latin-1")
             lt = lot.parse(r.data)
@@ -370,11 +464,12 @@ def check_lot(game, report):
             records += lt.count
             named += lot.parse_name(name) is not None
             for rec in lt.records:
+                _met(first, rec.cls)
                 kinds[rec.cls] = kinds.get(rec.cls, 0) + 1
         except Exception as e:  # noqa: BLE001
             failed += 1
             if len(failures) < 40:
-                failures.append({"resource": r.label, "why": f"{type(e).__name__}: {e}"})
+                failures.append(_placed({"resource": r.label, "why": f"{type(e).__name__}: {e}"}))
     report["lot"] = {"distinct": exact + failed, "byte_exact": exact, "records": records, "classes": len(kinds),
                      "records_by_class": dict(sorted(kinds.items(), key=lambda kv: -kv[1])),
                      "names_decoded": named, "failed": failed,
@@ -382,6 +477,7 @@ def check_lot(game, report):
                      "claim": "every record of every .lot is decoded field by field with the exe's own grammar; "
                               "parse->build and YAML round-trip reproduce every file byte-for-byte; copy-then-remove "
                               "restores every file"}
+    _keep_met(report["lot"], records_by_class=first)
     return _absent(game, "lot", exact, failed, "lot", report)
 
 
@@ -401,7 +497,7 @@ def check_arcs(game, report):
     t0 = time.time()
     exact = failed = matching = stale = no_target = entries = 0
     failures, differing, missing = [], [], []
-    for r in corpus.resources(game, [typemap.BY_EXT["arc"]]):
+    for r in _walk(game, [typemap.BY_EXT["arc"]]):
         try:
             ref = arcref.parse(r.data)
             if arcref.build(ref) != r.data:
@@ -443,7 +539,7 @@ def check_tables(game, report):
     t0 = time.time()
     exact = failed = rows = 0
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["ist"], typemap.BY_EXT["imx"]]):
+    for r in _walk(game, [typemap.BY_EXT["ist"], typemap.BY_EXT["imx"]]):
         try:
             t = tables.parse(r.data)
             if tables.build(t) != r.data:
@@ -468,7 +564,7 @@ def check_gpl_ddo(game, report):
     t0 = time.time()
     exact = failed = groups = cells = shapes = 0
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["gpl"]]):
+    for r in _walk(game, [typemap.BY_EXT["gpl"]]):
         try:
             x = gpl_ddo.parse(r.data)
             if gpl_ddo.build(x) != r.data:
@@ -499,7 +595,7 @@ def check_gpl(game, report):
     t0 = time.time()
     exact = failed = groups = units = 0
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["gpl"]]):
+    for r in _walk(game, [typemap.BY_EXT["gpl"]]):
         try:
             x = gpl.parse(r.data)
             if gpl.build(x) != r.data:
@@ -528,7 +624,7 @@ def check_tex(game, report):
     no_dds: Counter = Counter()          # why a texture has no .dds form: cube map, format, mip layout
     examples: dict[str, str] = {}
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["tex"]]):
+    for r in _walk(game, [typemap.BY_EXT["tex"]]):
         try:
             t = tex.parse(r.data)
             if tex.build(t) != r.data:
@@ -571,7 +667,7 @@ def check_mrl(game, report):
     exact = failed = shaders = binds = 0
     seen_shaders = set()
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["mrl"]]):
+    for r in _walk(game, [typemap.BY_EXT["mrl"]]):
         try:
             m = mrl.parse(r.data)
             if mrl.build(m) != r.data:
@@ -592,10 +688,20 @@ def check_mrl(game, report):
     return failed == 0 and exact > 0
 
 
+def _sbc_claim(worst: float, restored_files: int, exact: int, triangles: int, own_normal: int, flat: int) -> str:
+    return (f"every collision mesh follows the loader's layout to its last byte; a move by a "
+            f"cell corner changes only boxes, tree lanes and vertices; moving back restores every "
+            f"value within float32 rounding (largest change {worst:g} cm; {restored_files} of "
+            f"{exact} files byte for byte), and moving twice gives the same bytes; every one of "
+            f"{triangles:,} triangles names three vertices of its own part, and the stored normal "
+            f"is the corners' own for {own_normal:,} ({flat:,} have no area)")
+
+
 def check_sbc(game, report):
     from riftstone import sbc
 
     t0 = time.time()
+    _begin()
     exact = failed = nodes = floats = vertices = restored_files = changed = triangles = own_normal = flat = 0
     worst = 0.0
     failures = []
@@ -611,7 +717,7 @@ def check_sbc(game, report):
         return abs(cr[0] * n[0] + cr[1] * n[1] + cr[2] * n[2]) / size >= 0.99
 
     back_by = tuple(-v for v in corner)
-    for r in corpus.resources(game, [typemap.BY_EXT["sbc"]]):
+    for r in _resources(game, [typemap.BY_EXT["sbc"]]):
         try:
             s = sbc.parse(r.data)
             problems = sbc.bounds_problems(r.data)
@@ -655,18 +761,13 @@ def check_sbc(game, report):
         except Exception as e:  # noqa: BLE001
             failed += 1
             if len(failures) < 40:
-                failures.append({"resource": r.label, "why": f"{type(e).__name__}: {e}"})
+                failures.append(_placed({"resource": r.label, "why": f"{type(e).__name__}: {e}"}))
     report["sbc"] = {"distinct": exact + failed, "layout_exact": exact, "tree_nodes": nodes, "vertices": vertices,
                      "moved_floats": floats, "moved_back_floats_changed": changed, "triangles": triangles,
                      "triangles_whose_normal_is_their_corners": own_normal, "triangles_without_area": flat,
                      "moved_back_largest_change_cm": worst, "moved_back_files_byte_exact": restored_files,
                      "failed": failed, "failures": failures, "seconds": round(time.time() - t0, 1),
-                     "claim": f"every collision mesh follows the loader's layout to its last byte; a move by a "
-                              f"cell corner changes only boxes, tree lanes and vertices; moving back restores every "
-                              f"value within float32 rounding (largest change {worst:g} cm; {restored_files} of "
-                              f"{exact} files byte for byte), and moving twice gives the same bytes; every one of "
-                              f"{triangles:,} triangles names three vertices of its own part, and the stored normal "
-                              f"is the corners' own for {own_normal:,} ({flat:,} have no area)"}
+                     "claim": _sbc_claim(worst, restored_files, exact, triangles, own_normal, flat)}
     return _absent(game, "sbc", exact, failed, "sbc", report)
 
 
@@ -676,7 +777,7 @@ def check_ean(game, report):
     t0 = time.time()
     exact = failed = frames = 0
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["ean"]]):
+    for r in _walk(game, [typemap.BY_EXT["ean"]]):
         try:
             e = ean.parse(r.data)
             if ean.build(e) != r.data:
@@ -707,7 +808,7 @@ def check_nav(game, report):
     worst = 0.0
     off: Counter = Counter()           # links whose cost is more than 1% from the centroids' distance, per mesh
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["nav"]]):
+    for r in _walk(game, [typemap.BY_EXT["nav"]]):
         try:
             n = nav.parse(r.data)
             if nav.build(n) != r.data:
@@ -729,21 +830,27 @@ def check_nav(game, report):
             failed += 1
             if len(failures) < 40:
                 failures.append({"resource": r.label, "why": f"{type(exc).__name__}: {exc}"})
-    table = None
+    table = collision = None
     if game.kind == "ddda":
+        from riftstone import scene
         try:
-            t = nav.stage_table(game.exe.read_bytes())
+            exe = game.exe.read_bytes()
+            t = nav.stage_table(exe)
             table = {s: v for s, v in sorted(t.items()) if s != v} == nav.NAV_OF
+            t = nav.stage_table(exe, nav.COLLISION_FIELD)
+            collision = {s: v for s, v in sorted(t.items()) if s != v} == scene.COLLISION_OF
         except Exception as exc:  # noqa: BLE001
             failures.append({"resource": "DDDA.exe stage table", "why": f"{type(exc).__name__}: {exc}"})
-            table = False
+            table = collision = False
     report["nav"] = {"distinct": exact + failed, "byte_exact": exact, "failed": failed, "triangles": triangles,
                      "links": links, "links_with_reverse": reverse, "cost_vs_centroids_worst": round(worst, 5),
-                     "links_cost_off_1pct": dict(off), "stage_table_matches_exe": table, "failures": failures,
+                     "links_cost_off_1pct": dict(off), "stage_table_matches_exe": table,
+                     "collision_table_matches_exe": collision, "failures": failures,
                      "seconds": round(time.time() - t0, 1),
                      "claim": "parse->build reproduces every navigation mesh byte-for-byte; a link's cost is the "
                               "centroids' distance in metres (Dark Arisen: every link within 1%; Online: all but "
-                              "rm107's 96, measured 2026-09-26); nav.NAV_OF is the exe's table"}
+                              "rm107's 96, measured 2026-09-26); nav.NAV_OF and scene.COLLISION_OF are the exe's "
+                              "table"}
     costs_ok = worst < 0.01 if game.kind == "ddda" else set(off) <= {"st0407.arc:scr\\rm\\rm107\\etc\\rm107_nav"}
     return _absent(game, "nav", exact, failed, "nav", report) and table is not False and costs_ok
 
@@ -779,7 +886,7 @@ def check_lmt(game, report):
     port_worst = 0.0
     rot = Counter()
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["lmt"]]):
+    for r in _walk(game, [typemap.BY_EXT["lmt"]]):
         try:
             m = lmt.parse(r.data)
             if lmt.build(m) != r.data:
@@ -849,7 +956,7 @@ def check_weather(game, report):
     per = Counter()
     exact = failed = 0
     failures = []
-    for r in corpus.resources(game, list(ids)):
+    for r in _walk(game, list(ids)):
         ext = ids[r.type_id]
         try:
             w = weather.parse(r.data, ext)
@@ -879,7 +986,7 @@ def check_lcm(game, report):
     t0 = time.time()
     exact = failed = cams = frames = 0
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["lcm"]]):
+    for r in _walk(game, [typemap.BY_EXT["lcm"]]):
         try:
             cl = camera.parse(r.data)
             if camera.build(cl) != r.data:
@@ -909,7 +1016,7 @@ def check_sound(game, report):
     exts = ("srq", "stq", "smx", "sbkr", "sar") if game.is_ddo else ("srq", "stq", "srd", "smx", "spl")
     rows = {e: {"distinct": 0, "byte_exact": 0, "yaml_exact": 0} for e in exts}
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT[e] for e in exts]):
+    for r in _walk(game, [typemap.BY_EXT[e] for e in exts]):
         row = rows[typemap.extension(r.type_id)]
         row["distinct"] += 1
         try:
@@ -948,7 +1055,7 @@ def check_effect(game, report, parts=EFFECT_PARTS):
         kinds: Counter = Counter()
         res: Counter = Counter()
         failures = []
-        for r in corpus.resources(game, [typemap.BY_EXT[ext]]):
+        for r in _walk(game, [typemap.BY_EXT[ext]]):
             try:
                 x = mod.parse(r.data)
                 if mod.build(x) != r.data:
@@ -1012,7 +1119,7 @@ def check_ddo_params(game, report):
     per = {ext: {"distinct": 0, "byte_exact": 0, "yaml_exact": 0, "failed": 0} for ext in ddo_params.KINDS}
     failures = []
     flying = 0
-    for r in corpus.resources(game, list(tids)):
+    for r in _walk(game, list(tids)):
         ext = tids[r.type_id]
         c = per[ext]
         c["distinct"] += 1
@@ -1066,7 +1173,7 @@ def check_ndp(game, report):
     report["ndp"] = entry
     fail = entry["failures"].append
     tables = []
-    for r in corpus.resources(game, [tid]):
+    for r in _walk(game, [tid]):
         entry["distinct"] += 1
         try:
             m = ddo_params.parse(r.data, "ndp")
@@ -1164,7 +1271,7 @@ def _check_module(game, report, key, exts, module, claim):
     exact = failed = 0
     per = Counter()
     failures = []
-    for r in corpus.resources(game, list(ids)):
+    for r in _walk(game, list(ids)):
         try:
             m = mod.parse(r.data)
             if mod.build(m) != r.data:
@@ -1211,7 +1318,7 @@ def check_prp(game, report):
     classes = set()
     failures = []
     tid = typemap.BY_EXT["prp"]
-    for r in corpus.resources(game, [tid]):
+    for r in _walk(game, [tid]):
         try:
             doc = prp.parse(r.data)
             if prp.build(doc) != r.data:
@@ -1239,6 +1346,7 @@ def check_flat(game, report):
     from riftstone import flat
 
     t0 = time.time()
+    _begin()
     per = {}
     total_ok = total_bad = 0
     failures = []
@@ -1247,10 +1355,10 @@ def check_flat(game, report):
     for ext, tid in tids:
         why = _not_decoded(game, ext)
         if why:
-            per[ext] = {"files": sum(1 for _ in corpus.resources(game, [tid])), "not_decoded": why}
+            per[ext] = {"files": sum(1 for _ in _resources(game, [tid])), "not_decoded": why}
             continue
         ok = bad = 0
-        for r in corpus.resources(game, [tid]):
+        for r in _resources(game, [tid]):
             try:
                 f = flat.parse(r.data, ext)
                 if flat.build(f) != r.data:
@@ -1261,7 +1369,7 @@ def check_flat(game, report):
             except Exception as e:  # noqa: BLE001
                 bad += 1
                 if len(failures) < 40:
-                    failures.append({"resource": r.label, "why": f"{type(e).__name__}: {e}"})
+                    failures.append(_placed({"resource": r.label, "why": f"{type(e).__name__}: {e}"}))
         per[ext] = {"exact": ok, "failed": bad}
         total_ok += ok
         total_bad += bad
@@ -1328,10 +1436,14 @@ def check_xfs(game, report, with_yaml):
         from riftstone import params
 
     t0 = time.time()
+    _begin()
     counts = Counter({"strings": 0, "strings_non_ascii": 0, "strings_not_text": 0})
     failures = []
     per_type = Counter()
-    for r in corpus.resources(game, corpus.xfs_type_ids()):
+    first_type: dict[str, list] = {}
+    first_count: dict[str, list] = {}
+    for r in _resources(game, corpus.xfs_type_ids()):
+        _met(first_type, typemap.class_name(r.type_id))
         per_type[typemap.class_name(r.type_id)] += 1
         try:
             x = xfs.parse(r.data)
@@ -1339,6 +1451,7 @@ def check_xfs(game, report, with_yaml):
                 raise AssertionError("XFS rebuild differs")
             if xfs.build_definitions(x.classes, x.version) != x.extra["def_raw"]:
                 raise AssertionError("regenerated definition block differs")
+            _met(first_count, "xfs_exact")
             counts["xfs_exact"] += 1
             for o in xfs.walk(x.root):          # text: read in the file's encoding, how much needs escapes
                 for p, vals in zip(x.classes[o.cls].props, o.fields):
@@ -1354,15 +1467,18 @@ def check_xfs(game, report, with_yaml):
                 back = params.from_yaml(text, source=r.label)
                 if xfs.build(back) != r.data:
                     raise AssertionError("YAML round trip differs")
+                _met(first_count, "yaml_exact")
                 counts["yaml_exact"] += 1
         except Exception as e:  # noqa: BLE001
+            _met(first_count, "failed")
             counts["failed"] += 1
             if len(failures) < 50:
-                failures.append({"resource": r.label, "type": typemap.class_name(r.type_id),
-                                 "why": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(limit=3)})
+                failures.append(_placed({"resource": r.label, "type": typemap.class_name(r.type_id),
+                                         "why": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(limit=3)}))
     report["xfs"] = {"distinct_resources": sum(per_type.values()), **counts, "failures": failures,
                      "types": dict(per_type), "seconds": round(time.time() - t0, 1),
                      "claim": "byte-exact XFS parse/build" + (" and XFS->YAML->XFS" if with_yaml else "")}
+    _keep_met(report["xfs"], types=first_type, counts=first_count)
     return _absent(game, "xfs", counts["xfs_exact"], counts["failed"], "xfs", report)
 
 
@@ -1375,7 +1491,7 @@ def check_fsm(game, report):
     ok = failed = machines = states = links = 0
     kinds, verdicts, files_with = Counter(), Counter(), Counter()
     failures = []
-    for r in corpus.resources(game, [typemap.BY_EXT["fsm"]]):
+    for r in _walk(game, [typemap.BY_EXT["fsm"]]):
         try:
             x = xfs.parse(r.data)
             if not fsm.decompile(x, r.label).startswith("state machine"):
@@ -1421,29 +1537,247 @@ def run_check(name: str, game, report, only=CHECKS, parts=EFFECT_PARTS) -> bool:
     return globals()[f"check_{name}"](game, report)
 
 
+# What the checks cost in one process on the installed Dark Arisen (seconds, measured; "arc" is the 30 minutes the full
+# gate quotes), and the number of shards each check that can be split is cut into -- about six seconds a shard.  Every
+# other check runs whole, beside them.  The longest shards start first.
+SHARDS = {"xfs": 16, "sbc": 12, "flat": 12, "lot": 4, "gmd": 4, "ocl": 4}
+COST = {"arc": 1800, "xfs": 105, "sbc": 70, "flat": 65, "lot": 24, "gmd": 11, "ocl": 7, "fsm": 6, "gpl": 5, "nav": 4,
+        "arcs": 3, "itl": 3, "tables": 2}
+MAX_JOBS = 16                                              # about 100 MB a process
+UNKNOWN_COST = 120                                         # a whole check not measured: started early
+SECTION = {"xfs": "xfs", "ocl": "ocl", "gmd": "gmd", "lot": "lot", "sbc": "sbc", "flat": "flat"}
+# the counts a merged section's verdict is worked out from: (exact, failed), and the failures kept
+VERDICT_KEYS = {"xfs": ("xfs_exact", "failed"), "ocl": ("byte_exact", "failed"), "gmd": ("byte_exact", "failed"),
+                "lot": ("byte_exact", "failed"), "sbc": ("layout_exact", "failed"), "flat": ("byte_exact", "failed")}
+FAILURES_KEPT = {"xfs": 50}
+HEADER_KEYS = {"schema", "game", "exe_sha256", "utc", "checks", "read_from_backup", "ok", "skipped",
+               "nothing_checked", "verdicts", "walks"}
+# the tallies of each check that runs as shards, whose keys one process would have met in order
+TALLIES = {"xfs": ("types",), "ocl": ("shapes_by_kind",), "gmd": ("languages",)}
+
+
+def parse_shard(text: str) -> tuple[int, int]:
+    """'I/N' -> (I, N), 0 <= I < N."""
+    m = re.fullmatch(r"(\d+)/(\d+)", text.strip())
+    if not m or not 0 <= int(m[1]) < int(m[2]):
+        raise ValueError(f"--shard: {text!r} is not I/N with 0 <= I < N")
+    return int(m[1]), int(m[2])
+
+
+def _add(a, b):
+    """Two parts of one report section added up: numbers summed, dicts key by key, lists joined; anything else
+    (a claim, a note) is the same in every part, so the first stays."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = dict(a)
+        for k, v in b.items():
+            out[k] = _add(out[k], v) if k in out else v
+        return out
+    if isinstance(a, list) and isinstance(b, list):
+        return a + b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) \
+            and not isinstance(b, bool):
+        return a + b
+    return a
+
+
+def _met_order(sections: list[dict], field: str) -> list:
+    """The keys of one tally in the order one process would have met them: by the earliest (pass, place, turn) any
+    shard noted for the key.  Two keys met at one place were met by one shard, in its own turn."""
+    first: dict = {}
+    for sec in sections:
+        for key, at in sec.get("first_seen", {}).get(field, {}).items():
+            if key not in first or at < first[key]:
+                first[key] = at
+    return sorted(first, key=first.__getitem__)
+
+
+def merge_shards(game, check: str, sections: list[dict], report: dict) -> bool:
+    """The shards of one check (their sections, in shard order) as the section one process would write, into
+    ``report``; its verdict.  The verdict is worked out again from the added counts (a shard may hold none of the
+    resources, or all the failures), what ``_absent`` says about a game with none of a kind is said once, and the
+    keys of a tally and the failures come in the order one process would have met them (each shard noted where it
+    met its own: ``first_seen``, and ``at`` on a failure)."""
+    key = SECTION[check]
+    parts = [{k: v for k, v in sec.items() if k not in ("none_found", "absent", "first_seen")} for sec in sections]
+    out = parts[0]
+    for part in parts[1:]:
+        out = _add(out, part)
+    keys = list(parts[0])
+    if "failures" in keys:                                  # a counter only some shards met (failed) goes with the others
+        met = _met_order(sections, "counts")                # (xfs: counters exist from their first increment)
+        keys = [k for k in keys if k not in met]
+        at = keys.index("failures")
+        keys = keys[:at] + met + [k for k in out if k not in keys and k not in met] + keys[at:]
+        out = {k: out[k] for k in keys}
+    out["seconds"] = max(sec.get("seconds", 0.0) for sec in sections)
+    found = sorted((f for sec in sections for f in sec["failures"]), key=lambda f: f.get("at", [0, 0]))
+    out["failures"] = [{k: v for k, v in f.items() if k != "at"} for f in found[:FAILURES_KEPT.get(check, 40)]]
+    out["shards"] = len(sections)
+    for field in TALLIES.get(check, ()):
+        order = _met_order(sections, field)
+        if field in out and set(order) == set(out[field]):
+            out[field] = {k: out[field][k] for k in order}
+    if check == "lot":
+        by_class = out["records_by_class"]
+        order = _met_order(sections, "records_by_class")
+        if set(order) != set(by_class):                     # parts that did not say when they met each class: by name
+            order = sorted(by_class)
+        out["records_by_class"] = {k: by_class[k] for k in sorted(order, key=lambda k: -by_class[k])}
+        out["classes"] = len(by_class)
+    elif check == "sbc":
+        out["moved_back_largest_change_cm"] = max(sec["moved_back_largest_change_cm"] for sec in sections)
+        out["claim"] = _sbc_claim(out["moved_back_largest_change_cm"], out["moved_back_files_byte_exact"],
+                                  out["layout_exact"], out["triangles"], out["triangles_whose_normal_is_their_corners"],
+                                  out["triangles_without_area"])
+    elif check == "flat":
+        out["formats"] = sections[0]["formats"]
+    report[key] = out
+    exact_key, failed_key = VERDICT_KEYS[check]
+    exact, failed = out.get(exact_key, 0), out.get(failed_key, 0)
+    if check == "flat":
+        return failed == 0 and exact > 0
+    return _absent(game, check, exact, failed, key, report)
+
+
+def _units(only: list[str]) -> list[str]:
+    """The checks as processes run them: the XFS check's one pass does the "yaml" check too."""
+    return list(dict.fromkeys("xfs" if n == "yaml" else n for n in only))
+
+
+def _plan(only: list[str], parts: tuple[str, ...], text: str) -> list[tuple[str, int, int, str]]:
+    """The processes to run: (check, shard, shards, its --only), longest first.  ``text``: the --only as asked."""
+    names = [n.strip() for n in text.split(",") if n.strip()]
+    tasks = []
+    for name in _units(only):
+        if name == "xfs":
+            child = "xfs,yaml" if "yaml" in only else "xfs"
+        elif name == "effect":
+            child = ",".join(n for n in names if n == "effect" or n in EFFECT_PARTS)
+        else:
+            child = name
+        n = SHARDS.get(name, 1)
+        tasks += [(name, i, n, child) for i in range(n)]
+    tasks.sort(key=lambda t: -COST.get(t[0], UNKNOWN_COST) / t[2])      # stable: ties keep the order of CHECKS
+    return tasks
+
+
+def _run_task(task, game, tmp: str) -> dict:
+    """One process of the plan: this script on the same game with --shard, its report read back."""
+    name, i, n, child = task
+    out = os.path.join(tmp, f"{name}-{i}of{n}.json")
+    cmd = [sys.executable, "-B", str(Path(__file__).resolve()), "--game", str(game.root), "--only", child,
+           "--shard", f"{i}/{n}", "--jobs", "1", "--out", out]
+    # at this process's own priority: a below-normal class starved the shards on a busy PC (3-4 times slower)
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        rep = json.loads(Path(out).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        rep = None
+    return {"task": task, "report": rep, "rc": proc.returncode, "tail": (proc.stdout + proc.stderr)[-800:]}
+
+
+def _walk_mismatch(runs: list[dict]) -> str | None:
+    """None when the shards of one check (in shard order) walked one sequence of resources in every pass; else
+    what differs.  Each shard counts the places of the whole sequence and digests what stands at each, so shards
+    that read a game that changed between them, or that were run by hand at different times, are told apart."""
+    name = runs[0]["task"][0]
+    walks = [d["report"].get("walks", {}).get(name) for d in runs]
+    for d, w in zip(runs, walks):
+        shard = f"{d['task'][1]}/{d['task'][2]}"
+        if w is None:
+            return f"shard {shard} did not say what it walked"
+        if len(w) != len(walks[0]):
+            return f"shard {shard} made {len(w)} passes over the resources, shard 0/{d['task'][2]} made {len(walks[0])}"
+        for p, (mine, first) in enumerate(zip(w, walks[0]), 1):
+            if mine != first:
+                return (f"shard {shard} and shard 0/{d['task'][2]} did not walk the same resources (pass {p}: "
+                        f"{mine['places']} places against {first['places']}, digests {mine['sha256'][:12]} and "
+                        f"{first['sha256'][:12]})")
+    return None
+
+
+def run_parallel(game, only, parts, text: str, jobs: int, tasks) -> tuple[dict, bool]:
+    """The checks as processes ``jobs`` at a time; (the sections and skips of the report one process would write
+    -- every check's, in CHECKS order -- and whether all of them passed)."""
+    with tempfile.TemporaryDirectory(prefix="rs-corpus-") as tmp, ThreadPoolExecutor(max_workers=jobs) as pool:
+        done = list(pool.map(lambda t: _run_task(t, game, tmp), tasks))
+    by_check: dict[str, list[dict]] = {}
+    for d in done:
+        by_check.setdefault(d["task"][0], []).append(d)
+    report: dict = {}
+    good = True
+    for name in _units(only):
+        runs = sorted(by_check[name], key=lambda d: d["task"][1])
+        broken = [d for d in runs if d["report"] is None]
+        if broken:
+            good = False
+            report.setdefault("crashed", {})[name] = [{"shard": f"{d['task'][1]}/{d['task'][2]}", "rc": d["rc"],
+                                                       "output": d["tail"]} for d in broken]
+            continue
+        for d in runs:
+            for k, why in d["report"].get("skipped", {}).items():
+                report.setdefault("skipped", {})[k] = why
+        if SHARDS.get(name, 1) > 1:
+            why = _walk_mismatch(runs)
+            if why:                                         # their counts are of different games: not added up
+                good = False
+                report.setdefault("shard_mismatch", {})[name] = why
+                continue
+            good &= merge_shards(game, name, [d["report"][SECTION[name]] for d in runs], report)
+        else:
+            rep = runs[0]["report"]
+            for k, v in rep.items():
+                if k not in HEADER_KEYS:
+                    report[k] = v
+            good &= all(rep.get("verdicts", {}).values())
+    return report, good
+
+
 def main(argv: list[str] | None = None) -> int:
+    global SHARD
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--game")
     ap.add_argument("--only", default=",".join(CHECKS), help="checks to run, comma-separated (default: all)")
     ap.add_argument("--out")
+    ap.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, MAX_JOBS),
+                    help=f"processes at a time (default: one per CPU, at most {MAX_JOBS}); "
+                         "1 runs every check in this process")
+    ap.add_argument("--shard", help="I/N: run only the resources whose place in each pass is I modulo N, and write "
+                                    "that part of the report (what the processes of a parallel run are)")
     a = ap.parse_args(argv)
     try:
         only, parts = parse_only(a.only)
+        shard = parse_shard(a.shard) if a.shard else None
     except ValueError as e:
         ap.error(str(e))                                    # exit 2, nothing run
     game = find_game(a.game)
-    kept = corpus.backups(game)
-    exe_sha = hashlib.sha256(game.exe.read_bytes()).hexdigest()
-    report = {"schema": "riftstone.corpus-check/1", "game": str(game.root), "exe_sha256": exe_sha,
-              "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "checks": only,
-              # archives an install replaced in nativePC: every check reads Riftstone's backup of the original
-              "read_from_backup": sorted(game.arc_name(p) for p in game.archives()
-                                         if corpus.source(game, p, kept) != p)}
+    report: dict = {}
+    if shard is None:
+        kept = corpus.backups(game)
+        exe_sha = hashlib.sha256(game.exe.read_bytes()).hexdigest()
+        report = {"schema": "riftstone.corpus-check/1", "game": str(game.root), "exe_sha256": exe_sha,
+                  "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "checks": only,
+                  # archives an install replaced in nativePC: every check reads Riftstone's backup of the original
+                  "read_from_backup": sorted(game.arc_name(p) for p in game.archives()
+                                             if corpus.source(game, p, kept) != p)}
+    tasks = _plan(only, parts, a.only)
     good = True
-    for name in only:
-        if name == "yaml" and "xfs" in only:                # the XFS check's one pass does both
-            continue
-        good &= run_check(name, game, report, only, parts)
+    if shard is None and a.jobs > 1 and len(tasks) > 1:
+        sections, good = run_parallel(game, only, parts, a.only, a.jobs, tasks)
+        report.update(sections)
+    else:
+        SHARD = shard
+        verdicts = {}
+        for name in only:
+            if name == "yaml" and "xfs" in only:            # the XFS check's one pass does both
+                continue
+            WALKS.clear()
+            verdicts[name] = run_check(name, game, report, only, parts)
+            good &= verdicts[name]
+            if shard is not None:                           # what this part walked, for the others to be compared with
+                report.setdefault("walks", {})[name] = [{"places": w.places, "sha256": w.digest} for w in WALKS]
+        if shard is not None:
+            report["verdicts"] = verdicts
     skipped = report.get("skipped", {})
     if all(name in skipped for name in only):
         good = False
@@ -1452,6 +1786,8 @@ def main(argv: list[str] | None = None) -> int:
     text = json.dumps(report, indent=1)
     if a.out:
         Path(a.out).write_text(text, encoding="utf-8")
+    if shard is not None:
+        return 0 if good else 1
     summary = {k: {kk: vv for kk, vv in v.items() if kk not in ("failures", "types")} if isinstance(v, dict) else v
                for k, v in report.items()}
     print(json.dumps(summary, indent=1))
@@ -1460,6 +1796,11 @@ def main(argv: list[str] | None = None) -> int:
                     "fsm", "nav", "arc"):
         for f in report.get(section, {}).get("failures", [])[:5]:
             print("FAIL", json.dumps(f)[:600])
+    for name, runs in report.get("crashed", {}).items():
+        for r in runs:
+            print("CRASHED", name, json.dumps(r)[:800])
+    for name, why in report.get("shard_mismatch", {}).items():
+        print("SHARDS DISAGREE", name, why)
     return 0 if good else 1
 
 

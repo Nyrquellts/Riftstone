@@ -160,6 +160,65 @@ class SweepTest(unittest.TestCase):
             self.assertEqual(list(root.iterdir()), [])
 
 
+class ScheduleTest(unittest.TestCase):
+    """How a run hands its jobs to the pool: every target for its full --seconds on a core of its own, the same seeds
+    as ever, one job at a time to a worker (``Pool.map`` chunks several jobs into one task, which a worker runs back
+    to back: 117 jobs on 24 workers were chunks of 2 and six waves of --seconds where ceil(117 / 24) = 5 will do),
+    and the results in job order."""
+
+    def run_main(self, *argv):
+        calls = {}
+
+        class Pool:
+            def __init__(self, workers):
+                calls["workers"] = workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def map(self, fn, jobs, chunksize=None):
+                calls["fn"], calls["jobs"], calls["chunksize"] = fn, list(jobs), chunksize
+                return [{"target": j[0], "iterations": 1, "accepted": 0, "rejected": 0, "corpus": 0, "coverage": 0,
+                         "stalls": 0, "max_stall": 0.0, "findings": {}} for j in calls["jobs"]]
+
+        class Context:
+            def Pool(self, workers):  # noqa: N802 (multiprocessing's name)
+                return Pool(workers)
+
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(sys, "argv", ["run.py", "--tmp", str(Path(d) / "tmp"), *argv]), \
+                mock.patch.object(fuzz_run, "REPORTS", Path(d) / "reports"), \
+                mock.patch.object(fuzz_run, "load_seeds", lambda refresh: {}), \
+                mock.patch.object(fuzz_run.mp, "get_context", lambda method: Context()):
+            rc = fuzz_run.main()
+            reports = list((Path(d) / "reports").glob("fuzz-*.json"))
+            calls["report"] = json.loads(reports[0].read_text(encoding="utf-8")) if reports else None
+        return rc, calls
+
+    def test_each_job_goes_to_a_worker_on_its_own_with_its_full_budget(self):
+        names = list(targets.TARGETS)[:3]
+        rc, calls = self.run_main("--seconds", "7", "--workers", "5", "--targets", ",".join(names))
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls["workers"], 5)
+        self.assertEqual(calls["chunksize"], 1)
+        self.assertIs(calls["fn"], fuzz_run.worker)
+        self.assertEqual([j[:3] for j in calls["jobs"]],
+                         [(names[i % 3], 7.0, 1000 + i) for i in range(5)])      # the seeds are 1000 + the job's place
+        self.assertEqual(calls["report"]["seconds_per_worker"], 7.0)
+        self.assertEqual(calls["report"]["targets"][names[0]]["workers"], 2)
+
+    def test_every_target_runs_and_every_core_is_used_by_default(self):
+        rc, calls = self.run_main("--seconds", "1")
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls["workers"], os.cpu_count() or 1)
+        self.assertEqual(len(calls["jobs"]), max(calls["workers"], len(targets.TARGETS)))
+        self.assertEqual({j[0] for j in calls["jobs"]}, set(targets.TARGETS))
+        self.assertEqual(calls["chunksize"], 1)
+
+
 class OutsideTest(unittest.TestCase):
     """The filesystem targets' "only inside the mod" invariants see a write anywhere else in their stand-in
     (its game's archives, home), not just a new name at the top."""

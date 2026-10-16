@@ -68,5 +68,6 @@ riftstone loader install
 riftstone loader plugin add native\plugins\six_skill_warrior\out\six_skill_warrior.asi
 ```
 
-The first `plugin add` also copies `six_skill_warrior.ini`, and later updates keep the owner's edits.
+The first `plugin add` also copies `six_skill_warrior.ini`; a later update keeps the owner's values and adds any
+setting new in the build with its default and comment.
 Removal: `riftstone loader plugin remove six_skill_warrior.asi`.

@@ -62,6 +62,15 @@ If a different `dinput8.dll` is already present (DDDA Tweak), it becomes
 `dinput8_chain.dll` and the loader forwards DirectInput to it (`[loader] chain`). A chain that is the
 loader itself (`chain = dinput8.dll`) or whose `DirectInput8Create` forwards back to it is refused with a
 log line, and the system dinput8 answers (since 0.4.1; before, `DirectInput8Create` called itself).
+After 1.0.5 (not in its zip) a `dinput8_chain.dll` beside the game is chained when `chain` is empty too, so an update
+unzipped with Replace (which puts the shipped ini back) or a hand-edited ini does not drop the other mod; the
+chain is loaded at start-up, where the game would have loaded that `dinput8.dll` without Riftstone (before, at
+the game's first `DirectInput8Create`). A chain, or a DLL in `riftstone\legacy` or `riftstone\plugins`, that is
+a Riftstone loader (its file holds the version tag) is read, never loaded, and the log says so. One loader runs
+in a game: a second one (the add-on build behind a chained DDDA Tweak's `loadLibrary`) finds the first's mark
+(`Local\RiftstoneLoader-<pid>`) and stands aside, and the first names it in `loader.log` (`loader   another
+Riftstone loader is in the game too`). The harness's `dinputmod` test runs each of these with a stand-in for the
+other mod (`test\old_dinput8.cpp`).
 `loader remove` restores it. Installed mods move between direct and overlay
 mode automatically. Installing over an older loader keeps every value you set in
 `riftstone_loader.ini` and adds the new settings with their defaults. For DDO:

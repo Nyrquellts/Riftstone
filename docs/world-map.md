@@ -210,6 +210,57 @@ light up its placements), a placement inspector (click a dot: what it is, its la
 ground or a group, pick the enemy and the count, **Plan** shows the spawn points, **Write to mod**
 writes the group and layout).
 
+**The 3D map** (the World tab's **3D** switch; `src/riftstone/scene.py`, route `world/scene`) draws the
+stage as the game ships it: its merged collision `scr\st<S>\collision\st<S>{e,h}_mrgNN` (`.sbc`) and the
+navigation mesh it loads, with every placement at its own height. Turn it with the mouse, move it with
+right-drag or Shift-drag, zoom toward the pointer. A click on the ground puts the encounter's spot there
+at that ground's height (the first front face of the shown collision the pointer's ray meets; the walkable
+mesh when no collision is shown), so a spot on an upper floor or a ledge is where it looks. The encounter
+form's **Stand** picks where the spawn points go: on the walkable ground near the spot (the default; a spot
+more than 10 m from it is refused), or in rings exactly at the spot's height (`--no-ground`), for a spot the
+mesh does not reach. **Lot flag** clears the copied group's lot flag (`--always`).
+
+- Measured on the game (2026-10-16): `e` is the denser mesh, floors and walls (27-44 % of its triangles face
+  up in the stages measured), `h` the coarser (41-55 %); what the engine tests against each is UNKNOWN. Every
+  triangle's corners turn counter-clockwise about its stored normal, so back faces are culled: ceilings
+  vanish from above and rooms open like a doll's house.
+- The engine's stage table (rows at `0x015303D0`, field 5) names the stage whose merged collision a stage
+  loads: 443 for 444 and 445, each other stage itself (`scene.COLLISION_OF`; `check_corpus --only nav`
+  reports `collision_table_matches_exe`). Stage 320 is 44,260 triangles (e 35,552, h 8,708) and its mesh 3,376.
+- The open field has 836 collision meshes in each cell's frame (`docs/terrain.md`), so the 3D map reads 3 x 3
+  or 5 x 5 cells around a point (`at=x,z`, `radius` 0..2) and moves each by its cell's corner; it has no
+  navigation mesh.
+- Nothing is written: the scene is read from the game's archives and kept for the last six asked.
+
+### Changing the game's own placements
+
+The World tab edits any placement the game already has (`src/riftstone/spawnedit.py`, routes `world/placement`
+and `world/undo`). Pick the mod in **Your changes go into** above the map (a new one is made by the first change,
+never by a refused one); the map then shows that mod's own copy of every layout it holds, so a change shows at
+once: a moved, swapped or resized placement has a white outline, a removed one is a grey cross where the game has
+it. Click a placement, then:
+
+- **drag it** (2D or 3D), or **Move** (key M) and click the ground: it stands on the stage's walkable ground there
+  (its navigation mesh, the floor nearest the point first; on the open field its cells' walkable collision; a
+  stage with neither keeps the height given, and says so);
+- **Facing**, **Size** and **Health**, then **Apply** (Enter): facing in degrees (0 faces +Z, down the map; 90 faces
+  +X), size as its scale (wolves pick their own size and people are never scaled: refused), health as a multiplier
+  of its HP (the placement's own `HP倍率設定の有無` / `HPの倍率`; 1 turns the flag off);
+- **Swap** to another enemy (id or name): the placement takes the game's commonest ordinary setup for that enemy
+  (no AI script of its own) and keeps its id, position and heading; the enemy joins its group's kinds of unit while
+  the group lists fewer than three (`gpl.UNIT_KINDS_MAX`), and a stage that never uses it is named (installing the
+  mod lists it for `stage_enemies`);
+- **Delete** (the Delete key): the record goes, the other ids stay as they are; a removed one has **Put it back**
+  (the game's record, after the records the game has before it);
+- **As the game has it**: every field back to the game's record.
+
+Every change is saved in every copy of the layout the mod keeps (`files/` and each archive in `archives/`), after
+checking that the record the map showed (its number and id) is still there in each, and kept for **Undo**
+(Ctrl+Z; the last 100 while Studio runs). Undo puts each file back byte for byte, and refuses a file changed since.
+A placement's notes say what to know before playing it: an AI script of its own, a lot flag or a state machine its
+group waits for, and for a removal a big monster's flag or a life point group it shared. In game UNKNOWN until played; the tests (`tests/test_spawnedit.py`) and
+the fuzz target `spawnedit` run on the stand-in stage 424.
+
 ## 100 goblins
 
 ```bat

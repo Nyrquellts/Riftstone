@@ -270,7 +270,8 @@ static void StackWords(HANDLE f, DWORD_PTR sp, int count, BOOL classes) {
             Where(v, where, _countof(where));
             int p = PluginAt(v);
             Out(f, L"  [esp+0x%03x] 0x%p  %s%s%s\r\n", i * (int)sizeof(DWORD_PTR), (void*)v, where,
-                p >= 0 ? L"  <- plugin " : L"", p >= 0 ? g_pluginInfo[p].name : L"");
+                p < 0 ? L"" : g_pluginInfo[p].legacy ? L"  <- legacy " : L"  <- plugin ",
+                p >= 0 ? g_pluginInfo[p].name : L"");
         } else if (classes) {
             char cls[128];
             if (ClassNameOf((const void*)v, cls, sizeof cls))
@@ -431,10 +432,15 @@ static void WriteCrashReport(EXCEPTION_POINTERS* ep, DWORD thread) {
         const wchar_t* op = er->ExceptionInformation[0] == 0 ? L"reading" : er->ExceptionInformation[0] == 1 ? L"writing" : L"executing";
         Out(f, L"            %s address 0x%p\r\n", op, (void*)er->ExceptionInformation[1]);
     }
-    if (plugin >= 0) Out(f, L"fault in    plugin %s (riftstone\\plugins)\r\n", g_pluginInfo[plugin].name);
+    if (plugin >= 0 && g_pluginInfo[plugin].legacy)
+        Out(f, L"fault in    legacy DLL %s (riftstone\\legacy)\r\n", g_pluginInfo[plugin].name);
+    else if (plugin >= 0) Out(f, L"fault in    plugin %s (riftstone\\plugins)\r\n", g_pluginInfo[plugin].name);
     else if (faultModule[0] && _wcsicmp(wcsrchr(faultModule, L'\\') ? wcsrchr(faultModule, L'\\') + 1 : faultModule, L"dinput8.dll") != 0)
         Out(f, L"fault in    %s\r\n", faultModule);
     else if (faultModule[0]) Out(f, L"fault in    %s (the Riftstone loader, or another dinput8.dll)\r\n", faultModule);
+    wchar_t patcher[MAX_PATH];
+    if (LedgerOwnerAt(er->ExceptionAddress, patcher, _countof(patcher)))
+        Out(f, L"patched by  %s: the game's code there was changed (riftstone\\logs\\patches.txt)\r\n", patcher);
 #ifdef _M_IX86
     Out(f, L"\r\nregisters   EAX=%08lx EBX=%08lx ECX=%08lx EDX=%08lx\r\n", c->Eax, c->Ebx, c->Ecx, c->Edx);
     Out(f, L"            ESI=%08lx EDI=%08lx EBP=%08lx ESP=%08lx\r\n", c->Esi, c->Edi, c->Ebp, c->Esp);
@@ -476,7 +482,8 @@ static void WriteCrashReport(EXCEPTION_POINTERS* ep, DWORD thread) {
             if (!sf.AddrPC.Offset) break;
             Where((DWORD_PTR)sf.AddrPC.Offset, where, _countof(where));
             int p = PluginAt((DWORD_PTR)sf.AddrPC.Offset);
-            Out(f, L"  #%02d 0x%08llx  %s%s%s\r\n", i, sf.AddrPC.Offset, where, p >= 0 ? L"  <- plugin " : L"",
+            Out(f, L"  #%02d 0x%08llx  %s%s%s\r\n", i, sf.AddrPC.Offset, where,
+                p < 0 ? L"" : g_pluginInfo[p].legacy ? L"  <- legacy " : L"  <- plugin ",
                 p >= 0 ? g_pluginInfo[p].name : L"");
         }
     }
@@ -1241,11 +1248,14 @@ void StabilityStart() {
         LogLine(L"last run ended in a %s after %llu s%s", kind[0] ? kind : L"crash", up == ~0ULL ? 0 : up / 1000,
                 startUp ? L" (during start-up)" : L"");
         const wchar_t* base = module[0] ? wcsrchr(module, L'\\') : NULL;
-        wchar_t pluginsDir[MAX_PATH];
+        wchar_t pluginsDir[MAX_PATH], legacyDir[MAX_PATH], legacyName[MAX_PATH] = L"";
         _snwprintf_s(pluginsDir, _countof(pluginsDir), _TRUNCATE, L"%s\\plugins\\", g_stateDir);
+        _snwprintf_s(legacyDir, _countof(legacyDir), _TRUNCATE, L"%s\\legacy\\", g_stateDir);
         BOOL byPlugin = module[0] && _wcsnicmp(module, pluginsDir, wcslen(pluginsDir)) == 0 && base;
-        if (startUp && byPlugin) {
-            const wchar_t* name = base + 1;
+        BOOL byLegacy = module[0] && _wcsnicmp(module, legacyDir, wcslen(legacyDir)) == 0 && base;
+        if (byLegacy) _snwprintf_s(legacyName, _countof(legacyName), _TRUNCATE, L"legacy\\%s", base + 1);
+        if (startUp && (byPlugin || byLegacy)) {
+            const wchar_t* name = byLegacy ? legacyName : base + 1;
             wchar_t id[64] = L"", prevId[64], count[32], key[PLUGIN_KEY_CAP];
             FileIdentity(module, id, _countof(id));
             PluginKey(name, key, _countof(key));

@@ -398,6 +398,7 @@ def parse_report(text: str) -> dict:
         "hang" if "hang report" in first else "snapshot" if first.startswith("Riftstone snapshot") else "unknown"
     r: dict = {"kind": kind, "loader": None, "time": None, "game": None, "uptime_s": None, "startup": False,
                "safe_mode": False, "exception": None, "access": None, "fault_in": None, "fault_plugin": None,
+               "fault_legacy": None, "patched_by": None,
                "objects": [], "stack": [], "memory": {}, "out_of_memory": False, "plugins": [], "last_files": [],
                "missing_count": 0, "missing": [], "message": None, "caption": None, "missing_file": None,
                "main_thread": None, "stage": None, "device": {}}
@@ -438,6 +439,14 @@ def parse_report(text: str) -> dict:
                 m = re.match(r"plugin (.+?) \(riftstone\\plugins\)$", v)
                 if m:
                     r["fault_plugin"] = m.group(1)
+                m = re.match(r"legacy DLL (.+?) \(riftstone\\legacy\)$", v)
+                if m:
+                    r["fault_legacy"] = m.group(1)
+            elif head == "patched by":
+                # the patch ledger's owner of the code the fault is in (ledger.cpp, docs/runtime.md "Patch ledger")
+                m = re.match(r"(.+?) \((0x[0-9a-fA-F]{1,8}), (\d{1,10}) bytes\): ", line[12:].strip())
+                if m:
+                    r["patched_by"] = {"name": m.group(1), "at": m.group(2), "len": int(m.group(3))}
             elif s.startswith("objects in registers"):
                 section = "objects"
             elif s.startswith("stack words"):
@@ -475,10 +484,10 @@ def parse_report(text: str) -> dict:
             if m:
                 r["objects"].append({"register": m.group(1), "address": m.group(2), "class": m.group(3)})
         elif section == "stack":
-            m = re.match(r"#(\d{1,9}) (0x[0-9a-fA-F]+)\s+(\S+)(?:\s+<- plugin (.+))?$", s)
+            m = re.match(r"#(\d{1,9}) (0x[0-9a-fA-F]+)\s+(\S+)(?:\s+<- (plugin|legacy) (.+))?$", s)
             if m:
                 r["stack"].append({"frame": int(m.group(1)), "address": m.group(2), "where": m.group(3),
-                                   "plugin": m.group(4)})
+                                   "plugin": m.group(5), "legacy": m.group(4) == "legacy"})
         elif section == "words":
             m = re.match(r"\[esp\+0x[0-9a-fA-F]+\] (0x[0-9a-fA-F]+)\s+(\S+) object$", s)
             if m:
@@ -683,6 +692,11 @@ def explain(report: dict, game_root: Path | None = None) -> list[str]:
         name = report["fault_plugin"]
         out.append(f"The fault is inside the plugin {name}. If it keeps crashing the game while it starts, the loader "
                    f"skips it by itself after the second time. To take it out now: Riftstone.cmd loader plugin remove {name}")
+    elif report.get("fault_legacy"):
+        name = report["fault_legacy"]
+        out.append(f"The fault is inside {name}, a DLL from another mod that the loader brings in from riftstone\\legacy. "
+                   f"If it keeps crashing the game while it starts, the loader skips it by itself after the second time. "
+                   f"To take it out now: Riftstone.cmd loader legacy remove {name}")
     elif chained_d3d9:
         out.append(f"The fault is in the Direct3D 9 that [d3d9] chain names ({fault_in.split(' ')[0]}, DXVK or another "
                    "runtime), not Windows' own. 'riftstone loader d3d9 off' goes back to Windows' Direct3D 9; its log in "
@@ -692,9 +706,15 @@ def explain(report: dict, game_root: Path | None = None) -> list[str]:
         if base in _GRAPHICS_MODULES or base.startswith(("nv", "ati", "amd", "igd")):
             out.append("The fault is in Direct3D or the graphics driver: often video or address space running out, "
                        "an overlay or recorder hooking the game, or a driver bug. Update the driver and try without overlays.")
+    patched = report.get("patched_by")
+    if patched:
+        out.append(f"The game's code where it stopped was changed by {patched['name']} ({patched['len']} bytes at "
+                   f"{patched['at']}): the game ran that module's change, not its own code. 'Riftstone.cmd loader "
+                   "patches' lists every change and any two modules that changed the same bytes.")
     for f in report.get("stack", []):
-        if f.get("plugin") and f["plugin"] != report.get("fault_plugin"):
-            out.append(f"The plugin {f['plugin']} was on the stack when it happened.")
+        if f.get("plugin") and f["plugin"] not in (report.get("fault_plugin"), report.get("fault_legacy")):
+            out.append(f"The {'legacy DLL' if f.get('legacy') else 'plugin'} {f['plugin']} was on the stack when it "
+                       "happened.")
             break
     missing = report.get("missing_file")
     wanted = [missing] if missing else []

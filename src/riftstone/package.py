@@ -44,9 +44,9 @@ import zipfile
 import zlib
 from pathlib import Path
 
-from . import __version__, delta, ipaudit, loader, sources, typemap
+from . import __version__, delta, ipaudit, loader, sources, typemap, winapi
 from . import mod as modlib
-from .errors import RiftError
+from .errors import FormatError, RiftError
 from .runtime import ini_text
 
 SCHEMA = "riftstone.package/2"
@@ -57,7 +57,8 @@ RESERVED = ("dinput8.dll", "riftstone_loader.dll")
 # Riftstone's own plugins (native/plugins, MIT); any other plugin in a package keeps its author's terms.
 OWN_PLUGINS = ("enemy_cap", "enemy_skins", "lod_tuner", "inclination_lock", "save_backup", "free_sprint",
                "draw_distance", "six_skill_warrior", "stage_enemies", "portcrystals", "collision_cap",
-               "pool_cap")
+               "pool_cap", "xp_scale", "economy",
+               "vocation_stats")
 # The player zip starts Riftstone's own features OFF (in riftstone\plugins\off), so people choose what changes
 # their game; only what protects the player is on: the save backup, and collision_cap (a frame with more than
 # the game's 800 hit shapes made it read past its table and crash, docs/re-collision-cap.md; 2.6 MB).
@@ -67,6 +68,9 @@ DEFAULT_ON = ("save_backup", "collision_cap")
 # how a README names a feature that starts on
 _ON_WORDS = {"save_backup": "the save backup", "collision_cap": "the collision crash guard"}
 START_HERE = "Riftstone - Start Here.cmd"
+# the player zip's second copy of the loader: Start Here's fix copies it to dinput8.dll when the player skipped that
+# file on unzip (another mod's dinput8.dll was there) or it went missing; the loader never reads this folder
+SPARE_LOADER = "riftstone/loader/dinput8.dll"
 MAX_MEMBER = 256 * 1024 * 1024          # a package member, unpacked
 MAX_TOTAL = 1024 * 1024 * 1024          # everything in a package, unpacked
 MAX_MEMBERS = 50_000
@@ -606,8 +610,8 @@ def _plugins_readme(title: str, plugins: list[tuple[str, str]], ninput: bool = F
               "  2. Open the game folder: in Steam, right-click Dragon's Dogma: Dark Arisen, then Manage, then",
               "     Browse local files. It is the folder with DDDA.exe in it.",
               "  3. Unzip everything from this zip into that folder, keeping the folders. If Windows asks to",
-              "     replace files, say yes. (If it says a file named dinput8.dll is already there, another mod",
-              "     owns that name: stop and read \"Already have a dinput8.dll?\" below first.)",
+              "     replace files, say yes. (Only if the dinput8.dll already there is another mod's, such as",
+              "     DDDA Tweak or an ASI loader, skip that one file: see \"Already have a dinput8.dll?\" below.)",
               f"  4. Double-click  {START_HERE}  in that folder:",
               "        1  checks that the install is right and says what to fix"]
     lines += para(state, "        2  ", "           ")
@@ -620,10 +624,13 @@ def _plugins_readme(title: str, plugins: list[tuple[str, str]], ninput: bool = F
               "Updating from an older Riftstone",
               "  Unzip over it the same way, then double-click Start Here once: it swaps in this zip's new copy of",
               "  every feature you already had on, and keeps that feature's settings. The zip replaces",
-              "  riftstone_loader.ini, so redo any change you made in that file.", "",
+              "  riftstone_loader.ini, so redo any change you made in that file. A mod you chained as",
+              "  dinput8_chain.dll stays chained. If you kept your old dinput8.dll, choice 1 says so and F puts",
+              "  this zip's loader in.", "",
               "What is in the zip"]
     lines += ["  * dinput8.dll and riftstone_loader.ini -- the Riftstone loader, which loads the features",
-              f"  * {START_HERE} -- the check and the on/off switch"]
+              f"  * {START_HERE} -- the check (and its fix) and the on/off switch",
+              f"  * {SPARE_LOADER.replace('/', chr(92))} -- a spare copy of the loader, which the fix puts back"]
     for p, about in plugins:
         stem = Path(p).stem.lower()
         state = "off until you turn it on" if stem in off else "on"
@@ -634,14 +641,18 @@ def _plugins_readme(title: str, plugins: list[tuple[str, str]], ninput: bool = F
               "  beside it.", "",
               "Nothing shows up in the game?",
               f"  Run {START_HERE}, choice 1. It says what is missing (most often dinput8.dll is not in the",
-              "  same folder as DDDA.exe, or another mod is using that name; see below). If you ask for help,",
-              "  send the two files choice 3 shows: loader.log and the newest crash-*.txt.", "",
+              "  same folder as DDDA.exe, or another mod is using that name; see below), and F fixes what it",
+              "  can. If dinput8.dll keeps disappearing, Windows Security may have taken it: open Windows",
+              "  Security, Virus and threat protection, Protection history. If you ask for help, send what",
+              "  choice 1 prints and the two files choice 3 shows: loader.log and the newest crash-*.txt.", "",
               "Already have a dinput8.dll?",
-              "  Another mod in the game folder (DDDA Tweak, for example) may use that file name. Do this before",
-              "  step 3 and both keep working:",
-              "    a. Rename your dinput8.dll to  dinput8_chain.dll  (in the same folder).",
-              "    b. Do step 3. Then open riftstone_loader.ini in Notepad. Under [loader], find the line  chain =",
-              "       (the note above it mentions DDDA Tweak), change it to  chain = dinput8_chain.dll  and save.", "",
+              "  Another mod in the game folder (DDDA Tweak, an ASI loader) may use that file name. Keep it, and",
+              "  both keep working:",
+              "    a. Do step 3, but skip dinput8.dll when Windows says it is already there.",
+              f"    b. Double-click {START_HERE}, choose 1, then press F. It renames the other mod's",
+              "       dinput8.dll to  dinput8_chain.dll  and puts Riftstone's in its place. Riftstone starts",
+              "       dinput8_chain.dll itself; riftstone_loader.ini needs no change.",
+              "  (By hand: rename your dinput8.dll to  dinput8_chain.dll  before step 3.)", "",
               "Steam Deck / Linux (Proton)",
               "  Do the same (the .cmd file needs Windows; move the plugin files by hand instead), then in Steam:",
               "  the game's Properties > General > Launch Options, enter",
@@ -686,11 +697,28 @@ def _check_ninput(path: Path) -> bytes:
     return data
 
 
+def check_windows10(path: str, data: bytes, strict: bool = True) -> None:
+    """Refuse a DLL of Riftstone's own that might not load on Windows 10: one importing a function nobody checked
+    exists there, or whose header asks for a newer Windows (:mod:`riftstone.winapi`).  Windows refuses such a DLL
+    before any of its code runs, so a player sees nothing at all from it.  A file that is no PE file at all is
+    refused too, unless ``strict`` is off (the player zip's stand-ins in tests)."""
+    try:
+        bad = winapi.problems(data)
+    except FormatError as e:
+        if not strict:
+            return
+        raise RiftError(f"{path} is not a Windows DLL ({e})") from None
+    if bad:
+        raise RiftError(f"{path} might not load on Windows 10: " + "; ".join(bad) + " (look the function up and "
+                        "add it to riftstone.winapi.VETTED if Windows 10 1809 has it, else look it up at run time)")
+
+
 def build_plugins(plugins: list[Path], out: Path, name: str | None = None, loader_dir: Path | None = None,
                   ninput: Path | None = None, start_on: tuple[str, ...] | None = None) -> dict:
-    """A zip for players without Riftstone: the loader (dinput8.dll + riftstone_loader.ini) and the plugins at
-    their game-folder paths, a README, "Riftstone - Start Here.cmd" and riftstone/package.json -- no mods and no
-    game data.  Riftstone's own plugins start OFF (in riftstone\\plugins\\off, where the loader never looks) except
+    """A zip for players without Riftstone: the loader (dinput8.dll + riftstone_loader.ini, and the spare copy
+    Start Here's fix puts back, ``SPARE_LOADER``) and the plugins at their game-folder paths, a README, "Riftstone -
+    Start Here.cmd" and riftstone/package.json -- no mods and no game data.  Riftstone's own DLLs in it must load on
+    Windows 10 (``check_windows10``).  Riftstone's own plugins start OFF (in riftstone\\plugins\\off, where the loader never looks) except
     the ones in ``start_on`` (default: DEFAULT_ON, the save backup and collision_cap); a plugin that is not Riftstone's is on, since
     whoever packaged it named it.  ``ninput`` (its xinput1_3.dll) adds Ninput under optional\\ninput with its
     licences: shipped, but off until a player copies it."""
@@ -725,8 +753,15 @@ def build_plugins(plugins: list[Path], out: Path, name: str | None = None, loade
                 s = stem.lower()
                 return "riftstone/plugins/off/" if s in OWN_PLUGINS and s not in on_names else "riftstone/plugins/"
 
+            check_windows10("dinput8.dll", dll.read_bytes(), False)   # Riftstone's own; others' are their authors'
+            for f in plugin_files:
+                if f.stem.lower() in OWN_PLUGINS:
+                    check_windows10(f.name, f.read_bytes(), False)
+            if ninput_dll is not None:
+                check_windows10("xinput1_3.dll", ninput_dll, False)
             put("dinput8.dll", dll.read_bytes())
-            put("riftstone_loader.ini", _loader_ini())
+            put(SPARE_LOADER, dll.read_bytes())         # Start Here's fix (F) copies it in when dinput8.dll was
+            put("riftstone_loader.ini", _loader_ini())  # skipped on unzip (another mod's) or taken away
             put("riftstone/LICENSE-Riftstone.txt", _license())
             for f in plugin_files:
                 put(folder_of(f.stem) + f.name, f.read_bytes())

@@ -26,6 +26,8 @@ session  runtime-state.ini and the crash note as the loader leaves them: how the
          a known reason (or named as unknown) with words, one line, and no negative time
 plugin_ini  a plugin's .ini and one setting Studio writes: refused, or the value lands on its key and every
          other line of the file stays as it was
+profile  an overhaul profile (riftstone-profile/1): refused, or it reads back from its own text; a dry-run import on a
+         stand-in game changes no byte and writes only checked values to keys the files have; the import is its plan
 stage_enemies_ini  stage_enemies.ini and the lines an install writes into it: one block, in [stage_enemies], the
          same twice; removed, every other line is the file's own; a UTF-16 file that does not decode is refused
 dye      Online's dye baked into a colour map: every texel equals an independent oracle of the shader's formula,
@@ -1532,6 +1534,95 @@ def t_save_arisen(data: bytes) -> None:
     assert saves.set_arisen(new, edit, t) == (new, 0), "a second edit changed the save again"
 
 
+def t_save_pawns(data: bytes) -> None:
+    """A save's XML (what `riftstone saves pawns` edits), the change picked by its CRC-32: a clone of the main
+    pawn into hired slots, a pawn's level and discipline, or one character's looks given to another.  It refuses
+    with RiftError, or: a clone leaves every byte outside the chosen slots' records as it was and makes each of
+    them the main pawn's record with only values changed; a set or a copy of looks changes only the text of
+    values inside the character it names (its parameters, or its looks with the name kept), as many as it
+    reports; a party and an online check that read before still read, and doing it again changes nothing."""
+    import re
+    import zlib
+
+    from riftstone import pawns, saves
+
+    pick = zlib.crc32(data).to_bytes(4, "little")     # a save's first bytes are always its XML declaration
+    save = saves.pack(data)
+    what = pick[0] % 3
+
+    def reads(d: bytes) -> bool:
+        try:
+            pawns.party(d)
+            pawns.online_check(d)
+        except RiftError:
+            return False
+        return True
+    readable = reads(save)
+    try:
+        if what == 0:
+            slots = (("1",), ("2",), ("1", "2"))[pick[1] % 3]
+            new, n = pawns.clone_main(save, slots)
+        elif what == 1:
+            who = pawns.SLOTS[pick[1] % 3]
+            edit = saves.ArisenEdit(level=1 + pick[2] % saves.LEVEL_MAX, points=pick[3] * 4000)
+            new, n = pawns.set_character(save, who, edit)
+        else:
+            src, dst = pawns.WHO[pick[1] % 4], pawns.WHO[pick[2] % 4]
+            new, n = pawns.copy_looks(save, src, dst)
+    except RiftError:
+        return
+    assert n > 0 or new == save, "a change that changed nothing rewrote the save"
+    after = saves.unpack(new)
+    saves.check(new, deep=True)
+    values = re.compile(rb'<(f32|u32|u16|u8|s32|s16|s8)(?: name="[^"]*")? value="([^"]*)"/>')
+    blank = rb'<\1 value=""/>'
+    before, now = pawns.characters(data), pawns.characters(after)
+    if what == 0:
+        copies = sorted({c for c, _ in before}, key=lambda c: before[(c, "main")].start)
+        spans = sorted((before[(c, s)].start, before[(c, s)].end, c, s) for c in copies for s in slots)
+        kept, rest, at = [], [], 0
+        for s, e, _, _ in spans:
+            kept.append(data[at:s])
+            at = e
+        kept.append(data[at:])
+        spans_now = sorted((now[(c, s)].start, now[(c, s)].end) for c in copies for s in slots)
+        at = 0
+        for s, e in spans_now:
+            rest.append(after[at:s])
+            at = e
+        rest.append(after[at:])
+        assert kept == rest, "a clone changed bytes outside the hired slots it was given"
+        for c in copies:
+            main = data[before[(c, "main")].start:before[(c, "main")].end]
+            for s in slots:
+                clone = after[now[(c, s)].start:now[(c, s)].end]
+                assert values.sub(blank, main) == values.sub(blank, clone), f"{c} slot {s} is not the main pawn's record"
+                for a, v in zip(values.finditer(main), values.finditer(clone)):   # what the clone set itself
+                    assert a.group(2) == v.group(2) or saves._WRITTEN[v.group(1).decode()].fullmatch(v.group(2)), \
+                        f"wrote {v.group(2)!r}"
+        assert pawns.clone_main(new, slots) == (new, 0), "a second clone changed the save again"
+    else:
+        assert values.sub(blank, data) == values.sub(blank, after), "the change touched more than values"
+        changed = [(a, b) for a, b in zip(values.finditer(data), values.finditer(after)) if a.group(2) != b.group(2)]
+        assert len(changed) == n, f"{len(changed)} values changed; the change says {n}"
+        target = who if what == 1 else dst
+        inside = [(c.param if what == 1 else c.edit) for (_, w), c in now.items() if w == target]
+        for _, b in changed:
+            assert saves._WRITTEN[b.group(1).decode()].fullmatch(b.group(2)), f"wrote {b.group(2)!r}"
+            assert any(s <= b.start() < e for s, e in inside), "a value outside the character it names changed"
+        if what == 2:
+            def name(xml: bytes, c) -> bytes:       # the name array as text, readable or not
+                s = xml.find(b'<array name="(u8*)mNameStr"', *c.edit)
+                return b"" if s < 0 else xml[s:xml.find(b"</array>", s)]
+            for (copy, w), c in now.items():
+                if w == dst:
+                    assert name(after, c) == name(data, before[(copy, w)]), "the name changed"
+            assert pawns.copy_looks(new, src, dst) == (new, 0), "a second copy changed the save again"
+        else:
+            assert pawns.set_character(new, who, edit) == (new, 0), "a second set changed the save again"
+    assert reads(new) or not readable, "a save whose party read no longer reads"
+
+
 def t_fsmap(data: bytes) -> None:
     """Names <-> paths reverse exactly for every resource type (the first two bytes pick it); decoded user
     paths are canonical."""
@@ -1548,6 +1639,69 @@ def t_fsmap(data: bytes) -> None:
 
 
 # -- filesystem targets -----------------------------------------------------------
+
+_PROFILE_GAME = {
+    "riftstone_loader.ini": b"[loader]\r\noverlay = 1\r\n[fps]\r\nmax_fps = 165\r\n[overlay]\r\nkey = Insert\r\n",
+    "riftstone/plugins/enemy_cap.dll": b"MZ",
+    "riftstone/plugins/enemy_cap.ini": b"[enemy_cap]\r\nslots = 30\r\nrecord = 1\r\n",
+    "riftstone/plugins/save_backup.dll": b"MZ",
+    "riftstone/plugins/save_backup.ini": b"\xff\xfe" + "[backup]\r\nFolder = auto\r\nKeep = 20\r\n".encode("utf-16-le"),
+    "riftstone/plugins/off/free_sprint.dll": b"MZ",
+    "riftstone/plugins/off/free_sprint.ini": b"[sprint]\r\nMode = out_of_battle\r\nWho = party\r\n",
+    "riftstone/plugins/off/lod_tuner.dll": b"MZ",
+}
+
+
+def t_profile(data: bytes) -> None:
+    """An overhaul profile (riftstone-profile/1, any bytes).  Refused with RiftError; or it writes back to text
+    that reads back the same (and the same text again); a dry-run import on a stand-in game folder changes no
+    byte; every value it would write passes its key's check and names a key the file has; a real import does
+    what the dry run said, and a second import finds nothing left to do."""
+    from unittest import mock
+
+    from riftstone import install, plugins, profiles
+    from riftstone.game import Game
+
+    try:
+        p = profiles.parse(data)
+    except RiftError:
+        return
+    text = profiles.to_json(p)
+    again = profiles.parse(text.encode("utf-8"))
+    assert again == p, "the profile does not read back from its own text"
+    assert profiles.to_json(again) == text, "the text is not stable"
+    with _workdir() as tmp, mock.patch.object(install, "game_running", lambda g: False):
+        game = Game(Path(tmp) / "game")
+        for rel, raw in {"DDDA.exe": b"stub", **_PROFILE_GAME}.items():
+            (game.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (game.root / rel).write_bytes(raw)
+        (game.root / "nativePC" / "rom").mkdir(parents=True)
+
+        def files():
+            return {str(f.relative_to(game.root)): f.read_bytes() for f in game.root.rglob("*") if f.is_file()}
+
+        before = files()
+        try:
+            plan = profiles.apply(game, p, dry_run=True)
+        except RiftError:
+            return
+        assert files() == before, "a dry run changed a file"
+        stems = {s.lower(): s for s, _, _ in profiles.installed(game)} | {plugins.LOADER: plugins.LOADER}
+        for name, section, key, value in plan["writes"]:
+            stem = plugins.LOADER if name == "riftstone_loader.ini" else Path(name).stem
+            assert stem.lower() in stems, f"a write into {name}"
+            assert plugins.rule_for(stems[stem.lower()], section, key) is not None, f"{name} [{section}] {key} unchecked"
+            assert plugins._valid(stems[stem.lower()], section, key, value) == value, f"{value!r} not its check's"
+        done = profiles.apply(game, p)
+        assert (done["switched"], done["writes"]) == (plan["switched"], plan["writes"]), "the import was not its plan"
+        for name, section, key, value in done["writes"]:
+            ini = next(f for f in game.root.rglob(name) if f.is_file())
+            hits = [s for s in plugins.read_settings(ini) if (s["section"].lower(), s["key"].lower())
+                    == (section.lower(), key.lower())]
+            assert hits and hits[0]["value"] == value, f"{name} [{section}] {key} did not land"
+        rest = profiles.apply(game, p, dry_run=True)
+        assert (rest["switched"], rest["set"]) == (0, 0), "a second import still had work"
+
 
 def _workdir():
     base = Path(os.environ.get("RIFTSTONE_FUZZ_TMP") or tempfile.gettempdir())
@@ -3037,13 +3191,20 @@ def t_package_plugins(data: bytes) -> None:
     (ldir / "dinput8.dll").write_bytes(b"MZ" + loaderlib.MARKER)
     plugins = []
     inis = case.get("inis") if isinstance(case.get("inis"), dict) else {}
+    imports = case.get("imports") if isinstance(case.get("imports"), dict) else {}
     for i, nm in enumerate((case.get("plugins") or [])[:4] if isinstance(case.get("plugins"), list) else []):
         if not isinstance(nm, str) or not nm or any(c in nm for c in '\\/:*?"<>|\0') or nm.strip(". ") != nm:
             continue
         d = work / f"p{i % 2}"                  # two plugins may share a folder, so x.asi and x.dll share x.ini
         d.mkdir(exist_ok=True)
         try:
-            (d / nm).write_bytes(b"MZ plugin " + nm.encode("utf-8", "surrogateescape"))
+            wants = imports.get(nm)
+            if isinstance(wants, list):              # a real DLL importing these from USER32 (vetted or not)
+                import helpers
+                funcs = [x for x in wants if isinstance(x, str) and x.isascii() and x.isidentifier()][:8]
+                (d / nm).write_bytes(helpers.pe_file(exports=(), imports={"USER32.dll": funcs} if funcs else None))
+            else:
+                (d / nm).write_bytes(b"MZ plugin " + nm.encode("utf-8", "surrogateescape"))
             ini = inis.get(nm)
             if isinstance(ini, str):
                 (d / nm).with_suffix(".ini").write_bytes(ini.encode("utf-8", "surrogateescape"))
@@ -3085,12 +3246,22 @@ def t_package_plugins(data: bytes) -> None:
         names = z.namelist()
         assert len(names) == len(set(names)), "a path is in the zip twice"
         assert {"dinput8.dll", "riftstone_loader.ini", "riftstone/package.json", package.START_HERE} <= set(names)
+        assert z.read(package.SPARE_LOADER) == z.read("dinput8.dll"), "Start Here's spare is not the zip's loader"
         assert sum(1 for n in names if n.startswith("README - ") and n.endswith(".txt")) == 1, "one README"
         assert not [n for n in names if n.startswith(("riftstone/overlay/", "mods/"))], "game data in the zip"
         found = [f for n in names for f in ipaudit.scan_bytes(n, z.read(n))]
         assert not found, f"the zip carries {found[:3]}"
         man = json.loads(z.read("riftstone/package.json"))
         assert set(man["files"]) == set(names) - {"riftstone/package.json"}, "the manifest does not list the zip"
+        from riftstone import winapi
+        for n in names:                                 # Riftstone's own DLLs in it all load on Windows 10
+            stem = n.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+            if n.startswith("riftstone/plugins/") and n.endswith((".asi", ".dll")) and stem in package.OWN_PLUGINS:
+                try:
+                    bad = winapi.problems(z.read(n))
+                except RiftError:
+                    bad = []                            # a stand-in that is no PE file at all
+                assert not bad, f"{n} went in though it might not load on Windows 10: {bad}"
         def home(stem: str) -> str:                     # Riftstone's own features start off (1.0.3), the rest on
             own_off = stem.lower() in package.OWN_PLUGINS and stem.lower() not in package.DEFAULT_ON
             return "riftstone/plugins/off/" if own_off else "riftstone/plugins/"
@@ -3430,6 +3601,60 @@ def t_terrain(data: bytes) -> None:
             assert any("world coordinates" in e for e in errors), "a cell piece moved into the world passed check"
 
 
+def t_scene(data: bytes) -> None:
+    """The 3D map's scene (scene.py).  A collision mesh (.sbc) becomes a layer: every triangle sbc.triangles reads
+    either goes out moved by the cell's corner and rounded to float32, in order, its vertex numbers inside the
+    vertex list, or is left out because a corner is not finite or past COORD_MAX, and counted; the box holds every
+    vertex.  Anything else is the World tab's query text "x,z|radius": parse_at and parse_radius answer or refuse,
+    and the field's cells stay inside the 100 x 100 grid, hold the point's own cell and number at most (2r+1)^2."""
+    import base64
+    import math
+    from array import array
+
+    from riftstone import sbc, scene, terrain
+
+    f32 = lambda v: struct.unpack("<f", struct.pack("<f", v))[0]  # noqa: E731
+    if data[:4] == sbc.MAGIC:
+        tris = sbc.triangles(data)
+        c = terrain.Cell(47, 35)
+        ly = scene._Layer("e")
+        for a, b, cc, _n in tris:
+            ly.add(a, b, cc, c.offset)
+        out = ly.out()
+        v, t = array("f"), array("I")
+        v.frombytes(base64.b64decode(out["verts"]))
+        t.frombytes(base64.b64decode(out["tris"]))
+        assert len(v) == 3 * out["vertices"] and len(t) == 3 * out["triangles"], "counts do not match the lists"
+        assert out["triangles"] + out["skipped"] == len(tris), "a triangle was neither sent nor counted"
+        assert all(i < out["vertices"] for i in t), "a vertex number past the list"
+        kept = [tri for tri in tris if all(math.isfinite(p[k] + c.offset[k]) and abs(p[k] + c.offset[k]) <= scene.COORD_MAX
+                                           for p in tri[:3] for k in range(3))]
+        assert len(kept) == out["triangles"], "the wrong triangles were left out"
+        for j, tri in enumerate(kept):
+            for k in range(3):
+                got = tuple(v[3 * t[3 * j + k] + i] for i in range(3))
+                assert got == tuple(f32(tri[k][i] + c.offset[i]) for i in range(3)), "a corner did not move by the corner"
+        for i in range(0, len(v), 3):
+            assert all(ly.lo[k] <= v[i + k] or f32(ly.lo[k]) <= v[i + k] for k in range(3)), "a vertex below the box"
+            assert all(v[i + k] <= ly.hi[k] or v[i + k] <= f32(ly.hi[k]) for k in range(3)), "a vertex above the box"
+        return
+    text = data.decode("latin-1")
+    at_text, _, r_text = text.partition("|")
+    at = scene.parse_at(at_text)
+    r = scene.parse_radius(r_text)
+    assert 0 <= r <= scene.RADIUS_MAX, "a radius past the limit"
+    if at is None:
+        assert at_text.strip() == "", "a point read from nothing"
+        return
+    assert all(math.isfinite(x) and abs(x) <= scene.COORD_MAX for x in at), "a point past the world"
+    cells = scene.field_cells(at, r)
+    assert all(0 <= cl.m < 100 and 0 <= cl.n < 100 for cl in cells), "a cell outside the grid"
+    assert len(cells) <= (2 * r + 1) ** 2 and len(set(cells)) == len(cells), "too many cells, or one twice"
+    mid = terrain.cell_at(*at)
+    if 0 <= mid.m < 100 and 0 <= mid.n < 100:
+        assert mid in cells, "the point's own cell is missing"
+
+
 def t_live(data: bytes) -> None:
     """The live-stats page as the loader publishes it: parse or refuse; a parsed page is consistent."""
     from riftstone import runtime
@@ -3456,7 +3681,8 @@ def t_live(data: bytes) -> None:
 
 
 def t_pe(data: bytes) -> None:
-    """Exe / DLL bytes: header, exports, checksum and the large-address copy, or FormatError."""
+    """Exe / DLL bytes: header, exports, checksum and the large-address copy, the imports and the Windows 10 check
+    (every import vetted or named, never both), or FormatError."""
     from riftstone import pe
 
     h = pe.header(data)
@@ -3477,6 +3703,19 @@ def t_pe(data: bytes) -> None:
         assert all(a == b for i, (a, b) in enumerate(zip(data, out)) if i not in keep), "bytes beyond the two fields changed"
     else:
         assert out == data, "a file with the flag changed"
+    # what it imports, and whether Windows 10 has it (last: a damaged import table is a FormatError of its own)
+    from riftstone import winapi
+    major, minor = pe.required_os(data)
+    assert 0 <= major <= 0xFFFF and 0 <= minor <= 0xFFFF, "a subsystem version out of range"
+    table = pe.imports(data)
+    listed = [f"{d}!{n}" for d, ns in table.items() for n in ns]
+    assert all(isinstance(d, str) and all(isinstance(n, str) for n in ns) for d, ns in table.items()), "a name"
+    gone = winapi.missing(data)
+    assert all(f"{d}!" in gone for d, ns in table.items() if "" in ns), "an import with no name passed as vetted"
+    assert len(listed) <= pe._MAX_NAMES, "more imports than the reader's budget"
+    vetted = [f"{d}!{n}" for d, ns in table.items() for n in ns if n in winapi.VETTED.get(d.lower(), ())]
+    assert sorted(gone + vetted) == sorted(listed), "an import neither vetted nor named as missing"
+    assert len(winapi.problems(data)) == len(gone) + ((major, minor) > winapi.OLDEST_WINDOWS), "problems miscounted"
 
 
 def t_d3d9_source(data: bytes) -> None:
@@ -3666,6 +3905,46 @@ def t_portcrystals_names(data: bytes) -> None:
     assert back == {k: v for k, v in names.items() if k != key}, (names, back)
 
 
+def t_patch_ledger(data: bytes) -> None:
+    """riftstone\\logs\\patches.txt (any bytes, read as patchledger.read reads it): refused with RiftError, or a ledger
+    whose every owner number and change region is in the file; written back in the loader's form it reads back the
+    same and writes the same text again; per owner the places, bytes and import slots add up to the file's; the
+    crash report's "patched by" names an owner of the file at every change's first byte and nothing below the
+    lowest change; its words and its JSON form never fail."""
+    import json
+
+    from riftstone import patchledger
+
+    try:
+        led = patchledger.parse(data.decode("utf-8", "replace"))
+    except RiftError:
+        return
+    count = len(led.owners)
+    names = {r["name"] for r in led.regions}
+    assert all(r["owner"] < count and r["region"] in names for r in led.ranges), "a change names no owner or region"
+    assert all(r["owner"] < count for r in led.imports), "an import names no owner"
+    assert all(r["first"] < count and r["then"] < count for r in led.conflicts + led.chains), "an overlap's owner"
+    assert all(len(r["before"]) == len(r["after"]) == min(r["len"], 16) for r in led.ranges), "shown bytes"
+    text = patchledger.format_ledger(led)
+    back = patchledger.parse(text)
+    assert back == led, "written back, it reads differently"
+    assert patchledger.format_ledger(back) == text, "written twice, the text changed"
+    rows = patchledger.by_owner(led)
+    assert sum(r["places"] for r in rows) == len(led.ranges), "places per owner"
+    assert sum(r["bytes"] for r in rows) == sum(r["len"] for r in led.ranges), "bytes per owner"
+    assert sum(r["imports"] for r in rows) == len(led.imports), "import slots per owner"
+    owners = {o["name"] for o in led.owners}
+    for r in led.ranges[:64]:
+        assert patchledger.owner_at(led, r["at"]) in owners, f"nobody at 0x{r['at']:08x}"
+    if led.ranges and min(r["at"] for r in led.ranges) > 0:
+        assert patchledger.owner_at(led, min(r["at"] for r in led.ranges) - 1) is None, "an owner below every change"
+    words = patchledger.summary(led)
+    assert words and words[0].startswith(f"{led.game}: {len(led.ranges)} change(s)"), words[:1]
+    assert ("not complete" in words[0]) != led.complete, "the summary and complete disagree"
+    d = json.loads(json.dumps(led.as_dict()))
+    assert (len(d["ranges"]), len(d["imports"]), d["complete"]) == (len(led.ranges), len(led.imports), led.complete)
+
+
 def t_minidump(data: bytes) -> None:
     """A loader's minidump (any bytes).  Refused with FormatError, or every thread says where it is (a module and an
     offset inside it, or a bare address) with at most MAX_FRAMES callers, each in a module and past its first page;
@@ -3784,9 +4063,7 @@ def t_plugin_ini(data: bytes) -> None:
             assert path.read_bytes() == ini, "a refused write changed the file"
             return
         assert not any(c in clean for c in ";=[]\r\n\0"), "a written value carries a separator"
-        rule = plugins._RULES.get((stem.lower(), section.lower(), key.lower()))
-        if rule is None and plugins._BOOL_KEYS.match(key.lower()):
-            rule = ("int", 0, 1)
+        rule = plugins.rule_for(stem, section, key)
         if rule and rule[0] in ("int", "float", "int_or_zero", "float_or_zero"):
             n = float(clean)                   # a number rule writes a number: its range, or 0 where 0 is allowed
             assert (n == 0 and rule[0].endswith("_or_zero")) or rule[1] <= n <= rule[2], "a number outside its range"
@@ -3796,6 +4073,50 @@ def t_plugin_ini(data: bytes) -> None:
         (old, old_crcr), (new, new_crcr) = _ini_view(ini), _ini_view(path.read_bytes())
         assert len(old) == len(new) and sum(a != b for a, b in zip(old, new)) <= 1, "other lines changed"
         assert new_crcr <= old_crcr, "a line ending was doubled"
+
+
+def t_plugin_update(data: bytes) -> None:
+    """A plugin updated through `loader plugin add` (loader.add_plugin) over an ini the owner already has: the
+    build's ini (any bytes), a line "#owner", the owner's (any bytes; none = no file yet).  With no owner's
+    text the build's ini arrives byte for byte; otherwise, as the merge reads an ini (loader._ini_values), every
+    value the owner had is kept, every key only the build's ini has gets its default, the owner's UTF-16 mark is
+    kept (a default the owner's encoding cannot hold arrives as Windows writes it, '?'), and a second update
+    writes the same bytes; no temporary file is left."""
+    from riftstone import loader
+    from riftstone.game import Game
+    from riftstone.runtime import INI_UTF16, ini_bytes, ini_text
+
+    template, _, owners = data.partition(b"\n#owner\n")
+    with _workdir() as tmp:
+        game = Game(Path(tmp) / "game")
+        game.root.mkdir()
+        (game.root / "DDDA.exe").write_bytes(b"stub")
+        build = Path(tmp) / "build"
+        build.mkdir()
+        (build / "p.asi").write_bytes(b"MZ")
+        (build / "p.ini").write_bytes(template)
+        d = loader.plugins_dir(game)
+        d.mkdir(parents=True)
+        if owners:
+            (d / "p.ini").write_bytes(owners)
+        loader.add_plugin(game, build / "p.asi")
+        out = (d / "p.ini").read_bytes()
+        assert sorted(p.name for p in d.iterdir()) == ["p.asi", "p.ini"], "a temporary file was left"
+        if not ini_text(owners):
+            assert out == template, "a new ini is not the build's"
+            return
+        assert out.startswith(INI_UTF16) == owners.startswith(INI_UTF16), "the owner's encoding changed"
+        view = lambda raw: loader._ini_values(ini_text(raw).replace("�", "?"))   # noqa: E731
+        mine, theirs, got = view(owners), view(ini_bytes(ini_text(template), like=owners)), view(out)
+        for s, keys in mine.items():
+            for k, v in keys.items():
+                assert got.get(s, {}).get(k) == v, f"the owner's [{s}] {k} was not kept"
+        for s, keys in theirs.items():
+            for k, v in keys.items():
+                if k not in mine.get(s, {}):
+                    assert got.get(s, {}).get(k) == v, f"the new [{s}] {k} did not get its default"
+        loader.add_plugin(game, build / "p.asi")
+        assert (d / "p.ini").read_bytes() == out, "a second update changed the ini"
 
 
 def t_stage_enemies_ini(data: bytes) -> None:
@@ -4624,6 +4945,97 @@ def t_arrange(data: bytes) -> None:
                     assert q.how == "kept" or math.dist(p.now, q.now) > 1.0, "two set out on one spot"
 
 
+def t_spawnedit(data: bytes) -> None:
+    """The World tab's placement editor (spawnedit.edit, JSON: one edit or {"steps": [up to four]}) on the stand-in
+    stage 424 with its navigation mesh: each edit is refused with RiftError and writes nothing, or writes only the
+    files its change names (each holding the bytes it says), and in every copy of the layout changes only the
+    record it was given -- the others keep their kind, fields and order, a move only its position and heading, a
+    size or health change only its scale and health fields, another enemy keeps its id, position and heading, a
+    revert or a put-back is the game's own record, a removal takes out that id alone -- and undoing every accepted
+    edit, last first, gives the mod back byte for byte; nothing outside the mod changes."""
+    from riftstone import lot, modfiles, spawnedit
+    from riftstone.mod import Mod
+
+    game, idx, w, _b, base = _nav_world()
+    try:
+        case = json.loads(data.decode("utf-8", "replace"))
+    except (ValueError, RecursionError):
+        raise RiftError("not a case") from None
+    steps = case.get("steps") if isinstance(case, dict) and "steps" in case else [case]
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 4 or not all(isinstance(b, dict) for b in steps):
+        raise RiftError("not a case")
+    root = base / "spawnedit"
+    if not root.exists():
+        Mod.create(root, "Fuzz")
+
+    def files() -> dict:
+        return {f: f.read_bytes() for f in root.rglob("*") if f.is_file()}
+
+    def body_of(b: dict) -> tuple[str, lot.Lot | None]:
+        name, _ln = spawnedit.layout_name(b.get("layout"))
+        return name, spawnedit._game_layout(game, idx, name)
+
+    start, outside = files(), _outside(base, root)
+    done = []
+    try:
+        for b in steps:
+            name, g = body_of(b)
+            before = files()
+            was, from_game = spawnedit._copies(game, idx, root, name)
+            ground = spawnedit.stage_ground(game, idx, 424, root) if b.get("op") == "move" and b.get("ground") is True else None
+            try:
+                ch = spawnedit.edit(game, idx, w, root, b, ground)
+            except RiftError:
+                assert files() == before, "a refused edit wrote into the mod"
+                raise
+            done.append(ch)
+            now = files()
+            named = {f for f, _, _ in ch.files}
+            assert {f for f in set(before) | set(now) if before.get(f) != now.get(f)} <= named, "a file changed that the change does not name"
+            for f, old, new in ch.files:
+                assert now.get(f) == new and before.get(f) == old, "a change's bytes are not the file's"
+            rid = b["id"]
+            game_rec = {r.id: r for r in (g.records if g else [])}.get(rid)
+            after, _ = spawnedit._copies(game, idx, root, name)
+            olds = {c.path: c.lot for c in was}
+            for c in after:
+                old = olds.get(c.path) or (was[0].lot if from_game else None)
+                assert old is not None, "a copy of the layout appeared from nowhere"
+                ids0, ids1 = [r.id for r in old.records], [r.id for r in c.lot.records]
+                if ch.op == "remove":
+                    assert ids1 == [i for i in ids0 if i != rid] and len(ids1) == len(ids0) - 1, "a removal took out more"
+                elif ch.op == "restore":
+                    assert sorted(ids1) == sorted(ids0 + [rid]) and rid not in ids0, "a put-back added the wrong records"
+                else:
+                    assert ids1 == ids0, "the records' ids or order changed"
+                o = {r.id: r for r in old.records}
+                for r in c.lot.records:
+                    if r.id != rid:
+                        assert (r.kind, r.fields) == (o[r.id].kind, o[r.id].fields), "another record changed"
+                        continue
+                    if ch.op in ("revert", "restore"):
+                        assert game_rec is not None and (r.kind, r.fields) == (game_rec.kind, game_rec.fields), "not the game's own record"
+                        continue
+                    was_r = o[rid]
+                    diff = {k for k in set(r.fields) | set(was_r.fields) if r.fields.get(k) != was_r.fields.get(k)}
+                    if ch.op == "move":
+                        assert r.kind == was_r.kind and diff <= {"mPosition", "mAngle"}, f"a move changed {sorted(diff)}"
+                    elif ch.op == "set":
+                        assert r.kind == was_r.kind and diff <= {"mScale", spawnedit.HP_FLAG, spawnedit.HP_RATE}, f"a set changed {sorted(diff)}"
+                    else:
+                        assert all(r.fields.get(k) == was_r.fields.get(k) for k in ("mPosition", "mAngle")), "another enemy moved"
+            if ch.number is not None:
+                assert ch.record["id"] == rid and after[0].lot.records[ch.number].id == rid, "the change describes another record"
+            for f in named:
+                if f.exists() and ".lot" in f.name:
+                    lot.parse(modfiles.read(f))
+    finally:
+        for ch in reversed(done):
+            spawnedit.undo(ch.files)
+        assert files() == start, "undoing every edit did not give the mod back"
+        assert not _changed(outside, _outside(base, root)), "the editor wrote outside the mod"
+
+
 _EXPORT_RUNS = [0]
 
 
@@ -4798,6 +5210,7 @@ TARGETS = {
     "skintex": (t_skintex, False, 1 << 16),
     "monster": (t_monster, False, 1 << 16),
     "terrain": (t_terrain, False, 1 << 18),
+    "scene": (t_scene, False, 1 << 16),
     "png": (t_png, False, 1 << 15),
     "package": (t_package, True, 1 << 14),
     "package_install": (t_package_install, True, 1 << 16),
@@ -4845,6 +5258,7 @@ TARGETS = {
     "save": (t_save, False, 1 << 19),
     "save_knowledge": (t_save_knowledge, True, 1 << 17),
     "save_arisen": (t_save_arisen, True, 1 << 17),
+    "save_pawns": (t_save_pawns, True, 1 << 17),
     "xfs": (t_xfs, False, 1 << 19),
     "xfs_ddo_text": (t_xfs_ddo_text, False, 1 << 12),
     "params": (t_params, True, 1 << 19),
@@ -4856,7 +5270,10 @@ TARGETS = {
     "report": (t_report, True, 1 << 14),
     "session": (t_session, True, 1 << 13),
     "plugin_ini": (t_plugin_ini, True, 1 << 12),
+    "plugin_update": (t_plugin_update, True, 1 << 12),
+    "profile": (t_profile, True, 1 << 13),
     "stage_enemies_ini": (t_stage_enemies_ini, True, 1 << 12),
+    "patch_ledger": (t_patch_ledger, True, 1 << 16),
     "minidump": (t_minidump, False, 1 << 14),
     "portcrystals": (t_portcrystals, False, 1 << 13),
     "portcrystals_save": (t_portcrystals_save, False, 1 << 12),
@@ -4872,4 +5289,5 @@ TARGETS = {
     "multiply": (t_multiply, True, 1 << 10),
     "arrange": (t_arrange, True, 1 << 10),
     "export": (t_export, True, 1 << 12),
+    "spawnedit": (t_spawnedit, True, 1 << 11),
 }

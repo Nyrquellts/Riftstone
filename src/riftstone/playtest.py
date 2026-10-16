@@ -152,6 +152,9 @@ _PLUGIN_OK = {
     "save_backup": re.compile(r"watching the save"),
     "free_sprint": re.compile(r"free_sprint: Mode = \w+, Who = \w+ \(game\)"),
     "portcrystals": re.compile(r"portcrystals: \d+ Portcrystals placed at once .*patched \(game\)"),
+    "xp_scale": re.compile(r"xp_scale: Kills x[\d.]+, Quests x[\d.]+, LevelCost \d+ \(game\)"),
+    "economy": re.compile(r"economy: Buy x[\d.]+, Sell x[\d.]+, .* \(game\)"),
+    "vocation_stats": re.compile(r"vocation_stats: Mode = current, Who = \w+ \(game\)"),
 }
 _PLUGIN_OFF = re.compile(r"Mode = off|nothing patched|switched off", re.I)
 _PLUGIN_BAD = re.compile(r"^(refused|failed)\b|FAILED", re.I)

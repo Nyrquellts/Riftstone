@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     place: list[str] = []
-    for r in corpus.resources(game, [typemap.BY_EXT["gmd"]]):
+    for r in corpus.resources(game, [typemap.BY_EXT["gmd"]], indexed=False):
         if r.label.endswith(f"map_placelist_{a.lang}"):
             try:
                 place = [m.text or "" for m in gmd.parse(r.data).messages]
@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     rows, bad = [], []
-    for r in corpus.resources(game, [typemap.BY_EXT["spn"]]):
+    for r in corpus.resources(game, [typemap.BY_EXT["spn"]], indexed=False):
         try:
             rows.append((base(r.label), rooms(r.data, place)))
         except RiftError as e:          # reported and left out, not a traceback that loses the whole table

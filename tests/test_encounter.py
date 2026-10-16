@@ -202,6 +202,31 @@ class EncounterCellTest(unittest.TestCase):
             with self.assertRaises(RiftError, msg=bad):
                 s.api("POST", "encounter", {}, dict(body, **bad))
 
+    def test_studio_stands_them_at_the_spots_height_and_clears_the_lot_flag(self):
+        """The World tab's Stand and Lot flag (the 3D map's spot is often off the walkable ground): ground false is
+        the CLI's --no-ground, always the CLI's --always; both reach the plan, and other values are refused."""
+        import time
+
+        from riftstone import studio
+        s = studio.Studio(self.game, self.base / "studio-ground")
+        s.start_index()
+        for _ in range(500):
+            if s.index_state["ready"]:
+                break
+            time.sleep(0.01)
+        s.api("POST", "mods/new", {}, {"name": "Gr"})
+        body = {"mod": "Gr", "stage": 424, "enemy": "goblin", "count": 3, "at": [20100, 300, 50000], "at_once": 3,
+                "like": 6, "dry_run": True}
+        plain = s.api("POST", "encounter", {}, body)
+        self.assertFalse(plain["always"])
+        flat = s.api("POST", "encounter", {}, dict(body, ground=False, always=True))
+        self.assertEqual((flat["ground"], flat["always"]), ("", True))
+        self.assertTrue(all(p[1] == 300 for p in flat["spawn_points"]))       # rings at the spot's own height
+        self.assertFalse(s.api("POST", "encounter", {}, dict(body, ground=None, always=None))["always"])
+        for bad in ({"ground": "flat"}, {"ground": 0}, {"ground": []}, {"always": 1}, {"always": "true"}):
+            with self.assertRaises(RiftError, msg=bad):
+                s.api("POST", "encounter", {}, dict(body, **bad))
+
 
 class GroupListTest(unittest.TestCase):
     """The stage's enemy group list comes from the mod, else the game.  "No enemy group list" is said only

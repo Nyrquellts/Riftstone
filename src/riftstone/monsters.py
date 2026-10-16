@@ -666,10 +666,9 @@ def load(games: dict, idxs: dict, rebuild: bool = False, textures: bool = False,
 
 
 def save(c: dict, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(c, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    tmp.replace(path)
+    from .index import write_cache
+
+    write_cache(path, json.dumps(c, ensure_ascii=False, separators=(",", ":")))
 
 
 def normalise(c: dict) -> dict:

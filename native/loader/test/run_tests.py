@@ -6,7 +6,8 @@ Builds throwaway "games": harness.exe copied in as DDDA.exe (or DDO.exe, or a la
 nativePC\\ and riftstone\\overlay\\ with marker files, and checks every rule the loader promises:
 overlay redirection and write pass-through, missing files and the texture stand-in (also asked for by
 32 threads at once), the import table put back after start-up and a plugin's own import hook left in
-place, a chained dinput8 that leads back to the loader refused, plugins, crash / fatal-error / hang
+place, a chained dinput8 that leads back to the loader refused, another mod's dinput8 chained at start-up
+(named in the ini or found as dinput8_chain.dll), never a second Riftstone loader, plugins, crash / fatal-error / hang
 reports (a stack overflow's too, and one crash through a module's chaining filter), crash reports
 switched off, report rotation, plugin quarantine (a file name with '=' too) and safe mode, the last
 session's record after a clean exit, live stats in shared memory (with real Direct3D 9 frames when the
@@ -39,7 +40,7 @@ from pathlib import Path
 
 OUT = Path(__file__).resolve().parents[1] / "out"
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
-from riftstone import minidump, pe, runtime, tex  # noqa: E402
+from riftstone import minidump, patchledger, pe, runtime, tex  # noqa: E402
 
 # The version the loader sources carry (runtime.h), which the built DLL must report.
 VERSION = re.search(r'#define RIFTSTONE_VERSION_A "([^"]+)"',
@@ -405,6 +406,72 @@ def test_chain_self(work: Path) -> None:
           f"a chained DLL whose DirectInput8Create forwards back to the loader is refused too (exit {ntstatus(code):#x})")
 
 
+def _modules(r: dict[str, str]) -> list[str]:
+    return [m.lower() for m in r.get("folder-modules", "").split(",") if m]
+
+
+def test_chain_other_mod(work: Path) -> None:
+    print("another mod's dinput8.dll beside the loader: chained when the ini names it or names none, loaded at start-up;"
+          " a Riftstone loader is never chained or loaded as a plugin, and a second one stands aside")
+    # An update unzipped with Replace puts back the shipped ini (chain = nothing): the other mod still answers.
+    root = game(work / "chain-auto")
+    shutil.copy(OUT / "old_dinput8.dll", root / "dinput8_chain.dll")
+    code, r, _ = run(root, "files")
+    log = log_of(root)
+    check(code == 0 and r.get("dinput") == "ok" and r.get("old-dinput8") == "dinput8_chain.dll 1",
+          f"chain = (empty) and dinput8_chain.dll beside the game: the game's DirectInput8Create reaches it "
+          f"(exit {ntstatus(code):#x}, {r.get('old-dinput8')!r})")
+    check(r.get("old-dinput8-early") == "dinput8_chain.dll",
+          "it is loaded at start-up, before the game's first DirectInput8Create, where Windows would load it without "
+          f"Riftstone ({r.get('old-dinput8-early')!r})")
+    check("names no chain: chaining it" in log and "dinput8_chain.dll loaded" in log,
+          "loader.log says it chained dinput8_chain.dll with no chain in the ini")
+    # The ini names another file: that one, and dinput8_chain.dll is left alone.
+    root = game(work / "chain-named", ini="[loader]\nchain = tweak_dinput8.dll\n")
+    shutil.copy(OUT / "old_dinput8.dll", root / "tweak_dinput8.dll")
+    shutil.copy(OUT / "fwd_chain.dll", root / "dinput8_chain.dll")
+    code, r, _ = run(root, "files")
+    check(code == 0 and r.get("old-dinput8") == "tweak_dinput8.dll 1" and "dinput8_chain.dll" not in _modules(r),
+          f"chain = tweak_dinput8.dll: that DLL answers and dinput8_chain.dll is not loaded ({r.get('folder-modules')!r})")
+    # No chain anywhere: the system dinput8, nothing logged about a chain.
+    root = game(work / "chain-none")
+    code, r, _ = run(root, "files")
+    check(code == 0 and r.get("dinput") == "ok" and r.get("old-dinput8-early") == "none" and "chain    " not in log_of(root),
+          "no chain named and no dinput8_chain.dll: the system dinput8 answers and the log says nothing of a chain")
+    # A Riftstone loader kept as the chain (an older one renamed by hand): read, never loaded.
+    root = game(work / "chain-loader")
+    shutil.copy(OUT / "dinput8.dll", root / "dinput8_chain.dll")
+    code, r, _ = run(root, "files")
+    log = log_of(root)
+    check(code == 0 and r.get("dinput") == "ok" and "dinput8_chain.dll" not in _modules(r)
+          and "is another Riftstone loader, not another mod: not loaded" in log
+          and log.count("Riftstone loader " + VERSION + " in ") == 1,
+          f"a Riftstone loader as dinput8_chain.dll is not loaded; the system dinput8 answers ({r.get('folder-modules')!r})")
+    # One copied into riftstone\legacy or riftstone\plugins: not loaded either, and said so as a failed load.
+    root = game(work / "legacy-loader")
+    for folder, name in (("legacy", "old_loader.dll"), ("plugins", "riftstone_loader.asi")):
+        (root / "riftstone" / folder).mkdir(parents=True, exist_ok=True)
+        shutil.copy(OUT / "dinput8.dll", root / "riftstone" / folder / name)
+    code, r, _ = run(root, "files")
+    log = log_of(root)
+    check(code == 0 and not {"old_loader.dll", "riftstone_loader.asi"} & set(_modules(r))
+          and "old_loader.dll FAILED to load: it is a Riftstone loader, not a plugin" in log
+          and "riftstone_loader.asi FAILED to load: it is a Riftstone loader, not a plugin" in log,
+          f"a Riftstone loader in riftstone\\legacy or riftstone\\plugins is not loaded and counts as a failed load "
+          f"({r.get('folder-modules')!r})")
+    # The add-on build loaded by another mod (DDDA Tweak's loadLibrary) while the proxy runs: it stands aside.
+    root = game(work / "two-loaders")
+    shutil.copy(OUT / "riftstone_loader.dll", root / "riftstone_loader.dll")
+    code, r, _ = run(root, "addon")
+    log = log_of(root)
+    check(code == 0 and r.get("addon") == "loaded" and r.get("dinput") == "ok"
+          and log.count("Riftstone loader " + VERSION + " in ") == 1
+          and not (root / "riftstone/logs/loader.prev.log").exists(),
+          "the add-on loaded beside the proxy stands aside: one loader starts, and the log is not moved aside by a second")
+    check("another Riftstone loader is in the game too:" in log and "riftstone_loader.dll" in log,
+          "the proxy's loader.log names the second loader")
+
+
 def test_plugin_names(work: Path) -> None:
     odd = "crash=plugin.asi"
     print(f"a plugin whose file name is no ini key as it stands ({odd}): quarantine still counts")
@@ -534,6 +601,104 @@ def test_quarantine(work: Path) -> None:
     check("crash_plugin.asi changed since its quarantine; loading it again" in log_of(root),
           "a changed plugin file is loaded again")
     check(runtime.release_plugin(root, "crash_plugin.asi") is False, "release_plugin says there was nothing to release")
+
+
+def _legacy(root: Path, *names: str) -> None:
+    (root / "riftstone/legacy").mkdir(parents=True, exist_ok=True)
+    for name in names:
+        shutil.copy(OUT / name, root / "riftstone/legacy" / name)
+
+
+def test_ledger(work: Path) -> None:
+    print("the patch ledger: a legacy DLL and a plugin patch the same bytes of the game's code, the legacy one again "
+          "later, another plugin hooks an import; a crash in patched code; a legacy DLL quarantined")
+    root = game(work / "ledger", plugins=("patch_plugin.asi", "chain_plugin.asi"),
+                ini="[loader]\npatch_ledger_seconds = 2\n")
+    _legacy(root, "patch_legacy.dll")
+    code, r, _ = run(root, "ledger", "4")
+    log = log_of(root)
+    area = int(r.get("area", "0"), 16)
+    path = root / "riftstone/logs/patches.txt"
+    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    try:
+        led = patchledger.parse(text)
+    except Exception as e:                                  # noqa: BLE001 -- reported as a failed check
+        print(f"  ({e})")
+        led = patchledger.Ledger()
+    check(code == 0 and area and led.complete and led.game == "DDDA.exe" and led.late is not None,
+          f"patches.txt is whole after the late scan (exit {ntstatus(code):#x}, {len(led.ranges)} code change(s), "
+          f"{len(led.imports)} import(s))")
+    first_legacy = log.find("legacy   patch_legacy.dll loaded")
+    first_plugin = log.find("plugin   patch_plugin.asi loaded")
+    check(0 <= first_legacy < first_plugin, "riftstone\\legacy is loaded before riftstone\\plugins")
+    owners = {o["name"]: i for i, o in enumerate(led.owners)}
+    legacy, plugin = owners.get("legacy\\patch_legacy.dll"), owners.get("plugins\\patch_plugin.asi")
+    chain, loader = owners.get("plugins\\chain_plugin.asi"), owners.get("Riftstone loader (its import hooks)")
+
+    def changes(owner):
+        return [(c["at"] - area, c["len"], c["to"]) for c in led.ranges
+                if c["owner"] == owner and area <= c["at"] < area + 256]
+    check(changes(legacy) == [(0, 5, "patch_legacy.dll")],
+          f"the legacy DLL's jump: 5 bytes at +0, leading into patch_legacy.dll {changes(legacy)}")
+    mine = changes(plugin)
+    check(len(mine) == 2 and 2 <= mine[0][0] <= 6 and mine[0][0] + mine[0][1] == 7 and mine[0][2] == "patch_plugin.asi"
+          and mine[1] == (128, 2, ""), f"the plugin's call over it (ending at +7, leading into patch_plugin.asi) and "
+          f"its ud2 at +128 (leading nowhere) {mine}")
+    clash = [c for c in led.conflicts if area <= c["at"] < area + 256]
+    check(len(clash) == 1 and (clash[0]["first"], clash[0]["then"]) == (legacy, plugin) and 2 <= clash[0]["at"] - area
+          and clash[0]["at"] - area + clash[0]["len"] <= 5, f"one conflict: the plugin changed bytes the legacy DLL "
+          f"had changed {clash}")
+    late = [(c["at"] - area, c["len"], led.owners[c["owner"]]["kind"], led.owners[c["owner"]]["name"]) for c in led.ranges
+            if led.owners[c["owner"]]["kind"] == "late"]
+    check(late == [(64, 5, "late", "patch_legacy.dll")], f"the late scan names the change made 0.5 s after start "
+          f"by where it leads, patch_legacy.dll {late}")
+    hooks = {(led.owners[i["owner"]]["name"], i["name"]) for i in led.imports}
+    check(("plugins\\chain_plugin.asi", "KERNEL32.dll!CreateFileW") in hooks
+          and ("Riftstone loader (its import hooks)", "KERNEL32.dll!CreateFileW") in hooks,
+          "the import table: the loader's hook of KERNEL32.dll!CreateFileW, then chain_plugin.asi's over it")
+    chained = [(c["first"], c["then"]) for c in led.chains]
+    check((loader, chain) in chained and not [c for c in led.conflicts if not area <= c["at"] < area + 256],
+          "an import two modules hooked is a chain, not a conflict")
+    check(bool(led.game) and patchledger.parse(patchledger.format_ledger(led)) == led,
+          "patches.txt reads back to the same ledger")
+    check("ledger   CONFLICT at" in log and "late scan at 2 s: 1 change(s)" in log,
+          "loader.log names the conflict and the late scan")
+    words = patchledger.summary(led)
+    check(any(w.startswith("CONFLICT") and "plugins\\patch_plugin.asi changed bytes legacy\\patch_legacy.dll had "
+                                           "changed" in w for w in words), "the summary says who overwrote whom")
+
+    print("a crash in code a plugin changed")
+    root = game(work / "ledger-crash", plugins=("patch_plugin.asi",))
+    code, r, _ = run(root, "ledgercrash")
+    area = int(r.get("area", "0"), 16)
+    found = reports(root, "crash")
+    rep = runtime.parse_report(found[-1].read_text(encoding="utf-8", errors="replace")) if found else {}
+    by = rep.get("patched_by") or {}
+    check(ntstatus(code) == 0xC000001D and by.get("name") == "plugins\\patch_plugin.asi"
+          and int(by.get("at", "0"), 16) == area + 128 and by.get("len") == 2,
+          f"the crash report says who changed the code it stopped in ({by}, exit {ntstatus(code):#x})")
+    check(any("changed by plugins\\patch_plugin.asi" in line for line in runtime.explain(rep, root)),
+          "the explanation names it")
+
+    print("a legacy DLL that crashes the game's start-up twice")
+    root = game(work / "ledger-quarantine", ini="[loader]\nsafe_mode = 0\n")
+    _legacy(root, "crash_plugin.asi")
+    for _ in range(2):
+        code, r, _ = run(root, "plugincrash")
+    found = reports(root, "crash")
+    rep = runtime.parse_report(found[-1].read_text(encoding="utf-8", errors="replace")) if found else {}
+    check(is_crash_code(code) and rep.get("fault_legacy") == "crash_plugin.asi" and rep.get("fault_plugin") is None,
+          "the report says the fault is inside the legacy DLL")
+    code, r, _ = run(root, "plugincrash")
+    check("legacy\\crash_plugin.asi QUARANTINED" in log_of(root) and r.get("crash-plugin") == "absent" and code == 4,
+          "two start-up crashes quarantine it as legacy\\crash_plugin.asi; the game runs without it")
+    check(runtime.release_plugin(root, "legacy\\crash_plugin.asi"), "release_plugin takes it out of quarantine")
+
+    print("the ledger switched off")
+    root = game(work / "ledger-off", plugins=("patch_plugin.asi",), ini="[loader]\npatch_ledger = 0\n")
+    code, r, _ = run(root, "ledger", "0")
+    check(code == 0 and not (root / "riftstone/logs/patches.txt").exists()
+          and "ledger   switched off" in log_of(root), "patch_ledger = 0: no copy of the code, no patches.txt")
 
 
 def test_safe_mode(work: Path) -> None:
@@ -2187,14 +2352,16 @@ def test_from_archives(work: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--work")
-    ap.add_argument("--only", help="comma-separated test names (files,reset,hooks,dinputchain,crash,crashrace,dumps,"
-                                   "overflow,filters,crashoff,rotation,quarantine,names,safe,state,live,cap,guard,window,"
+    ap.add_argument("--only", help="comma-separated test names (files,reset,hooks,dinputchain,dinputmod,crash,crashrace,dumps,"
+                                   "overflow,filters,crashoff,rotation,quarantine,names,ledger,safe,state,live,cap,guard,"
+                                   "window,"
                                    "saves,foreignsaves,exit,overlay,d3d9,d3d9bench,chain,dxvk,memory,other,engine,"
                                    "archives)")
     a = ap.parse_args()
     sys.stdout.reconfigure(errors="backslashreplace")    # a label quoting a damaged value must not stop the run
     need = ["harness.exe", "harness_ddda.exe", "dinput8.dll", "riftstone_loader.dll", "marker_plugin.asi",
-            "crash_plugin.asi", "chain_plugin.asi", "cap_plugin.asi", "fwd_chain.dll", "chain_d3d9.dll"]
+            "crash_plugin.asi", "chain_plugin.asi", "cap_plugin.asi", "fwd_chain.dll", "chain_d3d9.dll",
+            "patch_legacy.dll", "patch_plugin.asi", "old_dinput8.dll"]
     if not all((OUT / n).is_file() for n in need):
         print("the loader is not built; run native\\loader\\build.cmd")
         return 1
@@ -2204,10 +2371,11 @@ def main() -> int:
     base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="run-", dir=base))
     tests = {"files": test_files, "reset": test_reset_plugins_off_addon, "hooks": test_foreign_hooks,
-             "dinputchain": test_chain_self, "crash": test_crash, "crashrace": test_crash_race, "dumps": test_dumps,
+             "dinputchain": test_chain_self, "dinputmod": test_chain_other_mod, "crash": test_crash, "crashrace": test_crash_race, "dumps": test_dumps,
              "overflow": test_stack_overflow,
              "filters": test_filter_chain, "crashoff": test_crash_reports_off, "rotation": test_rotation,
              "quarantine": test_quarantine, "names": test_plugin_names, "safe": test_safe_mode,
+             "ledger": test_ledger,
              "state": test_state_after_clean_exit, "live": test_live, "cap": test_enemy_cap_renamed,
              "guard": test_guard_race, "window": test_window, "saves": test_saves, "foreignsaves": test_saves_foreign,
              "exit": test_exit, "overlay": test_overlay, "d3d9": test_d3d9, "d3d9bench": test_d3d9_bench,

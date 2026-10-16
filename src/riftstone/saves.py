@@ -480,13 +480,13 @@ def knowledge_tables(exe: Path) -> KnowledgeTables:
 
 _TAG = re.compile(rb"<(/?)(class|array)\b([^>]*?)(/?)>")
 _ATTR_NAME = re.compile(rb'\bname="([^"]*)"')
-_VALUE = re.compile(rb'<(f32|u32|u8|s16|s32) value="([^"]*)"/>')
+_VALUE = re.compile(rb'<(f32|u32|u16|u8|s32|s16|s8) value="([^"]*)"/>')
 # how the game writes each counter (every value in a real save matches: floats "%.6f", counts in digits)
 _WRITTEN = {"f32": re.compile(rb"-?[0-9]+\.[0-9]{6}"), "u32": re.compile(rb"[0-9]{1,10}"), "s16": re.compile(rb"-?[0-9]{1,5}"),
-            "s32": re.compile(rb"-?[0-9]{1,10}"),
+            "s32": re.compile(rb"-?[0-9]{1,10}"), "u16": re.compile(rb"[0-9]{1,5}"), "s8": re.compile(rb"-?[0-9]{1,3}"),
             "u8": re.compile(rb"[0-9]{1,3}")}
-_LIMIT = {"u32": 0xFFFFFFFF, "u8": 0xFF, "s16": 0x7FFF, "s32": 0x7FFFFFFF}
-_FLOOR = {"s16": -0x8000, "s32": -0x80000000}
+_LIMIT = {"u32": 0xFFFFFFFF, "u16": 0xFFFF, "u8": 0xFF, "s16": 0x7FFF, "s32": 0x7FFFFFFF, "s8": 0x7F}
+_FLOOR = {"s16": -0x8000, "s32": -0x80000000, "s8": -0x80}
 _ONLY = {k: re.compile(rb'(?:\s*<' + k.encode() + rb' value="[^"]*"/>)*\s*') for k in _WRITTEN}  # an array's body
 
 
@@ -666,11 +666,20 @@ WEAPONS = ("SWORD", "MACE", "GSWORD", "DAGGER", "WAND", "WAND_DX", "HAMMER", "SH
 WEAPON_NAMES = {"SWORD": "sword", "MACE": "mace", "GSWORD": "longsword", "DAGGER": "daggers", "WAND": "staff",
                 "WAND_DX": "archistaff", "HAMMER": "warhammer", "SHIELD": "shield", "SHIELD_L": "magick shield",
                 "BOW": "shortbow", "BOW_L": "longbow", "BOW_MG": "magick bow"}
-#: the vocations by the game's number (`mJob`) and the weapons each one wields
-VOCATIONS = {1: ("Fighter", ("SWORD", "SHIELD")), 2: ("Strider", ("DAGGER", "BOW")), 3: ("Mage", ("WAND",)),
-             4: ("Assassin", ("SWORD", "DAGGER", "SHIELD", "BOW")), 5: ("Magick Archer", ("DAGGER", "BOW_MG")),
-             6: ("Mystic Knight", ("SWORD", "MACE", "SHIELD_L")), 7: ("Warrior", ("GSWORD", "HAMMER")),
+#: the vocations by the game's number (`mJob`) and the weapons each one wields: the Inn's skill menu rows
+#: (`0x01516D58`, seven menu categories a vocation) and each category's weapons (`0x01516BD8`), docs/saves.md
+VOCATIONS = {1: ("Fighter", ("SWORD", "MACE", "SHIELD")), 2: ("Strider", ("DAGGER", "BOW")), 3: ("Mage", ("WAND",)),
+             4: ("Mystic Knight", ("SWORD", "MACE", "WAND", "SHIELD_L")),
+             5: ("Assassin", ("SWORD", "MACE", "DAGGER", "SHIELD", "BOW")),
+             6: ("Magick Archer", ("DAGGER", "WAND", "BOW_MG")), 7: ("Warrior", ("GSWORD", "HAMMER")),
              8: ("Ranger", ("DAGGER", "BOW_L")), 9: ("Sorcerer", ("WAND_DX",))}
+#: the vocations a pawn can take (the hybrids 4-6 are the Arisen's alone)
+PAWN_VOCATIONS = (1, 2, 3, 7, 8, 9)
+#: the discipline a vocation's first rank needs once the character has taken it (`mJobNextExp` at rank 1 with no
+#: discipline earned, measured on the 26 parameter blocks of the owner's save, 2026-10-13); a vocation the
+#: character never took holds rank 1 and 1 there
+FIRST_RANK_COST = {1: 500, 2: 500, 3: 500, 4: 800, 5: 800, 6: 650, 7: 500, 8: 500, 9: 600}
+EQUIP_SLOTS = 12         # entries of mEquipItem (sItemManager::cITEM_PARAM_DATA)
 LEVEL_MAX = 200          # the game's level cap
 RANK_MAX = 9             # a vocation's top rank
 VOCATION_SLOTS = 10      # entries of mJobLevel / mJobExp / mJobNextExp / mJobPoint (by vocation number; 0 unused)
@@ -783,8 +792,9 @@ class ArisenEdit:
     points: int | None = None               # discipline (every entry of mJobPoint, which the game keeps equal)
     stats: dict[str, float] = field(default_factory=dict)   # by field name (STATS)
     skills: bool = False                    # every skill of the weapons learned at both tiers; empty slots filled
-    vocation: int | None = None             # whose rank and weapons; None = the first copy's own
+    vocation: int | None = None             # whose rank and weapons; None = the new vocation, else the first copy's own
     weapons: tuple[str, ...] = ()           # instead of the vocation's
+    job: int | None = None                  # the vocation the character takes (mJob); the gear must allow it
 
     def __post_init__(self) -> None:
         if self.level is not None and not 1 <= self.level <= LEVEL_MAX:
@@ -801,31 +811,142 @@ class ArisenEdit:
         for w in self.weapons:
             if w not in WEAPONS:
                 raise RiftError(f"{w}: not a weapon palette ({', '.join(WEAPONS)})")
-        if self.vocation is not None and self.vocation not in VOCATIONS:
-            raise RiftError(f"vocation {self.vocation}: the game's are " + ", ".join(f"{k} {v[0]}" for k, v in VOCATIONS.items()))
+        for v in (self.vocation, self.job):
+            if v is not None and v not in VOCATIONS:
+                raise RiftError(f"vocation {v}: the game's are " + ", ".join(f"{k} {n[0]}" for k, n in VOCATIONS.items()))
 
     @property
     def empty(self) -> bool:
-        return self.level is None and self.rank is None and self.points is None and not self.stats and not self.skills
+        return (self.level is None and self.rank is None and self.points is None and not self.stats
+                and not self.skills and self.job is None)
 
 
-def set_arisen(data: bytes, edit: ArisenEdit, tables: SkillTables | None = None) -> tuple[bytes, int]:
-    """The save with the Arisen's record changed in both copies of the player's data (only value text changes,
-    written as the game writes it; everything else stays byte for byte).  Learning skills fills a palette's empty
-    slots with the lowest unused numbers of its category and keeps the slots the player chose.  Returns the new
-    save and how many values changed."""
-    if edit.skills and tables is None:
-        raise RiftError("learning skills needs the skill tables (read from DDDA.exe)")
-    xml = unpack(data)
-    recs = _arisen_records(xml)
-    if not recs:
-        raise RiftError("this save has no Arisen record (mPlayerDataManual > mPlCmcEditAndParam > mPl)")
-    job = edit.vocation
+_ITEM = re.compile(rb'<class type="sItemManager::cITEM_PARAM_DATA">')
+
+
+@dataclass(frozen=True)
+class Gear:
+    """One equipment slot of a record: where its item number, flags and owner's value text sit."""
+    item: tuple[int, int, bytes]
+    flag: tuple[int, int, bytes]
+    owner: tuple[int, int, bytes]
+
+    @property
+    def number(self) -> int:
+        return int(self.item[2])
+
+
+def _gear(xml: bytes, start: int, end: int, whose: str) -> list[Gear]:
+    """The twelve equipment slots (`mEquipItem`) of a parameter block, in order."""
+    head = f'<array name="mEquipItem" type="class" count="{EQUIP_SLOTS}">'.encode()
+    at = xml.find(head, start, end)
+    close = xml.find(b"</array>", at, end) if at >= 0 else -1
+    if at < 0 or close < 0:
+        raise FormatError("save", f"{whose} record has no mEquipItem of {EQUIP_SLOTS} items")
+    heads = [m.start() for m in _ITEM.finditer(xml, at, close)]
+    if len(heads) != EQUIP_SLOTS:
+        raise FormatError("save", f"{whose} mEquipItem holds {len(heads)} items, not {EQUIP_SLOTS}")
+    out = []
+    for k, s in enumerate(heads):
+        e = heads[k + 1] if k + 1 < len(heads) else close
+        out.append(Gear(_scalar(xml, s, e, "data.mItemNo", "s16", whose), _scalar(xml, s, e, "data.mFlag", "u32", whose),
+                        _scalar(xml, s, e, "data.mOwnerId", "s8", whose)))
+    return out
+
+
+def gear_refusals(xml: bytes, start: int, end: int, whose: str, job: int,
+                  equip_jobs: dict[int, int] | None) -> list[int]:
+    """The equipped items (by number) that `mEnableEquipJob` (``equip_jobs``: item number -> mask, bit N =
+    vocation N) does not let vocation ``job`` wear."""
+    worn = [g.number for g in _gear(xml, start, end, whose) if g.number >= 0]
+    if worn and equip_jobs is None:
+        raise RiftError("a new vocation is checked against the gear's vocations, read from the game's item list; "
+                        "Dark Arisen was not found (pass --game \"C:\\path\\to\\DDDA\")")
+    return [n for n in worn if not (equip_jobs or {}).get(n, 0) >> job & 1]
+
+
+def _param_edits(xml: bytes, s: int, e: int, whose: str, edit: ArisenEdit, job: int, weapons: tuple[str, ...],
+                 tables: SkillTables | None, put: Callable[[tuple[int, int, bytes], bytes], None]) -> None:
+    """The value edits ``edit`` makes in one parameter block (cSAVE_DATA_PARAM, s..e); ``job`` is the vocation
+    whose rank and weapons it sets."""
+    if edit.level is not None:
+        put(_scalar(xml, s, e, "mLevel", "u8", whose), str(edit.level).encode())
+    if edit.job is not None:
+        put(_scalar(xml, s, e, "mJob", "u8", whose), str(edit.job).encode())
+        rank = _values(xml, s, e, "mJobLevel", "u8", VOCATION_SLOTS, whose)[edit.job]
+        earned = _values(xml, s, e, "mJobExp", "u32", VOCATION_SLOTS, whose)[edit.job]
+        nxt = _values(xml, s, e, "mJobNextExp", "u32", VOCATION_SLOTS, whose)[edit.job]
+        if (rank[2], earned[2], nxt[2]) == (b"1", b"0", b"1"):   # never taken: the first rank's cost, as when taken
+            put(nxt, str(FIRST_RANK_COST[edit.job]).encode())
+    if edit.rank is not None:
+        put(_values(xml, s, e, "mJobLevel", "u8", VOCATION_SLOTS, whose)[job], str(edit.rank).encode())
+        if edit.rank == RANK_MAX:
+            put(_values(xml, s, e, "mJobNextExp", "u32", VOCATION_SLOTS, whose)[job], b"0")
+    if edit.points is not None:
+        for at in _values(xml, s, e, "mJobPoint", "s32", VOCATION_SLOTS, whose):
+            put(at, str(edit.points).encode())
+    for name, value in edit.stats.items():
+        put(_scalar(xml, s, e, name, "f32", whose), f"{value:.6f}".encode())
+    if edit.skills:
+        lv1 = _values(xml, s, e, "mSkillLv1", "u32", SKILL_WORDS, whose)
+        lv2 = _values(xml, s, e, "mSkillLv2", "u32", SKILL_WORDS, whose)
+        w1, w2 = [int(t) for _, _, t in lv1], [int(t) for _, _, t in lv2]
+        for w in weapons:
+            nums = list(tables.numbers(w))
+            for n in nums:
+                w1[n // 32] |= 1 << (n % 32)
+                w2[n // 32] |= 1 << (n % 32)
+            slots = _values(xml, s, e, f"mWeaponSkill[nWeapon::{w}]", "s16", PALETTE, whose)
+            have = {int(t) for _, _, t in slots}
+            spare = [n for n in nums if n not in have]
+            for at in slots:
+                if int(at[2]) < 0 and spare:
+                    put(at, str(spare.pop(0)).encode())
+        for words, at in ((w1, lv1), (w2, lv2)):
+            for k, slot in enumerate(at):
+                put(slot, str(words[k]).encode())
+
+
+def _splice(xml: bytes, edits: list[tuple[int, int, bytes]]) -> bytes:
+    """``xml`` with each (start, end) replaced by its text; the spans never overlap."""
+    out, at = [], 0
+    for s, e, text in sorted(edits):
+        if s < at:
+            raise RiftError("two edits of the save overlap (a bug: nothing was written)")
+        out += [xml[at:s], text]
+        at = e
+    out.append(xml[at:])
+    return b"".join(out)
+
+
+def edit_job(xml: bytes, recs: list[tuple[str, int, int]], edit: ArisenEdit, whose: str) -> tuple[int, tuple[str, ...]]:
+    """The vocation whose rank and weapons ``edit`` sets in the parameter blocks ``recs`` (copy, start, end), and
+    those weapons."""
+    job = edit.vocation if edit.vocation is not None else edit.job
     if job is None:
-        job = int(_scalar(xml, recs[0][1], recs[0][2], "mJob", "u8", f"the Arisen's ({recs[0][0]})")[2])
+        job = int(_scalar(xml, recs[0][1], recs[0][2], "mJob", "u8", f"{whose} ({recs[0][0]})")[2])
         if job not in VOCATIONS:
             raise RiftError(f"the save's vocation {job} is not one the game has (1-{len(VOCATIONS)}); pass one")
-    weapons = edit.weapons or VOCATIONS[job][1]
+    return job, edit.weapons or VOCATIONS[job][1]
+
+
+def article(word: str) -> str:
+    return ("an " if word[:1].upper() in "AEIOU" else "a ") + word
+
+
+def item_label(n: int, names: dict[int, str] | None) -> str:
+    """An item as a message names it: its name and number when the names are known."""
+    name = (names or {}).get(n)
+    return f"{name} ({n})" if name else f"item {n}"
+
+
+def set_params(xml: bytes, recs: list[tuple[str, int, int]], edit: ArisenEdit, tables: SkillTables | None,
+               equip_jobs: dict[int, int] | None, whose: str,
+               names: dict[int, str] | None = None) -> list[tuple[int, int, bytes]]:
+    """The value edits ``edit`` makes in the parameter blocks ``recs`` (copy, start, end) of one character."""
+    if edit.skills and tables is None:
+        raise RiftError("learning skills needs the skill tables (read from DDDA.exe)")
+    job, weapons = edit_job(xml, recs, edit, whose)
     edits: list[tuple[int, int, bytes]] = []
 
     def put(at: tuple[int, int, bytes], new: bytes) -> None:
@@ -833,57 +954,53 @@ def set_arisen(data: bytes, edit: ArisenEdit, tables: SkillTables | None = None)
             edits.append((at[0], at[1], new))
 
     for copy, s, e in recs:
-        whose = f"the Arisen's ({copy})"
-        if edit.level is not None:
-            put(_scalar(xml, s, e, "mLevel", "u8", whose), str(edit.level).encode())
-        if edit.rank is not None:
-            put(_values(xml, s, e, "mJobLevel", "u8", VOCATION_SLOTS, whose)[job], str(edit.rank).encode())
-            if edit.rank == RANK_MAX:
-                put(_values(xml, s, e, "mJobNextExp", "u32", VOCATION_SLOTS, whose)[job], b"0")
-        if edit.points is not None:
-            for at in _values(xml, s, e, "mJobPoint", "s32", VOCATION_SLOTS, whose):
-                put(at, str(edit.points).encode())
-        for name, value in edit.stats.items():
-            put(_scalar(xml, s, e, name, "f32", whose), f"{value:.6f}".encode())
-        if edit.skills:
-            lv1 = _values(xml, s, e, "mSkillLv1", "u32", SKILL_WORDS, whose)
-            lv2 = _values(xml, s, e, "mSkillLv2", "u32", SKILL_WORDS, whose)
-            w1, w2 = [int(t) for _, _, t in lv1], [int(t) for _, _, t in lv2]
-            for w in weapons:
-                nums = list(tables.numbers(w))
-                for n in nums:
-                    w1[n // 32] |= 1 << (n % 32)
-                    w2[n // 32] |= 1 << (n % 32)
-                slots = _values(xml, s, e, f"mWeaponSkill[nWeapon::{w}]", "s16", PALETTE, whose)
-                have = {int(t) for _, _, t in slots}
-                spare = [n for n in nums if n not in have]
-                for at in slots:
-                    if int(at[2]) < 0 and spare:
-                        put(at, str(spare.pop(0)).encode())
-            for words, at in ((w1, lv1), (w2, lv2)):
-                for k, slot in enumerate(at):
-                    put(slot, str(words[k]).encode())
+        who = f"{whose} ({copy})"
+        if edit.job is not None:
+            refused = gear_refusals(xml, s, e, who, edit.job, equip_jobs)
+            if refused:
+                raise RiftError(f"{who} gear does not let {article(VOCATIONS[edit.job][0])} wear "
+                                f"{', '.join(item_label(n, names) for n in refused)}: take "
+                                f"{'them' if len(refused) > 1 else 'it'} off in the game first; nothing was changed")
+        _param_edits(xml, s, e, who, edit, job, weapons, tables, put)
+    return edits
+
+
+def set_arisen(data: bytes, edit: ArisenEdit, tables: SkillTables | None = None,
+               equip_jobs: dict[int, int] | None = None, names: dict[int, str] | None = None) -> tuple[bytes, int]:
+    """The save with the Arisen's record changed in both copies of the player's data (only value text changes,
+    written as the game writes it; everything else stays byte for byte).  Learning skills fills a palette's empty
+    slots with the lowest unused numbers of its category and keeps the slots the player chose.  A new vocation
+    (``edit.job``) is refused while the gear does not allow it (``equip_jobs``: item number -> mEnableEquipJob).
+    Returns the new save and how many values changed."""
+    xml = unpack(data)
+    recs = _arisen_records(xml)
+    if not recs:
+        raise RiftError("this save has no Arisen record (mPlayerDataManual > mPlCmcEditAndParam > mPl)")
+    edits = set_params(xml, recs, edit, tables, equip_jobs, "the Arisen's", names)
     if not edits:
         return data, 0
-    out, at = [], 0
-    for s, e, text in sorted(edits):
-        out += [xml[at:s], text]
-        at = e
-    out.append(xml[at:])
-    return pack(b"".join(out)), len(edits)
+    return pack(_splice(xml, edits)), len(edits)
 
 
-def set_arisen_file(save: Path, root: Path, account: str, edit: ArisenEdit, tables: SkillTables | None = None,
-                    game_running: Callable[[], bool] | None = None) -> tuple[Path | None, int]:
-    """Change the Arisen's record in a save file.  Refuses while the game runs and on a save that does not check;
-    the save as it was is kept as a copy first (returned with the count of values changed; nothing is written when
-    there is nothing to change)."""
+def change_file(save: Path, root: Path, account: str, change: Callable[[bytes], tuple[bytes, int]],
+                game_running: Callable[[], bool] | None = None) -> tuple[Path | None, int]:
+    """Run ``change`` (save bytes -> new bytes and how many values changed) on a save file.  Refuses while the
+    game runs and on a save that does not check, before or after; the save as it was is kept as a copy first
+    (returned with the count; nothing is written when there is nothing to change)."""
     _refuse_while_running(game_running)
     data = _complete(save, save.name)
-    new, n = set_arisen(data, edit, tables)
+    new, n = change(data)
     if not n:
         return None, 0
     check(new, deep=True)
     kept, _ = backup(save, root, account)
     _write_save(save, new)
     return kept, n
+
+
+def set_arisen_file(save: Path, root: Path, account: str, edit: ArisenEdit, tables: SkillTables | None = None,
+                    game_running: Callable[[], bool] | None = None, equip_jobs: dict[int, int] | None = None,
+                    names: dict[int, str] | None = None) -> tuple[Path | None, int]:
+    """Change the Arisen's record in a save file (``change_file``)."""
+    return change_file(save, root, account, lambda data: set_arisen(data, edit, tables, equip_jobs, names),
+                       game_running)

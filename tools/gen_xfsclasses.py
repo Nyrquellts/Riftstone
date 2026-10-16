@@ -46,7 +46,7 @@ def main() -> int:
     hashes: set[int] = set()
     layouts: dict[int, tuple] = {}
     resources = 0
-    for r in corpus.resources(game, corpus.xfs_type_ids()):
+    for r in corpus.resources(game, corpus.xfs_type_ids(), indexed=False):
         resources += 1
         for c in xfs.parse(r.data).classes:
             hashes.add(c.type_id)

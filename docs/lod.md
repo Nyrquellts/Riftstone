@@ -122,6 +122,39 @@ cloth's choice at FARTHEST in the game's own code: x3 for scenery and for an ene
 times their vanilla distances (their pair also sets cloth detail). The default stays `Farthest = high`,
 the game's own; what `lod` does to the frame rate and the look in game: UNKNOWN.
 
+**Instanced vegetation's cross-fade, by the clock (`FadeSeconds`, 2026-10-16).** The trees and bushes the
+game draws in bulk (`cInstancingDynamic`) do not switch level in one frame: they cross-fade. `cInstancing`'s
+constructor turns the fade on for every unit (`mUseLodFade`, `+0x26`: `B0 01 88 42 41 88 42 26` at
+`0x0114252D`), and the draw-list builder (`0x01143160`, `ret 0x14`: the view, a count, a tally, a mode, the
+list) keeps it while the view's bit `+0x16A & 1` is set (`F6 80 6A 01 00 00 01` at `0x01143172`). Each
+instance record (48 bytes: its box, then at `+0x20` its index, flags, level in bits 18-23 and an alpha cap
+in the top byte) has four counters at `+0x24`..`+0x27`, one per level. Each call steps them: the current
+level's counter rises by one up to 15 (level 0's: `83 F8 0F 73 4E FE 46 24` at `0x0114335B`), and only
+once it is at 15 do the others fall by 8 (two passes of an unrolled four: `B9 02 00 00 00` at
+`0x011433AE`). The list gets one entry per level whose counter is above 0, its alpha the counter (at most
+the cap), so a swap takes 17 calls: 15 up, then 2 down. The game calls it once a frame, so the swap's
+length follows the frame rate: 0.57 s at 30 fps, 0.19 s at 91, 0.11 s at 150, close to a pop.
+
+With `FadeSeconds` (default 0.75) the plugin paces it by the clock. Where the builder stores its fade
+flag (`C6 44 24 3B 01` at `0x01143179`) a thunk asks a gate whether this object's next step is due (one
+every `FadeSeconds / 17`: 44 ms at 0.75) and stores 1 (step) or 2 (hold). Where the step begins
+(`85 DB 75 11 0F B6 46 24` at `0x01143353`) a hold jumps past the counters to the step's end. The
+builder's two tests of the flag (`80 7C 24 47 00` at `0x011432EE`, and the draw list's at `0x01143604`)
+take any value but 0 as "fade on", so a held frame still draws both levels at their alphas. The gate
+keys on the object (8,192 slots, four probes, each taken with one compare-exchange), so a unit drawn by
+several views in one step moves once. Below about 23 fps at 0.75 every frame is a step: the game's own
+pace, which is slower there. `FadeSeconds = 0` patches nothing; the view's bit off, `mUseLodFade` off
+and a forced level (modes 1, 2 and 4) run as before. Both sites and five more runs around them are
+compared first, and one difference leaves the game's fade alone.
+
+The harness checks it in every profile: a fake unit with one record, seen first at 5 m, then from 15 m
+(level 0 to 1), with the builder called every 1/fps on the plugin's test clock until the swap ends. It
+checks the pace (a counter rises at most 1 a call and falls at most 8, never both in one call), the list
+against the counters, the registers the builder keeps, and the time. At 0.75 s: 20 fps takes the game's
+17 calls (0.80 s), 30 fps 0.70 s, 60 fps 0.72 s, 91 fps 0.71 s, 144 fps 0.72 s, 240 fps 0.72 s; at 5 s
+(`FadeSeconds = 9`, held to 5) 4.88 s; with `FadeSeconds = 0` or `Enabled = 0`, 17 calls at every rate.
+What the paced fade looks like in game: UNKNOWN.
+
 ### Settings (`lod_tuner.ini`, next to the `.asi`)
 
 | Key | Default | Meaning |
@@ -132,6 +165,8 @@ the game's own; what `lod` does to the frame rate and the look in game: UNKNOWN.
 | `Characters` | 1.0 | multiplier for everything that is not scenery (1 to 16) |
 | `ScreenHeight`, `FieldOfView` | auto | auto = config.ini `Resolution`, and 40 degrees plus config.ini `CameraFov` |
 | `MaxDistance` | 10000 | metres. No distance is pushed past it, and vanilla distances beyond it stay |
+| `Farthest` | high | ViewRange FARTHEST: `high` = every regular model at HIGH, the game's own; `lod` = levels of detail at the distances above x3 |
+| `FadeSeconds` | 0.75 | seconds per cross-fade of instanced vegetation at any frame rate. 0 = the game's own, a step a frame. At most 5 |
 
 `riftstone\logs\lod_tuner.log` records the settings used, the ViewRange in effect, the first changes
 with before and after values, and running counts every 2,000 models.
@@ -145,14 +180,15 @@ thunk to the next game instruction. It checks three things: the distances; that 
 instructions still load `ecx` from `[esp+0x2C]` and `edx` from `[esi+0x78]`; and that `eax`, `esi`,
 `edi`, `ebx`, `ebp`, `esp` and `xmm3` survive. It then hands a scaled model to the game's own
 `getTargetLODLevel` (the draw paths' arithmetic, ViewRange NORMAL, FAR and FARTHEST) and to
-`cInstancingCulling::updateLODParam`. That is 60 checks over three profiles: the shipped ini against
-a stand-in config.ini (2560x1440, FARTHEST), a flat multiplier with a low cap, and `Enabled=0`
+`cInstancingCulling::updateLODParam`, and times the vegetation's cross-fade (above). That is 148 checks
+over five profiles: the shipped ini against a stand-in config.ini (2560x1440, FARTHEST), `Farthest = lod`,
+a flat multiplier with a low cap and `FadeSeconds = 0`, `FadeSeconds = 9` (held to 5), and `Enabled=0`
 (nothing patched, vanilla values reach the readers). A second copy of the plugin sees the patched
 site and changes nothing. `tools\test_all.cmd` runs it.
 
 **UNKNOWN until observed in game:** that lod_tuner itself patches the real process (the loader and
 the `enemy_cap` plugin have been seen working in game, 2026-09-25); the frame rate at FAR/NORMAL + lod_tuner against FARTHEST;
-how visible the remaining switches are at `PopPixels = 24`; and that `cResource::mPath` is already set
+how visible the remaining switches are at `PopPixels = 24`; how the paced cross-fade looks; and that `cResource::mPath` is already set
 when `load` runs. The log's counts show that last one: if "without a path" counts every model, only
 the joint rule is classifying.
 
@@ -164,7 +200,8 @@ riftstone loader install
 riftstone loader plugin add native\plugins\lod_tuner\out\lod_tuner.asi
 ```
 
-`plugin add` also copies `lod_tuner.ini` the first time and keeps the owner's copy on later updates.
+`plugin add` also copies `lod_tuner.ini` the first time; a later update keeps the owner's values and adds
+any setting new in the build (`FadeSeconds` for an install from before it) with its default.
 Then set `ViewRange=FAR` (or `NORMAL`) in `%LOCALAPPDATA%\CAPCOM\DRAGONS DOGMA DARK ARISEN\config.ini`.
 Removal: `riftstone loader plugin remove lod_tuner.asi`.
 
@@ -186,6 +223,3 @@ Removal: `riftstone loader plugin remove lod_tuner.asi`.
   enemy records and 73 of 1,850 NPC records in the 6,209 distinct layouts, none of the 20,148
   `cSetInfoInsModel` records. Where an enemy first appears is its spawn: the layouts, the group lists and
   the enemy pool (`docs/world-map.md`, `docs/re-enemy-cap.md`).
-- **LOD fade for instancing:** `cInstancing::mUseLodFade` (`+0x26`) and the fade band in
-  `cInstancingDynamic`'s culling (`0x011435B6`). Where it is off, turning it on would cross-fade
-  vegetation instead of popping it.

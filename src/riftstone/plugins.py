@@ -101,6 +101,24 @@ CATALOG: dict[str, dict] = {
                    "log of refused requests.",
         "own": True,
     },
+    "xp_scale": {
+        "title": "Experience scale",
+        "summary": "More or less experience from kills and quests (0.1x to 2x), and a flatter level curve past "
+                   "level 100.",
+        "own": True,
+    },
+    "economy": {
+        "title": "Economy",
+        "summary": "Shop prices, the gold and Rift Crystals quests and finds give, and enemy and gathering drop "
+                   "chances, each multiplied.",
+        "own": True,
+    },
+    "vocation_stats": {
+        "title": "Stats by vocation",
+        "summary": "Each rest at an inn gives the Arisen and the main pawn the stats of their current vocation at "
+                   "every level.",
+        "own": True,
+    },
     LOADER: {
         "title": "Riftstone loader",
         "summary": "Serves your mods without touching the game's files, reports crashes, loads the plugins.",
@@ -121,6 +139,7 @@ _RULES: dict[tuple[str, str, str], tuple] = {
     ("lod_tuner", "lod", "screenheight"): ("auto_int", 240, 8640),
     ("lod_tuner", "lod", "fieldofview"): ("auto_float", 10.0, 170.0),
     ("lod_tuner", "lod", "farthest"): ("choice", "high", "lod"),
+    ("lod_tuner", "lod", "fadeseconds"): ("float", 0.0, 5.0),
     ("compat", "compat", "enabled"): ("int", 0, 1),
     ("compat", "levels", "unlearned"): ("int", 1, 10),
     ("compat", "levels", "learned"): ("int", 1, 10),
@@ -147,6 +166,19 @@ _RULES: dict[tuple[str, str, str], tuple] = {
     ("draw_distance", "draw", "objectsneverhide"): ("int", 0, 1),
     ("draw_distance", "draw", "enemiesalwaysactive"): ("int", 0, 1),
     ("six_skill_warrior", "warrior", "mode"): ("choice", "six", "off"),
+    ("xp_scale", "xp", "kills"): ("float", 0.1, 2.0),
+    ("xp_scale", "xp", "quests"): ("float", 0.1, 2.0),
+    ("xp_scale", "curve", "levelcost"): ("int_or_zero", 1000, 10000000),
+    ("economy", "shops", "buy"): ("float", 0.1, 5.0),
+    ("economy", "shops", "sell"): ("float", 0.1, 5.0),
+    ("economy", "gold", "quests"): ("float", 0.1, 10.0),
+    ("economy", "gold", "found"): ("float", 0.1, 10.0),
+    ("economy", "crystals", "quests"): ("float", 0.1, 10.0),
+    ("economy", "crystals", "found"): ("float", 0.1, 10.0),
+    ("economy", "drops", "enemies"): ("float", 0.1, 5.0),
+    ("economy", "drops", "gathering"): ("float", 0.1, 5.0),
+    ("vocation_stats", "vocation_stats", "mode"): ("choice", "current", "off"),
+    ("vocation_stats", "vocation_stats", "who"): ("choice", "party", "arisen", "pawn"),
     # the plugins read these as their ini describes; anything else they ignore or clamp
     ("inclination_lock", "lock", "mode"): ("choice", "freeze", "commands", "off"),
     ("save_backup", "backup", "keep"): ("int", 1, 1000),
@@ -157,6 +189,7 @@ _RULES: dict[tuple[str, str, str], tuple] = {
     (LOADER, "live", "hang_seconds"): ("int", 5, 600),
     (LOADER, "saves", "keep"): ("int", 1, 500),
     (LOADER, "loader", "keep_reports"): ("int", 1, 100),
+    (LOADER, "loader", "patch_ledger_seconds"): ("int", 2, 900),
     (LOADER, "overlay", "key"): ("fkey",),
     (LOADER, "overlay", "banner"): ("int", 0, 1),
     (LOADER, "overlay", "banner_seconds"): ("int", 3, 60),
@@ -168,7 +201,8 @@ _RULES: dict[tuple[str, str, str], tuple] = {
 _SECTION_RULES: dict[tuple[str, str], tuple] = {
     ("portcrystals", "names"): ("int", 0, 65535),
 }
-_BOOL_KEYS = re.compile(r"^(enabled|overlay|log_redirects|crash_reports|minidump|plugins|safe_mode|safe_mode_notice|"
+_BOOL_KEYS = re.compile(r"^(enabled|overlay|log_redirects|crash_reports|minidump|plugins|legacy|patch_ledger|"
+                        r"safe_mode|safe_mode_notice|"
                         r"fatal_hint|missing_textures|from_archives|ragdoll_bodies|frame_stats|hang_reports|borderless|borderless_fill|"
                         r"background_run|backup|show_at_start|record|trace)$")
 
@@ -238,13 +272,20 @@ def read_settings(path: Path) -> list[dict]:
     return out
 
 
+def rule_for(stem: str, section: str, key: str) -> tuple | None:
+    """The check a value of [section] key in stem's settings gets: its rule, its section's, the 0/1 of a switch, or
+    None (any short line: a path, a name)."""
+    rule = _RULES.get((stem.lower(), section.lower(), key.lower())) or _SECTION_RULES.get((stem.lower(), section.lower()))
+    if rule is None and _BOOL_KEYS.match(key.lower()):
+        rule = ("int", 0, 1)
+    return rule
+
+
 def _valid(stem: str, section: str, key: str, value) -> str:
     text = str(value).strip() if value is not None else ""
     if not text or len(text) > 64 or any(c in text for c in ";=[]\r\n\x00"):
         raise RiftError(f"{key}: a short value without ; = [ ] or line breaks")
-    rule = _RULES.get((stem.lower(), section.lower(), key.lower())) or _SECTION_RULES.get((stem.lower(), section.lower()))
-    if rule is None and _BOOL_KEYS.match(key.lower()):
-        rule = ("int", 0, 1)
+    rule = rule_for(stem, section, key)
     if rule is None:
         return text
     kind = rule[0]
@@ -462,7 +503,7 @@ def toggle(game: Game, name: str, on: bool) -> dict:
 
 def add(game: Game, name: str) -> dict:
     """Install (or update) a plugin this Riftstone built; an ini already there keeps its values."""
-    from .loader import merge_ini
+    from .loader import merged_ini
 
     _closed(game)
     src = built().get(_check_name(name).lower())
@@ -479,10 +520,8 @@ def add(game: Game, name: str) -> dict:
     os.replace(tmp, folder / src.name)
     ini_src, ini_dst = src.with_suffix(".ini"), folder / (src.stem + ".ini")
     if ini_src.is_file():
-        template = ini_src.read_bytes()
         owners = ini_dst.read_bytes() if ini_dst.is_file() else b""
-        mine = ini_text(owners)
         tmp = ini_dst.with_name(ini_dst.name + ".riftstone-tmp")
-        tmp.write_bytes(ini_bytes(merge_ini(ini_text(template), mine), like=owners) if mine else template)
+        tmp.write_bytes(merged_ini(ini_src.read_bytes(), owners))
         os.replace(tmp, ini_dst)
     return {"ok": True, "file": src.name, "enabled": enabled}

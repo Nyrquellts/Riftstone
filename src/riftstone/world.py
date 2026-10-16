@@ -465,10 +465,8 @@ def load(game: Game, idx, rebuild: bool = False, progress_factory=None, lang: st
     if bar:
         bar.done(f"World map ready: {len(data['stages'])} stages, {len(data['groups']):,} groups, "
                  f"{len(data['layouts']):,} layouts, {len(data['placements']):,} placements")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    tmp.replace(path)
+    from .index import write_cache
+    write_cache(path, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
     return World(data)
 
 

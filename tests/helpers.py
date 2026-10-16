@@ -220,9 +220,12 @@ def game_root() -> Path | None:
 
 
 def pe_file(machine: int = 0x14C, dll: bool = True, laa: bool = False, exports=("Direct3DCreate9",),
-            plus: bool = False, extra: bytes = b"", stamp: int = 0x5A314C31) -> bytes:
+            plus: bool = False, extra: bytes = b"", stamp: int = 0x5A314C31, imports: dict | None = None,
+            delay: dict | None = None, subsystem: tuple[int, int] | None = None) -> bytes:
     """A small but well-formed PE file: one section holding an export table with ``exports`` (none: no export
-    directory), then ``extra`` bytes (e.g. a marker string)."""
+    directory), then ``extra`` bytes (e.g. a marker string), then an import table for ``imports`` and a delay-load
+    table for ``delay`` ({DLL: [function name, or an int for an ordinal]}); ``subsystem`` = (major, minor), the
+    oldest Windows the header asks for (default: zeros, as before)."""
     import struct
 
     opt_size = 0xF0 if plus else 0xE0
@@ -244,6 +247,34 @@ def pe_file(machine: int = 0x14C, dll: bool = True, laa: bool = False, exports=(
         struct.pack_into("<I", blob, ptrs_at + 4 * i, r)
         struct.pack_into("<H", blob, ords_at + 2 * i, i)
         struct.pack_into("<I", blob, funcs_at + 4 * i, 0x2000 + i)
+
+    def table(dlls, size, name_at, lookup_at, iat_at, attributes):
+        """Descriptors (one per DLL and a null one), then each DLL's name, hint/name entries and lookup table."""
+        width, flag = (8, 1 << 63) if plus else (4, 1 << 31)
+        start = len(blob)
+        blob.extend(bytes(size * (len(dlls) + 1)))
+        for i, (lib, funcs) in enumerate(dlls.items()):
+            name_rva = va + len(blob)
+            blob.extend(lib.encode("ascii") + b"\0")
+            entries = []
+            for f in funcs:
+                if isinstance(f, int):
+                    entries.append(flag | f)
+                else:
+                    entries.append(va + len(blob))
+                    blob.extend(b"\0\0" + f.encode("ascii") + b"\0")
+            lookup = va + len(blob)
+            for e in entries + [0]:
+                blob.extend(e.to_bytes(width, "little"))
+            d = start + size * i
+            struct.pack_into("<I", blob, d, attributes)
+            struct.pack_into("<I", blob, d + name_at, name_rva)
+            struct.pack_into("<I", blob, d + lookup_at, lookup)
+            struct.pack_into("<I", blob, d + iat_at, lookup)
+        return va + start, size * (len(dlls) + 1)
+
+    import_dir = table(imports, 20, 12, 0, 16, 0) if imports else None
+    delay_dir = table(delay, 32, 4, 16, 12, 1) if delay else None
     size = len(blob)
     data = bytearray(raw + (size + 0x1FF) // 0x200 * 0x200)
     data[0:2] = b"MZ"
@@ -257,6 +288,12 @@ def pe_file(machine: int = 0x14C, dll: bool = True, laa: bool = False, exports=(
     struct.pack_into("<I", data, count_at, 16)
     if names:
         struct.pack_into("<II", data, count_at + 4, va, size)
+    if import_dir:
+        struct.pack_into("<II", data, count_at + 4 + 8 * 1, *import_dir)
+    if delay_dir:
+        struct.pack_into("<II", data, count_at + 4 + 8 * 13, *delay_dir)
+    if subsystem:
+        struct.pack_into("<HH", data, opt + 48, *subsystem)
     section = opt + opt_size
     data[section:section + 8] = b".edata\0\0"
     struct.pack_into("<IIII", data, section + 8, size, va, len(data) - raw, raw)

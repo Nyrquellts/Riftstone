@@ -76,7 +76,8 @@ def add_plugin(game: Game, source: Path) -> str:
     """Copy a native plugin (.asi/.dll) into <game>\\riftstone\\plugins so the loader loads it.
 
     A settings file with the plugin's name (lod_tuner.ini next to lod_tuner.asi) comes along the
-    first time; an ini already in the plugins folder holds the owner's settings and is kept.
+    first time; an ini already in the plugins folder holds the owner's settings: their values stay, and a
+    setting new in this build arrives with its default and comment (`merge_ini`, as Studio's update does).
     """
     source = Path(source)
     if source.suffix.lower() not in (".asi", ".dll"):
@@ -87,9 +88,14 @@ def add_plugin(game: Game, source: Path) -> str:
     d.mkdir(parents=True, exist_ok=True)
     target = d / source.name
     shutil.copyfile(source, target)
-    ini = source.with_suffix(".ini")
-    if ini.is_file() and not target.with_suffix(".ini").exists():
-        shutil.copyfile(ini, target.with_suffix(".ini"))
+    ini, owned = source.with_suffix(".ini"), target.with_suffix(".ini")
+    if ini.is_file():
+        owners = owned.read_bytes() if owned.is_file() else b""
+        text = merged_ini(ini.read_bytes(), owners)
+        if text != owners or not owned.is_file():      # an empty ini of the build's arrives too
+            tmp = owned.with_name(owned.name + ".riftstone-tmp")
+            tmp.write_bytes(text)
+            os.replace(tmp, owned)
     return target.name
 
 
@@ -97,6 +103,52 @@ def remove_plugin(game: Game, name: str) -> None:
     if any(c in name for c in "\\/") or name not in list_plugins(game):
         raise RiftError(f"no plugin named {name!r} in {plugins_dir(game)}")
     (plugins_dir(game) / name).unlink()
+
+
+def legacy_dir(game: Game) -> Path:
+    """riftstone\\legacy: other mods' DLLs (an old dinput8 hook, HardPlus.dll, pawnlib.dll), loaded before the
+    plugins so Riftstone's byte-checked plugins see what they changed (docs/runtime.md "Legacy DLLs")."""
+    return game.state_dir / "legacy"
+
+
+def list_legacy(game: Game) -> list[str]:
+    d = legacy_dir(game)
+    return sorted((p.name for p in d.glob("*") if p.is_file() and p.suffix.lower() in (".asi", ".dll")),
+                  key=str.lower) if d.is_dir() else []
+
+
+# A legacy DLL under one of these names would share it with a module already in the game (the loader is dinput8.dll):
+# it is kept under <stem>_legacy<suffix>, which a DLL loaded by its path does not mind.
+_TAKEN_NAMES = {"dinput8.dll", "riftstone_loader.dll", "d3d9.dll", "xinput1_3.dll", "version.dll", "winmm.dll"}
+
+
+def add_legacy(game: Game, source: Path) -> str:
+    """Copy another mod's DLL into riftstone\\legacy; its ini of the same name comes along the first time (one
+    already there holds the owner's settings and is kept).  The name it was given."""
+    source = Path(source)
+    if source.suffix.lower() not in (".asi", ".dll"):
+        raise RiftError("a legacy DLL is a .asi or .dll file")
+    if not source.is_file():
+        raise RiftError(f"{source} does not exist")
+    name = source.name
+    if name.lower() in _TAKEN_NAMES:
+        name = f"{source.stem}_legacy{source.suffix}"
+    if name.lower() in {n.lower() for n in list_plugins(game)}:
+        raise RiftError(f"{name} is already a plugin in {plugins_dir(game)}; one file is loaded once")
+    d = legacy_dir(game)
+    d.mkdir(parents=True, exist_ok=True)
+    target = d / name
+    shutil.copyfile(source, target)
+    ini = source.with_suffix(".ini")
+    if ini.is_file() and not target.with_suffix(".ini").exists():
+        shutil.copyfile(ini, target.with_suffix(".ini"))
+    return name
+
+
+def remove_legacy(game: Game, name: str) -> None:
+    if any(c in name for c in "\\/") or name not in list_legacy(game):
+        raise RiftError(f"no legacy DLL named {name!r} in {legacy_dir(game)}")
+    (legacy_dir(game) / name).unlink()
 
 
 def status(game: Game) -> dict:
@@ -107,6 +159,7 @@ def status(game: Game) -> dict:
             "other_dinput8": dll.is_file() and not is_ours(dll),
             "chained": chain.is_file(),
             "plugins": list_plugins(game),
+            "legacy": list_legacy(game),
             "crash_reports": sorted(p.name for p in logs.glob("crash-*.txt")) if logs.is_dir() else [],
             "log": (logs / "loader.log") if (logs / "loader.log").is_file() else None}
 
@@ -139,11 +192,31 @@ def _ini_values(text: str) -> dict[str, dict[str, str]]:
     return out
 
 
+def _ini_spelling(text: str) -> dict[str, tuple[str, dict[str, str]]]:
+    """{section: (the section as written, {key: the key as written})}, by the lower-cased names
+    ``_ini_values`` gives, first block of a section and first line of a key winning as there."""
+    out: dict[str, tuple[str, dict[str, str]]] = {}
+    current = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            name = line[1:-1].strip()
+            current = None if name.lower() in out else out.setdefault(name.lower(), (name, {}))[1]
+        elif "=" in line and current is not None:
+            k = line.partition("=")[0].strip()
+            current.setdefault(k.lower(), k)
+    return out
+
+
 def merge_ini(template: str, existing: str, overrides: dict[str, dict[str, str]] | None = None) -> str:
     """The template's layout and comments with the owner's values kept: a key the owner set keeps its
-    value, a key new in the template gets its default, a key only the owner has stays in its section.
-    ``overrides`` ({section: {key: value}}) win over both."""
+    value, a key new in the template gets its default, a key only the owner has stays in its section,
+    spelled as the owner wrote it (a section only the owner has too).  ``overrides`` ({section: {key:
+    value}}) win over both."""
     mine = _ini_values(existing)
+    spelling = _ini_spelling(existing)
     overrides = {s.lower(): {k.lower(): v for k, v in keys.items()} for s, keys in (overrides or {}).items()}
     out: list[str] = []
     used: dict[str, set[str]] = {}
@@ -153,9 +226,10 @@ def merge_ini(template: str, existing: str, overrides: dict[str, dict[str, str]]
         if sec is None:
             return
         extra = {**mine.get(sec, {}), **overrides.get(sec, {})}
+        written = spelling.get(sec, (sec, {}))[1]
         for k, v in extra.items():
             if k not in used.get(sec, set()):
-                out.append(f"{k} = {v}")
+                out.append(f"{written.get(k, k)} = {v}")
                 used.setdefault(sec, set()).add(k)
 
     for raw in template.splitlines():
@@ -163,17 +237,20 @@ def merge_ini(template: str, existing: str, overrides: dict[str, dict[str, str]]
         if line.startswith("[") and line.endswith("]"):
             close(section)
             section = line[1:-1].strip().lower()
+            used.setdefault(section, set())     # the template has it: never added again below, even with no keys
             out.append(raw)
             continue
-        if section and line and not line.startswith(";") and "=" in line:
-            key = line.partition("=")[0].strip().lower()
-            if key in overrides.get(section, {}):
-                out.append(f"{line.partition('=')[0].strip()} = {overrides[section][key]}")
-            elif key in mine.get(section, {}):
-                out.append(f"{line.partition('=')[0].strip()} = {mine[section][key]}")
-            else:
+        if section is not None and line and not line.startswith(";") and "=" in line:   # "[]" is a section too
+            name, _, default = line.partition("=")
+            key = name.strip().lower()
+            value = overrides.get(section, {}).get(key, mine.get(section, {}).get(key))
+            # The template's own line when the value is its default, or for a key it has already given (Windows
+            # reads only the first), so a second merge writes the same bytes.
+            if value is None or value == default.strip() or key in used[section]:
                 out.append(raw)
-            used.setdefault(section, set()).add(key)
+            else:
+                out.append(f"{name.strip()} = {value}")
+            used[section].add(key)
             continue
         out.append(raw)
     close(section)
@@ -181,10 +258,22 @@ def merge_ini(template: str, existing: str, overrides: dict[str, dict[str, str]]
         if sec in used:
             continue
         out.append("")
-        out.append(f"[{sec}]")
+        out.append(f"[{spelling.get(sec, (sec, {}))[0]}]")
         used[sec] = set()
         close(sec)
     return "\n".join(out).rstrip("\n") + "\n"
+
+
+def merged_ini(template: bytes, owners: bytes) -> bytes:
+    """A plugin's ini after an update (`add_plugin`, Studio's `plugins.add`): the build's bytes where the owner has
+    no text, else `merge_ini` in the owner's encoding (UTF-16 or the code page, as their file is).  The build's ini
+    is put in that encoding first, so a default the file cannot hold reads as it will be written ('?') and a
+    second update writes the same bytes."""
+    mine = ini_text(owners)
+    if not mine:
+        return template
+    theirs = ini_text(ini_bytes("\n".join(ini_text(template).splitlines()), like=owners))
+    return ini_bytes(merge_ini(theirs, mine), like=owners)
 
 
 def _template_ini() -> str:

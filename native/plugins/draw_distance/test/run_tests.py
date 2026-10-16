@@ -6,9 +6,10 @@ dd_stub.exe maps DDDA.exe's image into its own process, dd_harness_core.dll load
 which verifies and patches that copy, and then runs the game's own code on fake objects at ViewRange
 NORMAL, FAR and FARTHEST: the display radii (setNoMoveDistance, the sGameSys constructor), the radius
 each object takes and the tests that hide it, enemy and human-enemy distances and move modes, and
-the grass fade.  Seven profiles: the shipped draw_distance.ini, two others, clamped and unreadable
-values, every setting 0, Enabled = 0, and game code that differs by one byte.  The plugin never sees
-the owner's real config.ini here: LOCALAPPDATA points at the temp folder.
+the grass fade.  Eight profiles: the shipped draw_distance.ini, two others, clamped and unreadable
+values, the owner's own settings, every setting 0, Enabled = 0, and game code that differs by one
+byte.  The plugin never sees the owner's real config.ini here: LOCALAPPDATA points at the temp
+folder.
 Needs native\\plugins\\draw_distance\\build.cmd to have run; without the build or without the game it
 reports a skip.  Exit status 0 = passed or skipped, 1 = failed.
 """
@@ -47,6 +48,12 @@ PROFILES = {
     "clamp": ("[draw]\nObjects = 500\nGrass = many\nEnemies = 0.5\nHumanEnemies = 99999\n",
               ["Grass = many is not a number of 0 or more",
                "patched (harness), 7 writes; at every ViewRange objects x20, grass the game's, enemies x1, human enemies 2000 m"]),
+    # The owner's own settings (2026-10-16), played at FARTHEST: objects at the most, grass at FARTHEST's, objects
+    # never hidden, enemies left to the game.
+    "owner": ("[draw]\nEnabled = 1\nObjects = 20\nGrass = 3\nEnemies = 0\nHumanEnemies = 0\nObjectsNeverHide = 1\n"
+              "EnemiesAlwaysActive = 0\n",
+              ["patched (harness), 8 writes; at every ViewRange objects x20, grass x3, enemies the game's, "
+               "human enemies the game's", "objects never hidden: yes; enemies always active: no"]),
     "zero": ("[draw]\nEnabled = 1\nObjects = 0\nGrass = 0\nEnemies = 0\nHumanEnemies = 0\nObjectsNeverHide = 0\n"
              "EnemiesAlwaysActive = 0\n", ["every setting is the game's own, nothing patched"]),
     "off": ("[draw]\nEnabled = 0\nObjects = 8\n", ["Enabled = 0, nothing patched"]),

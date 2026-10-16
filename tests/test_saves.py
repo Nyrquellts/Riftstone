@@ -531,7 +531,7 @@ def pl_record(name: str, **kw) -> str:
             '<u8 name="mHairNo" value="3"/>\n</class>\n' + param_block(**kw) + "</class>\n")
 
 
-def arisen_save(level=50, job=7, rank=1, points=100, palettes=None, learned=(), base_level=48, base_job=5) -> bytes:
+def arisen_save(level=50, job=7, rank=1, points=100, palettes=None, learned=(), base_level=48, base_job=6) -> bytes:
     """An Arisen (a Warrior) in the manual copy, an older Magick Archer in the base copy, a pawn beside each and
     the system data's copy of the Arisen: only the two mPl records are the Arisen's."""
     def copy(name, lv, jb):
@@ -560,7 +560,8 @@ class ArisenTest(unittest.TestCase):
         self.assertEqual(a["skills"]["HAMMER"], {"equipped": [-1] * 6, "learned": 3, "of": 10})
         self.assertEqual((a["stats"]["mHpMax"], a["stats"]["mBasicMgcDefend"]), (500.0, 70.0))
         b = seen["mPlayerDataBase"]
-        self.assertEqual((b["level"], b["vocation"], list(b["skills"])), (48, "Magick Archer", ["DAGGER", "BOW_MG"]))
+        self.assertEqual((b["level"], b["vocation"], list(b["skills"])),
+                         (48, "Magick Archer", ["DAGGER", "WAND", "BOW_MG"]))
         self.assertNotIn("learned", saves.arisen(data)["mPlayerDataManual"]["skills"]["GSWORD"])   # no tables
 
     def test_set_changes_both_copies_and_nothing_else(self):
@@ -580,7 +581,7 @@ class ArisenTest(unittest.TestCase):
         # the slots the player chose stay; the empty ones take the lowest unused numbers of the category
         self.assertEqual(a["skills"]["GSWORD"], {"equipped": [103, 101, 100, 102, 104, 105], "learned": 10, "of": 10})
         self.assertEqual(a["skills"]["HAMMER"]["equipped"], [100, 101, 102, 103, 104, 105])
-        self.assertEqual((b["job"], b["vocation"]), (5, "Magick Archer"))         # the vocation itself is kept
+        self.assertEqual((b["job"], b["vocation"]), (6, "Magick Archer"))         # the vocation itself is kept
         self.assertEqual(b["skills"]["DAGGER"], {"equipped": [-1] * 6, "learned": 0, "of": 4})   # not its weapons
         xml = saves.unpack(new)
         manual = xml.split(b'name="mPlayerDataBase"')[0]

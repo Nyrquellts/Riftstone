@@ -21,7 +21,9 @@
 //   sets cloth-simulation detail (uSimSoftBody::getTargetLODLevel).  A distance is never lowered and
 //   never pushed past MaxDistance.  Farthest = lod gives ViewRange FARTHEST levels of detail too: the ten
 //   ViewRange tests that skip the distance test at FARTHEST store 3 as the multiplier instead, the way FAR
-//   stores 2 (FAR_SITES; a branch retargeted at each, nothing else).  Settings: lod_tuner.ini next to this file.
+//   stores 2 (FAR_SITES; a branch retargeted at each, nothing else).  FadeSeconds paces instanced vegetation's
+//   cross-fade between levels by the clock instead of a step a frame (FADE_SET, FADE_STEP), so a swap takes the
+//   same time at 150 fps as at 30.  Settings: lod_tuner.ini next to this file.
 //
 // Safety
 //   DDDA.exe build 2364871 only.  The patched bytes, the code around them, rModel's vtable and two
@@ -104,6 +106,31 @@ const FarSite FAR_SITES[] = {
 #undef FAR_JNE10
 #undef FAR_JNE6
 
+// Instanced vegetation's cross-fade.  cInstancingDynamic's draw-list builder (0x01143160, thiscall, ret 0x14) keeps
+// four 4-bit counters in each instance record (+0x24..+0x27, one per level) and, when the object's mUseLodFade (+0x26,
+// 1 from the constructor) and the view's bit (+0x16A & 1) are set, steps them once per call: the new level's counter
+// up by one to 15, then the others down by 8; the record is drawn at every level whose counter is above 0, at that
+// alpha.  A swap is 17 steps: 0.57 s at the consoles' 30 fps, 0.19 s at 91, 0.11 s at 150, close to a pop.
+// FadeSeconds paces the steps by the clock: the store of the fade flag (FADE_SET) asks FadeGate whether this object's
+// step is due (1) or not yet (2, fade still drawn), and the step (FADE_STEP) skips to its end on 2.  The two places
+// the function reads the flag compare it with 0 (FADE_CONTEXT), so 2 draws the cross-fade as 1 does.
+constexpr uintptr_t FADE_SET = 0x01143179, FADE_SET_ON = 0x01143184, FADE_SET_OFF = 0x01143180;
+const uint8_t FADE_SET_BYTES[5] = {0xC6, 0x44, 0x24, 0x3B, 0x01};  // mov byte [esp+0x3B], 1
+constexpr uintptr_t FADE_STEP = 0x01143353, FADE_STEP_NEXT = 0x0114335B, FADE_STEP_LEVEL = 0x01143368,
+                    FADE_STEP_END = 0x011434C2;
+const uint8_t FADE_STEP_BYTES[8] = {0x85, 0xDB, 0x75, 0x11, 0x0F, 0xB6, 0x46, 0x24};  // test ebx,ebx; jne; movzx eax,[esi+0x24]
+constexpr uint32_t FADE_STEPS = 17;  // 15 up, then 2 of 8 down
+const Expect FADE_CONTEXT[] = {
+    {"the builder's start: mUseLodFade and the view's fade bit", 0x01143160,
+     {0x83, 0xEC, 0x3C, 0x33, 0xD2, 0x89, 0x4C, 0x24, 0x28, 0x38, 0x51, 0x26}, 12},
+    {"the view's fade bit", 0x0114316E, {0x8B, 0x44, 0x24, 0x40, 0xF6, 0x80, 0x6A, 0x01, 0x00, 0x00, 0x01}, 11},
+    {"the flag's stores", 0x0114317E, {0x75, 0x04, 0x88, 0x54, 0x24, 0x3B, 0x8B, 0x44, 0x24, 0x4C}, 10},
+    {"the step's test of the flag", 0x011432EE, {0x80, 0x7C, 0x24, 0x47, 0x00, 0x0F, 0x84, 0xC9, 0x01, 0x00, 0x00}, 11},
+    {"the step's counter up", 0x0114335B, {0x83, 0xF8, 0x0F, 0x73, 0x4E, 0xFE, 0x46, 0x24, 0xE9, 0x5A, 0x01, 0x00}, 12},
+    {"the step's end", 0x011434C2, {0x8B, 0x4C, 0x24, 0x34, 0x80, 0xB9, 0x64, 0x04}, 8},
+    {"the draw list's test of the flag", 0x01143604, {0x80, 0x7C, 0x24, 0x47, 0x00, 0x0F, 0x84, 0x2E, 0x01, 0x00, 0x00}, 11},
+};
+
 constexpr uintptr_t RMODEL_VTABLE = 0x01438618;
 constexpr uint32_t SLOT_LOAD = 10;
 constexpr uintptr_t RMODEL_LOAD = 0x00FA8FE0;
@@ -124,6 +151,7 @@ struct Settings {
     double characters = 1.0;
     double maxMeters = 10000;
     bool farthestLod = false; // Farthest = lod: levels of detail at FARTHEST too (x3)
+    double fadeSeconds = 0.75; // instanced vegetation's cross-fade; 0: the game's, one step a frame
 };
 
 Settings g_set;
@@ -133,6 +161,14 @@ volatile LONG g_models = 0, g_env = 0, g_fallback = 0, g_farOnly = 0, g_changed 
 // Ninput runtime multiplier x1000 (1000 == x1.0). Set atomically via the engine provider; read per
 // model load, so it takes effect for models loaded after the change (already-loaded ones keep theirs).
 volatile LONG g_extra_milli = 1000;
+
+// The fade's clock: a step every g_period counts of QueryPerformanceCounter (g_periodUs microseconds on the test
+// clock).  g_fadeLast keeps the step each object last took, {object, step number} in one 64-bit entry, found by the
+// object's address; objects that share a run of FADE_PROBE entries with others fall back to a step a call.
+constexpr uint32_t FADE_SLOTS = 8192, FADE_PROBE = 4;
+uint64_t g_period = 1, g_periodUs = 1;
+volatile LONG64 g_testUs = -1;  // >= 0: the harness's clock, in microseconds
+alignas(8) volatile LONG64 g_fadeLast[FADE_SLOTS];
 
 // One write per line: models load on several threads.
 void Log(const char* fmt, ...) {
@@ -278,6 +314,94 @@ __declspec(naked) static void ThunkModel() {
     }
 }
 
+// ---- the fade's pace, asked once per call of the draw-list builder that fades --------------------
+// 1: this object's counters step now; 2: not yet (the cross-fade is still drawn).  Integer only.
+extern "C" uint32_t __stdcall LodTuner_FadeGate(uint32_t object) {
+    LONG64 us = g_testUs;
+    uint32_t step;
+    if (us >= 0) {
+        step = (uint32_t)((uint64_t)us / g_periodUs);
+    } else {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        step = (uint32_t)((uint64_t)now.QuadPart / g_period);
+    }
+    LONG64 mine = (LONG64)(((uint64_t)object << 32) | step);
+    uint32_t home = (uint32_t)((object >> 4) * 2654435761u) >> 19;  // 13 bits: FADE_SLOTS
+    for (uint32_t k = 0; k < FADE_PROBE; k++) {
+        volatile LONG64* e = &g_fadeLast[(home + k) & (FADE_SLOTS - 1)];
+        LONG64 v = InterlockedCompareExchange64(e, 0, 0);  // an atomic read
+        if (v == 0) {
+            if (InterlockedCompareExchange64(e, mine, 0) == 0) return 1;
+            v = InterlockedCompareExchange64(e, 0, 0);
+        }
+        if ((uint32_t)((uint64_t)v >> 32) == object) {
+            if ((uint32_t)v == step) return 2;
+            InterlockedCompareExchange64(e, mine, v);
+            return 1;
+        }
+    }
+    InterlockedExchange64(&g_fadeLast[home], mine);
+    return 1;
+}
+
+// FADE_SET: `test byte [view+0x16A], 1` has just set ZF and the jmp keeps it.  Off: the game's own store of 0.  On: the
+// gate's answer stored as the flag (at [esp+0x3B], 0x20 deeper under pushad), every register, the flags and the xmm
+// registers kept, on to the game's code after both stores (which reads no flag and needs edx, 0, as it was).
+static uintptr_t g_fadeOn, g_fadeOff, g_fadeNext, g_fadeLevel, g_fadeEnd;
+
+__declspec(naked) static void ThunkFadeSet() {
+    __asm {
+        jz off
+        pushfd
+        pushad
+        sub esp, 128
+        movdqu [esp], xmm0
+        movdqu [esp + 16], xmm1
+        movdqu [esp + 32], xmm2
+        movdqu [esp + 48], xmm3
+        movdqu [esp + 64], xmm4
+        movdqu [esp + 80], xmm5
+        movdqu [esp + 96], xmm6
+        movdqu [esp + 112], xmm7
+        push dword ptr [esp + 128 + 0x24 + 0x28]  // this, as the builder saved it
+        call LodTuner_FadeGate
+        mov byte ptr [esp + 128 + 0x24 + 0x3B], al
+        movdqu xmm0, [esp]
+        movdqu xmm1, [esp + 16]
+        movdqu xmm2, [esp + 32]
+        movdqu xmm3, [esp + 48]
+        movdqu xmm4, [esp + 64]
+        movdqu xmm5, [esp + 80]
+        movdqu xmm6, [esp + 96]
+        movdqu xmm7, [esp + 112]
+        add esp, 128
+        popad
+        popfd
+        jmp dword ptr [g_fadeOn]
+    off:
+        jmp dword ptr [g_fadeOff]
+    }
+}
+
+// FADE_STEP, after the level is stored and a new record's counters are set: on 2 the step is skipped (to the end of
+// the fade block, which reads no flag and no eax); otherwise the three instructions the jmp covers, and on.  The
+// builder has pushed ebx, esi and edi since the store, so the flag is at [esp+0x47].
+__declspec(naked) static void ThunkFadeStep() {
+    __asm {
+        cmp byte ptr [esp + 0x47], 2
+        je hold
+        test ebx, ebx
+        jne level
+        movzx eax, byte ptr [esi + 0x24]
+        jmp dword ptr [g_fadeNext]
+    level:
+        jmp dword ptr [g_fadeLevel]
+    hold:
+        jmp dword ptr [g_fadeEnd]
+    }
+}
+
 namespace {
 
 bool Readable(uintptr_t at, size_t n) {
@@ -320,6 +444,48 @@ bool PatchFarthest() {
         FlushInstructionCache(GetCurrentProcess(), (void*)s.at, s.putLen);
     }
     return true;
+}
+
+// A jmp from `at` to `to`, nops over the rest of `len`.
+bool WriteJmp(uintptr_t at, size_t len, const void* to) {
+    DWORD old;
+    if (!VirtualProtect((void*)at, len, PAGE_EXECUTE_READWRITE, &old))
+        return Log("failed: VirtualProtect at 0x%08X (%lu)", (unsigned)at, GetLastError()), false;
+    uint8_t* p = (uint8_t*)at;
+    int32_t rel = (int32_t)((uintptr_t)to - (at + 5));
+    p[0] = 0xE9;
+    memcpy(p + 1, &rel, 4);
+    for (size_t k = 5; k < len; k++) p[k] = 0x90;
+    VirtualProtect((void*)at, len, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, len);
+    return true;
+}
+
+// FadeSeconds: both sites and their context checked first, then both written, or none.
+bool PatchFade() {
+    if (!Readable(FADE_SET, sizeof FADE_SET_BYTES) || memcmp((const void*)FADE_SET, FADE_SET_BYTES, sizeof FADE_SET_BYTES) != 0 ||
+        !Readable(FADE_STEP, sizeof FADE_STEP_BYTES) || memcmp((const void*)FADE_STEP, FADE_STEP_BYTES, sizeof FADE_STEP_BYTES) != 0)
+        return Log("refused: FadeSeconds: instanced vegetation's fade step at 0x%08X / 0x%08X is not the expected code; the "
+                   "game's own fade stays", (unsigned)FADE_SET, (unsigned)FADE_STEP), false;
+    for (const Expect& e : FADE_CONTEXT) {
+        if (!Readable(e.at, e.len) || memcmp((const void*)e.at, e.bytes, e.len) != 0)
+            return Log("refused: FadeSeconds: %s at 0x%08X is not the expected code; the game's own fade stays", e.what,
+                       (unsigned)e.at), false;
+    }
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    double per = g_set.fadeSeconds / FADE_STEPS;
+    g_period = (uint64_t)((double)f.QuadPart * per + 0.5);
+    g_periodUs = (uint64_t)(1e6 * per + 0.5);
+    if (g_period < 1) g_period = 1;
+    if (g_periodUs < 1) g_periodUs = 1;
+    g_fadeOn = FADE_SET_ON;
+    g_fadeOff = FADE_SET_OFF;
+    g_fadeNext = FADE_STEP_NEXT;
+    g_fadeLevel = FADE_STEP_LEVEL;
+    g_fadeEnd = FADE_STEP_END;
+    return WriteJmp(FADE_STEP, sizeof FADE_STEP_BYTES, ThunkFadeStep) &&
+           WriteJmp(FADE_SET, sizeof FADE_SET_BYTES, ThunkFadeSet);
 }
 
 bool Patch() {
@@ -396,6 +562,7 @@ void LoadSettings(HMODULE self) {
     const wchar_t* f = farthest;
     while (*f == L' ' || *f == L'\t') f++;
     s.farthestLod = _wcsnicmp(f, L"lod", 3) == 0;
+    s.fadeSeconds = Clamp(ReadNumber(ini, L"FadeSeconds", 0.75), 0, 5);
 
     GameConfig game = ReadGameConfig();
     if (s.height <= 0) s.height = game.height > 0 ? game.height : 1080;
@@ -418,6 +585,11 @@ void LoadSettings(HMODULE self) {
         haveIni ? "lod_tuner.ini" : "no lod_tuner.ini, defaults", g_k, s.scale > 0 ? "" : " (screen height / 720)",
         pixels, s.characters, g_cap / 100.0,
         s.farthestLod ? "with levels of detail at x3 (Farthest = lod)" : "at full detail, the game's own (Farthest = high)");
+    if (s.fadeSeconds > 0)
+        Log("settings: instanced vegetation cross-fades between levels of detail over %.2f s at any frame rate (FadeSeconds)",
+            s.fadeSeconds);
+    else
+        Log("settings: instanced vegetation cross-fades a step a frame, the game's own (FadeSeconds = 0)");
     if (game.viewRange[0])
         Log("config.ini ViewRange=%S%s", game.viewRange,
             _wcsicmp(game.viewRange, L"FARTHEST") == 0
@@ -460,6 +632,10 @@ void Start(HMODULE self) {
     if (!Verify() || !Patch()) return;
     if (g_set.farthestLod && PatchFarthest())
         Log("lod_tuner: FARTHEST picks levels of detail at x3: %u ViewRange tests changed", (unsigned)_countof(FAR_SITES));
+    if (g_set.fadeSeconds > 0 && PatchFade())
+        Log("lod_tuner: instanced vegetation's fade step patched at 0x%08X and 0x%08X: a step every %.1f ms, a swap in "
+            "%.2f s (below %.0f fps a step a frame, the game's own)", (unsigned)FADE_SET, (unsigned)FADE_STEP,
+            g_set.fadeSeconds * 1000.0 / FADE_STEPS, g_set.fadeSeconds, FADE_STEPS / g_set.fadeSeconds);
     Log("lod_tuner: rModel::load patched at 0x%08X (%s); first changes:", (unsigned)SITE, harness ? "harness" : "game");
 }
 
@@ -481,6 +657,9 @@ extern "C" int NinputProvide_LodMultiplier(float m) {
 
 // For tests / a live view: the multiplier currently in effect.
 extern "C" __declspec(dllexport) float LodTuner_Multiplier() { return (float)g_extra_milli / 1000.0f; }
+
+// For the harness: the fade's clock in microseconds (a negative value: the real clock again).
+extern "C" __declspec(dllexport) void LodTunerTest_Clock(long long us) { InterlockedExchange64(&g_testUs, us < 0 ? -1 : us); }
 
 extern "C" __declspec(dllexport) int Ninput_Initialize(const NinputInterface* nyr) {
     if (!nyr || nyr->abi_version != NINPUT_ABI_VERSION || !nyr->engine) return 0;

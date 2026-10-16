@@ -338,6 +338,18 @@ pre.code { padding: 14px 18px; white-space: pre; }
 .chip.drag { cursor: grab; }
 .chip.drag:active { cursor: grabbing; }
 .wmap .legend { padding: 7px 10px 9px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.wmode { display: flex; gap: 6px; }
+.w3host { position: relative; }
+.w3host canvas { display: block; width: 100%; height: 600px; cursor: crosshair; touch-action: none; }
+.w3host canvas.over { position: absolute; inset: 0; height: 100%; pointer-events: none; }
+.w3bar { position: absolute; top: 10px; left: 10px; right: 10px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; pointer-events: none; }
+.w3bar > * { pointer-events: auto; }
+.w3bar .chip { background: rgb(8 8 12 / .84); }
+.w3bar .chip .sub { margin-left: 4px; font-size: 11px; }
+.w3bar select { height: 28px; padding: 0 8px; font-size: 12px; width: auto; background: rgb(8 8 12 / .84); }
+.w3msg { position: absolute; left: 0; right: 0; top: 0; height: 600px; display: grid; place-items: center; padding: 24px; text-align: center;
+  color: var(--muted); font-size: 13px; pointer-events: none; background: rgb(12 13 19 / .72); }
+.w3msg:empty { display: none; }
 .wtip { position: absolute; pointer-events: none; padding: 5px 9px; background: rgb(8 8 12 / .94); border: 1px solid var(--line);
   font: 12px var(--mono); color: var(--text); white-space: nowrap; display: none; }
 .wtoggles { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -356,6 +368,17 @@ pre.code { padding: 14px 18px; white-space: pre; }
 .wplan { padding: 10px 12px; border-top: 1px solid var(--line); font-size: 12.5px; }
 .wplan .warn { color: var(--text); }
 .wplan .warn::first-letter { color: var(--muted); }
+.wedit { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0 0; padding: 8px 12px; border: 1px solid var(--line);
+  background: var(--well); font-size: 12.5px; }
+.wedit .dest { display: flex; gap: 6px; }
+.wedit select, .wedit .input { height: 30px; padding: 0 8px; font-size: 12.5px; width: auto; min-width: 190px; }
+.wsel .wform { padding: 8px 0 6px; grid-template-columns: 64px minmax(0, 1fr); }
+.wsel .wform .input { height: 30px; }
+.wsel .row { gap: 6px; flex-wrap: wrap; }
+.wsel .warn { color: var(--text); font-size: 12px; margin-top: 4px; }
+.wsel .warn::first-letter { color: var(--muted); }
+.wmark { margin-left: 6px; font: 600 10px var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+.wmap.moving canvas { cursor: copy; }
 .wbox.wide { grid-column: 1 / -1; }
 .dbeats { width: 100%; border-collapse: collapse; margin: 8px 0 4px; }
 .dbeats td { padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line2); font-size: 12.5px; vertical-align: top; }
@@ -1421,7 +1444,7 @@ function editorMap() {
 
 /* ---------- world: every stage, its groups and placements on one map; encounters ---------- */
 const W = { stages: null, st: null, show: { e: true, n: true, p: true, t: false, s: false }, hl: null, name: null,
-            sel: null, spot: null, plan: null, view: null, drag: null };
+            sel: null, spot: null, plan: null, view: null, drag: null, mode: "map" };
 const WCOLOR = { e: "#00f0ff", n: "#e2e8f0", p: "#8d99a8", t: "#6f8fd6", s: "#3d4452" };
 const WTYPE = { e: "enemies", n: "NPCs & humans", p: "objects", t: "sensor targets", s: "static models" };
 const stName = n => "st" + String(n).padStart(3, "0");
@@ -1466,11 +1489,12 @@ async function worldFind() {
   if (W.st) drawWorld();
 }
 async function loadStage(n) {
-  const r = await api("world/stage?n=" + n);
-  W.st = r; W.hl = null; W.sel = null; W.plan = null; W.spot = null; W.view = null; W.dungeon = null;
+  const r = await api("world/stage?" + qs({ n, mod: worldMod() }));
+  W.st = r; W.hl = null; W.sel = null; W.plan = null; W.spot = null; W.view = null; W.dungeon = null; W.moving = false; W.dragTo = null;
   W.backPath = null; W.backKind = "";
   renderStageList(); renderStage();
   loadBackdrop(r.stage);
+  if (W.mode === "3d") load3d();
 }
 // The ground behind the dots: the stage's navigation mesh (where the game's walkers stand), or for the open field
 // the terrain cells that hold something.  It arrives after the dots and is drawn under them; no picture is no error.
@@ -1496,9 +1520,13 @@ function backdropPath(b) {
   if (b.kind === "cells") { for (const [x, z] of b.cells) p.rect(x, z, b.size, b.size); return p; }
   return null;
 }
+function typeCounts() {
+  const counts = {};
+  W.st.points.forEach(p => { if (p[7] === 2) return; const t = W.st.layouts[p[3]].type; counts[t] = (counts[t] || 0) + 1; });
+  return counts;
+}
 function renderStage() {
-  const r = W.st, counts = {};
-  r.points.forEach(p => { const t = r.layouts[p[3]].type; counts[t] = (counts[t] || 0) + 1; });
+  const r = W.st, counts = typeCounts();
   const eg =r.groups.filter(g => g.type === "e").sort((a, b) => (a.dlc - b.dlc) || (a.number - b.number));
   const unitName = u => { const x = r.names.find(n => n.id === u); return x && x.name ? x.name : ""; };
   const story = g => (g.appear[0] || g.appear[1]) ? `scn ${g.appear[0]}..${g.appear[1] || "on"}` : "always";
@@ -1508,8 +1536,18 @@ function renderStage() {
     <div class="wdrag"><span class="sub">Drag an enemy onto the map to plan an encounter there:</span>
       <input class="input" id="wdragq" placeholder="filter: goblin, em0100…" autocomplete="off">
       <div class="chips" id="wdragchips"></div></div>
-    <div class="wmap"><canvas id="wcanvas"></canvas><div class="wtip" id="wtip"></div>
+    <div class="wedit"><span class="sub">Your changes go into</span><div id="edestbox">${destPicker("edest", null, gameKind())}</div>
+      <button class="btn small" id="wundo" title="Undo the last change (Ctrl+Z)" ${W.undo ? "" : "disabled"}>Undo</button>
+      <span class="sub grow" id="weditinfo">${editInfo()}</span></div>
+    <div class="row" style="margin-top: 12px; flex-wrap: nowrap"><div class="wmode">
+        <button class="chip ${W.mode !== "3d" ? "on" : ""}" data-m="map" title="every placement seen from above">Map</button>
+        <button class="chip ${W.mode === "3d" ? "on" : ""}" data-m="3d" title="the stage's own collision and walkable ground in 3D: pick a spot at its real height">3D</button></div>
+      <span class="sub grow" id="w3info" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap"></span></div>
+    <div class="wmap" id="wmap2" ${W.mode === "3d" ? "hidden" : ""}><canvas id="wcanvas"></canvas><div class="wtip" id="wtip"></div>
       <div class="legend" id="wlegend">Scroll to zoom, drag to pan. Click a dot to see it; click open ground to pick a spot for an encounter.</div></div>
+    <div class="wmap" id="wmap3" ${W.mode !== "3d" ? "hidden" : ""}><div class="w3host" id="w3host"></div>
+      <div class="w3bar" id="w3bar"></div><div class="w3msg" id="w3msg"></div><div class="wtip" id="w3tip"></div>
+      <div class="legend" id="w3legend"></div></div>
     <div class="wcols">
       <div class="wbox"><div class="bh">Enemy groups (${eg.length}; free numbers from ${r.free.length ? r.free[0] : "none"})</div>
         <div class="wgroups">${eg.map((g, i) => `<div class="wg" data-i="${i}"><div class="num">${g.dlc ? "DLC " : ""}#${g.number}</div>
@@ -1519,7 +1557,7 @@ function renderStage() {
         <div class="wsel" id="wsel"><span class="muted">Nothing selected.</span></div></div>
       <div class="wbox"><div class="bh">Encounter: N of an enemy as a new group</div>
         <div class="wform">
-          <label>Put it in</label><div id="edestbox">${destPicker("edest", null, gameKind())}</div>
+          <label>Put it in</label><div class="sub">the mod chosen above the map</div>
           <label>Enemy</label><input class="input" id="eenemy" list="wenemylist" placeholder="goblin, em0100…" value="${esc(W.name || "")}">
           <label>How many</label><input class="input" id="ecount" type="number" min="1" max="9999" value="100">
           <label>At once</label><input class="input" id="eonce" type="number" min="1" max="31" value="10" title="spawn points; the game keeps 10 enemies active, the enemy_cap plugin 30">
@@ -1528,6 +1566,9 @@ function renderStage() {
           <label>Hours</label><input class="input" id="ehours" placeholder="like the copied group, or 4,19 / 20,3" title="the first and the last whole hour of the day the group exists (20,3 runs past midnight)">
           <label>Copy group</label><input class="input" id="elike" type="number" min="0" max="294" placeholder="the nearest one" title="the group whose areas, story window and load conditions (e.g. a post-game random set) the new group copies">
           <label>Skin</label><input class="input" id="eskin" inputmode="numeric" placeholder="none, 1, or 1,2 in turn" title="a skin number from the Skins tab (chimera only), or several the placements wear in turn">
+          <label>Stand</label><select id="eground" title="the game's walkers stand on the stage's navigation mesh; a spot more than 10 m from it is refused unless they stand exactly where you clicked">
+            <option value="">on the walkable ground near the spot</option><option value="flat">exactly at the spot's height (off the walkable ground too)</option></select>
+          <label>Lot flag</label><label class="check" title="most dungeon groups load only while a lot flag is set; what sets each flag is UNKNOWN here"><input type="checkbox" id="ealways"> load whenever the stage does (clear the copied group's lot flag)</label>
           <label>Where</label><div class="mono" id="espot">click the map, or a group</div>
         </div>
         <div class="row" style="padding: 0 12px 12px"><button class="btn small" id="eplan">Plan</button>
@@ -1557,12 +1598,26 @@ function renderStage() {
   });
   $("#eplan").onclick = () => busy($("#eplan"), () => encounterGo(true));
   $("#ewrite").onclick = () => busy($("#ewrite"), () => encounterGo(false));
+  DESTHOOK.edest = () => tryGo(() => reloadStage());
   wireDest("edest");
+  $("#wundo").onclick = () => busy($("#wundo"), undoEdit);
   $("#dplan").onclick = () => busy($("#dplan"), () => dungeonGo(true));
   $("#dwrite").onclick = () => busy($("#dwrite"), () => dungeonGo(false));
   wireDest("ddest");
   $("#wdragq").addEventListener("input", renderDragChips); renderDragChips();
-  setupWorldCanvas(); drawWorld();
+  document.querySelectorAll(".wmode .chip").forEach(c => c.onclick = () => setWorldMode(c.dataset.m));
+  setupWorldCanvas();
+  if (W.mode === "3d") mount3d();
+  drawWorld();
+}
+function setWorldMode(m) {
+  if (m === W.mode) return;
+  W.mode = m;
+  try { localStorage.setItem("riftstone.world.mode", m); } catch (e) { /* remembered for this visit only */ }
+  $("#wmap2").hidden = m === "3d"; $("#wmap3").hidden = m !== "3d";
+  document.querySelectorAll(".wmode .chip").forEach(c => c.classList.toggle("on", c.dataset.m === m));
+  $("#wtip").style.display = "none";
+  if (m === "3d") { mount3d(); load3d(); } else { $("#w3info").textContent = ""; drawWorld(); }
 }
 function renderDragChips() {
   const f = ($("#wdragq") ? $("#wdragq").value : "").trim().toLowerCase();
@@ -1590,6 +1645,7 @@ function fitView() {
   return { cx: (x0 + x1) / 2, cz: (z0 + z1) / 2, k: Math.min((W_ - 60) / Math.max(x1 - x0, 200), (H_ - 60) / Math.max(z1 - z0, 200)) };
 }
 function drawWorld() {
+  if (W.mode === "3d") { w3soon(true); return; }       // the same state drawn in 3D: markers, spot, plan, dungeon
   const c = $("#wcanvas");
   if (!c || !W.st) return;
   const dpr = window.devicePixelRatio || 1, Wd = c.clientWidth, Hd = c.clientHeight;
@@ -1617,10 +1673,21 @@ function drawWorld() {
     g.globalAlpha = on ? .9 : .16; g.fillStyle = WCOLOR[lay.type];
     const x = sx(p[0]), y = sz(p[1]);
     if (x < -10 || y < -10 || x > Wd + 10 || y > Hd + 10) continue;
+    if (p[7] === 2) {                                    // removed by the mod: a cross where the game has it
+      const a = size / 2 + 1; g.strokeStyle = "#8d99a8"; g.lineWidth = 1.5; g.globalAlpha = on ? .7 : .16;
+      g.beginPath(); g.moveTo(x - a, y - a); g.lineTo(x + a, y + a); g.moveTo(x + a, y - a); g.lineTo(x - a, y + a); g.stroke();
+      continue;
+    }
     g.fillRect(x - size / 2, y - size / 2, size, size);
+    if (p[7] === 1) { g.strokeStyle = "#ffffff"; g.lineWidth = 1; g.strokeRect(x - size / 2 - 2, y - size / 2 - 2, size + 4, size + 4); }
   }
   g.globalAlpha = 1;
   if (W.sel) { g.strokeStyle = "#7ff8ff"; g.lineWidth = 2; g.beginPath(); g.arc(sx(W.sel[0]), sz(W.sel[1]), 8, 0, 7); g.stroke(); }
+  if (W.sel && W.dragTo) {                             // being dragged: where it will stand
+    const x0 = sx(W.sel[0]), y0 = sz(W.sel[1]), x1 = sx(W.dragTo[0]), y1 = sz(W.dragTo[2]);
+    g.strokeStyle = "#7ff8ff"; g.lineWidth = 1; g.setLineDash([4, 4]); g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke(); g.setLineDash([]);
+    g.lineWidth = 2; g.beginPath(); g.arc(x1, y1, 8, 0, 7); g.stroke();
+  }
   if (W.plan) {
     g.fillStyle = "#ffffff";
     for (const s of W.plan.spawn_points) { g.beginPath(); g.arc(sx(s[0]), sz(s[2]), 4.5, 0, 7); g.fill(); }
@@ -1644,7 +1711,8 @@ function drawWorld() {
     });
     g.textAlign = "start"; g.textBaseline = "alphabetic";
   }
-  $("#wlegend").textContent = `${pts.length.toLocaleString()} placements shown, seen from above${W.backPath ? (W.backKind === "nav" ? " over the ground the game's walkers can stand on (shaded)" : " over the terrain cells that hold something (shaded)") : ""} · grid ${step.toLocaleString()} units · scroll to zoom, drag to pan · click a dot to see it, open ground to pick a spot`;
+  if (W.moving) { $("#wlegend").textContent = "Click the ground where it should stand (it stands on the walkable ground there) · Esc cancels"; return; }
+  $("#wlegend").textContent = `${pts.length.toLocaleString()} placements shown, seen from above${W.backPath ? (W.backKind === "nav" ? " over the ground the game's walkers can stand on (shaded)" : " over the terrain cells that hold something (shaded)") : ""} · grid ${step.toLocaleString()} units · scroll to zoom, drag to pan · click a dot to see it and change it, drag the selected one to move it, open ground to pick a spot`;
 }
 function nearestPoint(mx, my, radius = 7) {
   const v = W.view, c = $("#wcanvas"), Wd = c.clientWidth, Hd = c.clientHeight;
@@ -1657,7 +1725,8 @@ function nearestPoint(mx, my, radius = 7) {
 }
 function describePoint(p) {
   const r = W.st, lay = r.layouts[p[3]], nm = r.names[p[5]];
-  return { lay, nm, text: `${nm.id}${nm.name ? " " + nm.name : ""} · ${lay.type === "s" ? "static" : WTYPE[lay.type] + " group " + lay.number} · record ${p[4]}` };
+  const mark = p[7] === 2 ? " · removed in " + r.mod : p[7] === 1 ? " · changed in " + r.mod : "";
+  return { lay, nm, text: `${nm.id}${nm.name ? " " + nm.name : ""} · ${lay.type === "s" ? "static" : WTYPE[lay.type] + " group " + lay.number} · ${p[7] === 2 ? "" : "record " + p[4] + " · "}id ${p[6]}${mark}` };
 }
 function setupWorldCanvas() {
   const c = $("#wcanvas"), tip = $("#wtip");
@@ -1669,12 +1738,18 @@ function setupWorldCanvas() {
     W.view.k *= f; W.view.cx = wx - (mx - c.clientWidth / 2) / W.view.k; W.view.cz = wz - (my - c.clientHeight / 2) / W.view.k;
     drawWorld();
   }, { passive: false });
-  c.addEventListener("pointerdown", e => { W.drag = { x: e.clientX, y: e.clientY, cx: W.view.cx, cz: W.view.cz, moved: false }; c.setPointerCapture(e.pointerId); });
+  c.addEventListener("pointerdown", e => {
+    const b = c.getBoundingClientRect(), mx = e.clientX - b.left, my = e.clientY - b.top;
+    const mark = W.sel && W.sel[7] !== 2 && nearestPoint(mx, my, 9) === W.sel;    // the selected placement: drag it to move it
+    W.drag = { x: e.clientX, y: e.clientY, cx: W.view.cx, cz: W.view.cz, moved: false, mark };
+    c.setPointerCapture(e.pointerId);
+  });
   c.addEventListener("pointermove", e => {
     const b = c.getBoundingClientRect(), mx = e.clientX - b.left, my = e.clientY - b.top;
     if (W.drag) {
       const dx = e.clientX - W.drag.x, dy = e.clientY - W.drag.y;
       if (Math.abs(dx) + Math.abs(dy) > 3) W.drag.moved = true;
+      if (W.drag.moved && W.drag.mark) { const [wx, wz] = toWorld(mx, my); W.dragTo = [wx, W.sel[2], wz]; drawWorld(); tip.style.display = "none"; return; }
       if (W.drag.moved) { W.view.cx = W.drag.cx - dx / W.view.k; W.view.cz = W.drag.cz - dy / W.view.k; drawWorld(); tip.style.display = "none"; return; }
     }
     const p = nearestPoint(mx, my);
@@ -1683,8 +1758,14 @@ function setupWorldCanvas() {
   });
   c.addEventListener("pointerup", e => {
     const drag = W.drag; W.drag = null;
+    if (drag && drag.moved && drag.mark && W.dragTo) {          // dropped: it stands on the walkable ground there
+      const to = W.dragTo; W.dragTo = null;
+      tryGo(() => moveSel(to, true));
+      return;
+    }
     if (drag && drag.moved) return;
     const b = c.getBoundingClientRect(), mx = e.clientX - b.left, my = e.clientY - b.top;
+    if (W.moving && W.sel) { const [wx, wz] = toWorld(mx, my); tryGo(() => moveSel([wx, W.sel[2], wz], true)); return; }
     const p = nearestPoint(mx, my);
     if (p) { selectPoint(p); return; }
     const [wx, wz] = toWorld(mx, my), near = nearestPoint(mx, my, 1e9);
@@ -1709,40 +1790,181 @@ function setupWorldCanvas() {
   });
 }
 function selectPoint(p) {
-  W.sel = p;
-  const d = describePoint(p);
-  $("#wsel").innerHTML = `<div><b>${esc(d.nm.id)}</b> ${esc(d.nm.name)} <span class="sub">at [${Math.round(p[0])}, ${Math.round(p[2])}, ${Math.round(p[1])}]</span></div>
-    <div class="sub mono" style="word-break: break-all">${esc(d.lay.path)} · record ${p[4]}</div>
-    <div class="row" style="margin-top: 8px"><button class="btn small" id="wopen">Open layout</button>
-      ${d.lay.type !== "s" ? `<button class="btn small" id="wgroup">Show group ${d.lay.number}</button>` : ""}
-      <button class="btn small" id="wspot">Encounter here</button></div>`;
-  $("#wopen").onclick = () => { $('.tab[data-view="explore"]').click(); openResource({ path: d.lay.path }); };
-  if ($("#wgroup")) $("#wgroup").onclick = () => { W.hl = { type: d.lay.type, number: d.lay.number }; drawWorld(); };
+  W.sel = p; W.selInfo = null; W.dragTo = null;
+  if (W.moving) moveMode(false);
+  const d = describePoint(p), lay = d.lay, gone = p[7] === 2, mod = W.st.mod;
+  $("#wsel").innerHTML = `<div><b>${esc(d.nm.id)}</b> ${esc(d.nm.name)}${p[7] === 1 ? `<span class="wmark">changed in ${esc(mod)}</span>` : gone ? `<span class="wmark">removed in ${esc(mod)}</span>` : ""}
+      <span class="sub">at [${Math.round(p[0])}, ${Math.round(p[2])}, ${Math.round(p[1])}]</span></div>
+    <div class="sub mono" style="word-break: break-all">${esc(lay.path)} · ${gone ? "" : `record ${p[4]} · `}id ${p[6]}</div>
+    ${gone ? `<div class="row" style="margin-top: 8px"><button class="btn small primary" id="wsrestore">Put it back</button>
+        <span class="sub grow">as the game has it</span></div>`
+      : `<div id="wsedit"><div class="sub" style="margin-top: 6px">Reading it…</div></div>`}
+    <div id="wsnotes"></div>
+    <div class="row" style="margin-top: 8px"><button class="btn small ghost" id="wopen">Open layout</button>
+      ${lay.type !== "s" ? `<button class="btn small ghost" id="wgroup">Show group ${lay.number}</button>` : ""}
+      <button class="btn small ghost" id="wspot">Encounter here</button></div>`;
+  $("#wopen").onclick = () => { $('.tab[data-view="explore"]').click(); openResource({ path: lay.path }); };
+  if ($("#wgroup")) $("#wgroup").onclick = () => { W.hl = { type: lay.type, number: lay.number }; drawWorld(); };
   $("#wspot").onclick = () => { W.spot = { xyz: [Math.round(p[0]), Math.round(p[2]), Math.round(p[1])] }; W.plan = null;
     $("#espot").textContent = `[${W.spot.xyz.join(", ")}]  (at ${d.nm.id})`; drawWorld(); };
+  if (gone) $("#wsrestore").onclick = () => busy($("#wsrestore"), () => editGo({ op: "restore" }));
+  else loadPlacement(p);
   drawWorld();
 }
+const pointKey = p => ({ layout: W.st.layouts[p[3]].name, id: p[6] });
+function findPoint(k) {
+  const i = W.st.layouts.findIndex(l => l.name === k.layout);
+  return i < 0 ? null : W.st.points.find(p => p[3] === i && p[6] === k.id) || null;
+}
+const tryGo = fn => Promise.resolve().then(fn).catch(e => toast(e.message, "bad", 9000));
+const EDITWORD = { move: "Moved", enemy: "Swapped", set: "Changed", remove: "Deleted", revert: "Put back as the game has it",
+                   restore: "Put back" };
+function editInfo() {
+  return W.st && W.st.mod ? `the map shows ${W.st.mod}'s own copy of each layout it changes · click a placement to change it, drag it to move it, Delete removes it`
+    : "the map shows the game as it is · click a placement to change it; your first change makes the new mod";
+}
+function worldMod() {
+  const s = $("#edest");
+  if (s) return s.value;
+  const kind = gameKind(), mods = S.mods.filter(m => !m.error && (!kind || (m.game || "ddda") === kind));
+  const cur = S.dest.edest != null ? S.dest.edest : mods.length ? mods[0].name : "";
+  return mods.some(m => m.name === cur) ? cur : "";
+}
+// the stage again as the chosen mod has it (after a change, an undo, or another mod picked), the selection kept
+async function reloadStage(keep) {
+  if (!W.st) return;
+  const stage = W.st.stage, key = keep || (W.sel ? pointKey(W.sel) : null);
+  const r = await api("world/stage?" + qs({ n: stage, mod: worldMod() }));
+  if (!W.st || W.st.stage !== stage) return;
+  W.st = r;
+  const counts = typeCounts();
+  document.querySelectorAll(".wtoggles .chip").forEach(c => { c.lastChild.textContent = `${WTYPE[c.dataset.t]} ${counts[c.dataset.t] || 0}`; });
+  $("#weditinfo").textContent = editInfo();
+  const p = key ? findPoint(key) : null;
+  if (p) selectPoint(p);
+  else { W.sel = null; $("#wsel").innerHTML = '<span class="muted">Nothing selected.</span>'; drawWorld(); }
+}
+async function loadPlacement(p) {
+  const k = pointKey(p), mod = W.st.mod;
+  let d;
+  try { d = await api("world/placement?" + qs({ layout: k.layout, number: p[4], id: p[6], ...(mod ? { mod } : {}) })); }
+  catch (e) { if (W.sel === p && $("#wsedit")) $("#wsedit").innerHTML = `<div class="warn">▲ ${esc(e.message)}</div>`; return; }
+  if (W.sel !== p || !$("#wsedit")) return;
+  W.selInfo = d;
+  const num = (id, v, attrs) => `<input class="input" id="${id}" type="number" ${attrs} value="${v == null ? "" : v}" ${v == null ? 'disabled placeholder="—"' : ""}>`;
+  $("#wsedit").innerHTML = `<div class="wform">
+      <label>Enemy</label>${d.family ? `<div class="row" style="flex-wrap: nowrap"><input class="input grow" id="wsenemy" list="wenemylist" value="${esc(d.name)}" autocomplete="off"
+          title="another enemy: it takes the game's own setup for that enemy, standing here"><button class="btn small" id="wsswap">Swap</button></div>`
+        : `<span class="sub">${esc(d.class)}: not an enemy</span>`}
+      <label>Facing</label>${num("wsface", d.facing, 'step="15" min="-180" max="180" title="degrees: 0 faces +Z (down the map), 90 faces +X (right)"')}
+      <label>Size</label>${num("wssize", d.size, 'step="0.1" min="0.1" max="10" title="its scale (1 is the usual size); wolves pick their own size and people are never scaled"')}
+      <label>Health</label>${num("wshp", d.health, 'step="0.25" min="0.1" max="100" title="times its usual HP (1 is the game\'s own)"')}
+    </div>
+    <div class="row"><button class="btn small primary" id="wsapply" title="Enter">Apply</button>
+      <button class="btn small" id="wsmove" title="then click the ground (M); or drag its marker on the map">Move</button>
+      <button class="btn small danger" id="wsdel" title="Delete key; Ctrl+Z brings it back">Delete</button>
+      ${d.held && d.in_game ? `<button class="btn small ghost" id="wsrevert" title="every field back to the game's own">As the game has it</button>` : ""}</div>
+    ${d.script ? `<div class="warn">▲ it runs an AI script of its own (a quest's or a cut-scene's)</div>` : ""}
+    ${d.notes.map(n => `<div class="warn">▲ ${esc(n)}</div>`).join("")}`;
+  if ($("#wsswap")) $("#wsswap").onclick = () => busy($("#wsswap"), () => {
+    const em = $("#wsenemy").value.trim();
+    if (!em || em === d.name) throw new Error("type another enemy: goblin, em0101, Cyclops…");
+    return editGo({ op: "enemy", enemy: em });
+  });
+  $("#wsapply").onclick = () => busy($("#wsapply"), applySel);
+  $("#wsmove").onclick = () => moveMode(true);
+  $("#wsdel").onclick = () => busy($("#wsdel"), () => editGo({ op: "remove" }));
+  if ($("#wsrevert")) $("#wsrevert").onclick = () => busy($("#wsrevert"), () => editGo({ op: "revert" }));
+  $("#wsedit").querySelectorAll(".input").forEach(el => el.addEventListener("keydown", e => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    if (el.id === "wsenemy") $("#wsswap").click(); else $("#wsapply").click();
+  }));
+}
+async function applySel() {
+  const d = W.selInfo;
+  if (!d) throw new Error("it is still being read");
+  const val = id => { const el = $(id); return el && !el.disabled && el.value.trim() !== "" ? +el.value : null; };
+  const size = val("#wssize"), hp = val("#wshp"), face = val("#wsface"), set = {};
+  if (size != null && Math.abs(size - d.size) > 1e-4) set.size = size;
+  if (hp != null && Math.abs(hp - d.health) > 1e-4) set.health = hp;
+  const turn = face != null && d.facing != null && Math.abs(face - d.facing) > 1e-3;
+  if (!Object.keys(set).length && !turn) { toast("Nothing to apply: change the facing, size or health first", "warn"); return; }
+  if (Object.keys(set).length) await editGo({ op: "set", ...set });
+  if (turn) await editGo({ op: "move", at: [W.sel[0], W.sel[2], W.sel[1]], facing: face, ground: false });
+}
+function moveMode(on) {
+  W.moving = !!on && !!W.sel;
+  for (const id of ["#wmap2", "#wmap3"]) { const m = $(id); if (m) m.classList.toggle("moving", W.moving); }
+  if (W.moving) toast("Click the ground where it should stand (Esc cancels)");
+  drawWorld();
+}
+// x, y, z: where it goes; ground: true stands it on the walkable ground nearest that height (the 2D map's height is
+// a guess, and the 3D map's click can meet a wall's top or a roof), false keeps the height exactly
+function moveSel(at, ground) {
+  W.moving = false;
+  for (const id of ["#wmap2", "#wmap3"]) { const m = $(id); if (m) m.classList.remove("moving"); }
+  return editGo({ op: "move", at: at.map(v => Math.round(v * 10) / 10), ground });
+}
+async function editGo(extra) {
+  const p = W.sel;
+  if (!p) throw new Error("click a placement on the map first");
+  const k = pointKey(p);
+  const r = await api("world/placement", { ...destBody("edest"), layout: k.layout, number: p[4], id: p[6], ...extra });
+  W.undo = r.undo;
+  if (r.new_mod) {
+    S.dest.edest = r.mod; await refresh();
+    $("#edestbox").innerHTML = destPicker("edest", r.mod, gameKind()); wireDest("edest");
+  }
+  await reloadStage({ layout: r.layout, id: r.id });
+  $("#wundo").disabled = !W.undo;
+  if ($("#wsnotes")) $("#wsnotes").innerHTML = r.notes.map(n => `<div class="warn">▲ ${esc(n)}</div>`).join("");
+  toast(`${EDITWORD[r.op]}: saved in ${r.mod}${r.new_mod ? " (a new mod)" : ""} · Ctrl+Z undoes it`);
+  return r;
+}
+async function undoEdit() {
+  const r = await api("world/undo", {});
+  W.undo = r.undo; $("#wundo").disabled = !W.undo;
+  await reloadStage(r.mod === worldMod() ? { layout: r.layout, id: r.id } : null);
+  toast(`Undone (${EDITWORD[r.op].toLowerCase()}) in ${r.mod}`);
+}
+document.addEventListener("keydown", e => {
+  const view = document.getElementById("view-world");
+  if (!W.st || !view || !view.classList.contains("active")) return;
+  if (e.key === "Escape" && W.moving) { moveMode(false); return; }
+  const t = e.target, typing = t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+  if (typing || e.altKey) return;
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
+    e.preventDefault(); if (W.undo) tryGo(undoEdit); return;
+  }
+  if (e.ctrlKey || e.metaKey || !W.sel || W.sel[7] === 2) return;
+  if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); tryGo(() => editGo({ op: "remove" })); }
+  else if (e.key === "m" || e.key === "M") moveMode(!W.moving);
+});
 async function encounterGo(dry) {
   if (!W.spot) throw new Error("pick a spot: click the map, a group, or a placement's Encounter here");
   const opt = id => $(id).value.trim() === "" ? null : +$(id).value;
   const body = { ...destBody("edest"), stage: W.st.stage, enemy: $("#eenemy").value.trim(), count: +$("#ecount").value,
                  at_once: +$("#eonce").value, spread: +$("#espread").value, story: $("#estory").value || null,
                  like: opt("#elike"), skin: $("#eskin").value.trim() || null, hours: $("#ehours").value.trim() || null,
+                 ground: $("#eground").value === "flat" ? false : null, always: $("#ealways").checked,
                  at: W.spot.group != null ? "group:" + W.spot.group : W.spot.xyz, dry_run: dry };
   if (!body.enemy) throw new Error("say which enemy");
   const r = await api("encounter", body);
   W.plan = r;
   const box = $("#eplanout"); box.hidden = false;
   box.innerHTML = `<div><b>${r.total} × ${esc(r.enemy)} ${esc(r.enemy_name)}</b> as new group <b>#${r.group}</b>, ${r.points} spawn point${r.points === 1 ? "" : "s"}${r.horde ? " (a horde: refilled up to the total)" : ""}${r.skin != null ? `, wearing skin ${r.skin}` : ""}</div>
-    <div class="sub">a copy of group ${r.template_group} (${r.template_distance} units away) · ${esc(r.layout)} · ${r.archives.length} archive(s)</div>
+    <div class="sub">a copy of group ${r.template_group} (${r.template_distance} units away) · ${esc(r.layout)} · ${r.archives.length} archive(s)${r.always ? " · lot flag cleared" : ""}</div>
+    ${r.ground ? "" : `<div class="sub">the spawn points stand in rings at the spot's height</div>`}
     ${r.notes.map(n => `<div class="warn">▲ ${esc(n)}</div>`).join("")}
     <div class="sub" style="margin-top: 4px">${esc(r.note)}</div>
     ${r.written.length ? `<div style="margin-top: 6px">Written into <b>${esc(r.mod)}</b>${r.new_mod ? " (a new mod)" : ""}:</div>${r.written.map(f => `<div class="mono sub">${esc(f)}</div>`).join("")}`
-      : `<div class="sub" style="margin-top: 6px">Plan only: nothing written${r.new_mod ? `, and the mod ${esc(r.mod)} is made only when you write` : ""}. The gold dots are the spawn points.</div>`}`;
+      : `<div class="sub" style="margin-top: 6px">Plan only: nothing written${r.new_mod ? `, and the mod ${esc(r.mod)} is made only when you write` : ""}. The white dots are the spawn points.</div>`}`;
   drawWorld();
   if (!dry) {
     toast(`Encounter written into ${r.mod}. Install it from the Mods tab.`); await refresh();
     if (r.new_mod) { S.dest.edest = r.mod; $("#edestbox").innerHTML = destPicker("edest", r.mod, gameKind()); wireDest("edest"); }
+    await reloadStage();
   }
 }
 async function dungeonGo(dry) {
@@ -1771,6 +1993,515 @@ async function dungeonGo(dry) {
   }
 }
 window.addEventListener("resize", () => { if (W.st && document.getElementById("view-world").classList.contains("active")) drawWorld(); });
+
+/* ---------- the world in 3D: the stage's own collision and walkable ground, its placements, a spot on real ground ----------
+   The scene is the game's data (world/scene: scene.py): collision e and h from the stage's .sbc, the navigation mesh, in
+   centimetres with Y up; the open field a few terrain cells at a time.  X runs right and Z down the screen when seen from
+   above, as on the map.  Back faces are not drawn (a triangle's corners turn counter-clockwise about its stored normal in
+   every collision mesh), so ceilings vanish from above and rooms open like a doll's house; picking skips them the same
+   way.  Nothing here writes: a click on the ground only fills the encounter form's spot. */
+const W3 = { canvas: null, over: null, gl: null, P: null, sets: null, lines: null, scene: null, key: "", loading: "",
+             layers: {}, show: { e: true, h: false, nav: true }, cam: null, drag: null, marks: [], M: null, frame: 0,
+             rebuild: true, fail: "", radius: 1 };
+const W3FOV = 50 * Math.PI / 180;
+const W3NAME = { e: "Collision e", h: "Collision h", nav: "Walkable mesh" };
+const W3TIP = { e: "the stage's denser collision mesh (Riftstone reads the open field's ground from it)",
+                h: "the stage's coarser collision mesh", nav: "the navigation mesh: where the game's walking enemies can go" };
+const W3CELL = 10000, W3ORIGIN = -500000;               // the open field's terrain cells (terrain.CELL, terrain.ORIGIN)
+try { if (localStorage.getItem("riftstone.world.mode") === "3d") W.mode = "3d"; } catch (e) { /* the map */ }
+const v3 = { sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+             cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+             norm: a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; } };
+const W3SRC = {
+  meshV: `#version 300 es
+in vec3 p; uniform mat4 mvp; out vec3 vp;
+void main() { vp = p; gl_Position = mvp * vec4(p, 1.0); }`,
+  meshF: `#version 300 es
+precision highp float;
+in vec3 vp; uniform vec3 eye, tint, bg; uniform vec2 fog; out vec4 o;
+void main() {
+  vec3 n = normalize(cross(dFdx(vp), dFdy(vp)));            // the face's own normal, toward the eye
+  float flat_ = smoothstep(0.55, 0.85, n.y);                // floors light, walls dark
+  float lam = max(dot(n, normalize(vec3(0.35, 0.85, 0.4))), 0.0), head = max(dot(n, normalize(eye - vp)), 0.0);
+  vec3 c = mix(vec3(0.19, 0.21, 0.27), vec3(0.42, 0.46, 0.54), flat_) * tint * (0.32 + 0.45 * lam + 0.33 * head);
+  float h = vp.y / 100.0, w = fwidth(h);                    // a faint line every metre of height on the floors
+  c *= 1.0 - 0.2 * flat_ * step(w, 0.4) * (1.0 - smoothstep(0.0, 1.5 * w, abs(fract(h + 0.5) - 0.5)));
+  o = vec4(mix(c, bg, 0.85 * smoothstep(fog.x, fog.y, length(eye - vp))), 1.0);
+}`,
+  flatV: `#version 300 es
+in vec3 p; uniform mat4 mvp; uniform float lift;
+void main() { gl_Position = mvp * vec4(p.x, p.y + lift, p.z, 1.0); }`,
+  flatF: `#version 300 es
+precision mediump float; uniform vec4 col; out vec4 o;
+void main() { o = col; }`,
+  dotV: `#version 300 es
+in vec3 p; in vec4 c; uniform mat4 mvp; uniform float size; out vec4 vc;
+void main() { vc = c; gl_Position = mvp * vec4(p, 1.0); gl_PointSize = size; }`,
+  dotF: `#version 300 es
+precision mediump float; in vec4 vc; uniform float ghost; out vec4 o;
+void main() {
+  vec2 q = abs(gl_PointCoord - 0.5) * 2.0;
+  o = vec4(max(q.x, q.y) > 0.66 ? vec3(0.03, 0.03, 0.05) : vc.rgb, vc.a * ghost);
+}` };
+function w3program(gl, vs, fs) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || "a shader did not compile");
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, mk(gl.VERTEX_SHADER, vs)); gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.bindAttribLocation(p, 0, "p"); gl.bindAttribLocation(p, 1, "c"); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || "a program did not link");
+  const u = {};
+  for (let i = 0, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); i < n; i++) { const a = gl.getActiveUniform(p, i); u[a.name] = gl.getUniformLocation(p, a.name); }
+  return { p, u };
+}
+function w3init() {
+  if (W3.gl) return true;
+  if (W3.fail) return false;
+  const gl = W3.canvas.getContext("webgl2", { antialias: true, alpha: false });
+  if (!gl) { W3.fail = "This browser gives Studio no WebGL 2, so the 3D map cannot draw here. The map from above still works."; return false; }
+  try {
+    W3.P = { mesh: w3program(gl, W3SRC.meshV, W3SRC.meshF), flat: w3program(gl, W3SRC.flatV, W3SRC.flatF),
+             dots: w3program(gl, W3SRC.dotV, W3SRC.dotF) };
+  } catch (e) { W3.fail = "The 3D map cannot draw here: " + e.message; return false; }
+  W3.gl = gl;
+  const dots = size => {
+    const s = { vao: gl.createVertexArray(), pos: gl.createBuffer(), col: gl.createBuffer(), n: 0, size };
+    gl.bindVertexArray(s.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, s.pos); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, s.col); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+    return s;
+  };
+  W3.sets = { marks: dots(7), dung: dots(6), doors: dots(11), plan: dots(9) };
+  W3.lines = { vao: gl.createVertexArray(), buf: gl.createBuffer(), n: 0 };
+  gl.bindVertexArray(W3.lines.vao); gl.bindBuffer(gl.ARRAY_BUFFER, W3.lines.buf);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0); gl.bindVertexArray(null);
+  for (const L of Object.values(W3.layers)) L.vao = null;
+  w3gpu(); W3.rebuild = true;
+  return true;
+}
+function mount3d() {
+  const host = $("#w3host");
+  if (!host) return;
+  if (!W3.canvas) {                                    // one canvas and one context for the whole visit, moved between stages
+    W3.canvas = document.createElement("canvas"); W3.canvas.setAttribute("aria-label", "the stage in 3D");
+    W3.over = document.createElement("canvas"); W3.over.className = "over";
+    w3wire();
+  }
+  host.append(W3.canvas, W3.over);
+  if (!w3init()) { w3msg(W3.fail); return; }
+  w3bar(); w3soon(true);
+}
+function w3msg(text) { const m = $("#w3msg"); if (m) m.textContent = text || ""; }
+function w3buf(b64) { const s = atob(b64), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u.buffer; }
+function w3decode(sc) {
+  W3.layers = {};
+  for (const ly of sc.layers) {
+    const L = { key: ly.key, v: new Float32Array(w3buf(ly.verts)), t: new Uint32Array(w3buf(ly.tris)), vao: null };
+    if (ly.key === "nav") {                            // the walkable mesh's edges, each once
+      const seen = new Set(), E = [], t = L.t;
+      for (let i = 0; i < t.length; i += 3) for (let k = 0; k < 3; k++) {
+        let a = t[i + k], b = t[i + (k + 1) % 3]; if (a > b) { const x = a; a = b; b = x; }
+        const key = a * 2097152 + b; if (!seen.has(key)) { seen.add(key); E.push(a, b); }
+      }
+      L.edges = new Uint32Array(E);
+    }
+    W3.layers[ly.key] = L;
+  }
+}
+function w3free() {
+  const gl = W3.gl;
+  if (gl) for (const L of Object.values(W3.layers)) if (L.vao) {
+    gl.deleteVertexArray(L.vao); gl.deleteBuffer(L.vb); gl.deleteBuffer(L.ib);
+    if (L.evao) { gl.deleteVertexArray(L.evao); gl.deleteBuffer(L.eb); }
+  }
+  W3.layers = {};
+}
+function w3gpu() {
+  const gl = W3.gl;
+  if (!gl) return;
+  for (const L of Object.values(W3.layers)) {
+    if (L.vao) continue;
+    L.vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, L.vb); gl.bufferData(gl.ARRAY_BUFFER, L.v, gl.STATIC_DRAW);
+    const vao = ib => {
+      const a = gl.createVertexArray(); gl.bindVertexArray(a);
+      gl.bindBuffer(gl.ARRAY_BUFFER, L.vb); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bindVertexArray(null); return a;
+    };
+    L.ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, L.ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, L.t, gl.STATIC_DRAW);
+    L.vao = vao(L.ib);
+    if (L.edges) { L.eb = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, L.eb); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, L.edges, gl.STATIC_DRAW); L.evao = vao(L.eb); }
+  }
+}
+// the open field is shown a few cells at a time: around the spot, the selected placement or group, else the map's centre
+function w3fieldCentre() {
+  const r = W.st;
+  if (W.spot && W.spot.xyz) return [W.spot.xyz[0], W.spot.xyz[2]];
+  if (W.sel) return [W.sel[0], W.sel[1]];
+  if (W.hl) {
+    const pts = r.points.filter(p => { const l = r.layouts[p[3]]; return l.type === W.hl.type && l.number === W.hl.number; });
+    if (pts.length) return [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
+  }
+  if (W.view) return [W.view.cx, W.view.cz];
+  const xs = r.points.map(p => p[0]).sort((a, b) => a - b), zs = r.points.map(p => p[1]).sort((a, b) => a - b);
+  return [xs[xs.length >> 1] || 0, zs[zs.length >> 1] || 0];
+}
+async function load3d(here) {
+  const st = W.st;
+  if (!st || W.mode !== "3d" || !W3.gl) return;
+  let q = "world/scene?n=" + st.stage, key = String(st.stage);
+  if (st.stage === 100) {
+    const c = here && W3.cam && W3.scene && W3.scene.stage === 100 ? [W3.cam.t[0], W3.cam.t[2]] : w3fieldCentre();
+    key += `@${Math.floor((c[1] - W3ORIGIN) / W3CELL)},${Math.floor((c[0] - W3ORIGIN) / W3CELL)}@${W3.radius}`;
+    q += `&at=${Math.round(c[0])},${Math.round(c[1])}&radius=${W3.radius}`;
+  }
+  if (W3.key === key && W3.scene) { w3bar(); w3info(); w3soon(true); return; }
+  if (W3.loading === key) return;
+  W3.loading = key;
+  w3msg(`Reading ${stName(st.stage)}'s collision from your game…`);
+  try {
+    const sc = await api(q);
+    if (W3.loading !== key || !W.st || W.st.stage !== st.stage) return;
+    w3use(sc, key);
+  } catch (e) { if (W3.loading === key) w3msg(e.message); }
+  finally { if (W3.loading === key) W3.loading = ""; }
+}
+function w3use(sc, key) {
+  const keep = W3.cam && W3.scene && W3.scene.kind === "field" && sc.kind === "field";
+  w3free(); w3decode(sc); W3.scene = sc; W3.key = key; w3gpu();
+  if (!W3.layers.e && W3.layers.h) W3.show.h = true;
+  if (keep) W3.cam.t = [sc.center[0], w3groundY(sc.center[0], sc.center[1], W3CELL / 2), sc.center[1]];
+  else w3frame();
+  w3msg(sc.layers.length ? "" : `${stName(sc.stage)} has no collision or walkable mesh to draw. ${sc.notes.join(" · ")}`);
+  w3bar(); w3info(); w3soon(true);
+}
+// the median height of the ground's corners near (x, z): where the camera looks at first
+function w3groundY(x, z, half) {
+  const ys = [];
+  for (const k of ["e", "h", "nav"]) {
+    const L = W3.layers[k]; if (!L) continue;
+    for (let i = 0; i < L.v.length && ys.length < 20000; i += 3)
+      if (Math.abs(L.v[i] - x) <= half && Math.abs(L.v[i + 2] - z) <= half) ys.push(L.v[i + 1]);
+    if (ys.length) break;
+  }
+  if (!ys.length) { const b = W3.scene.bounds; return (b[1] + b[4]) / 2; }
+  ys.sort((a, b) => a - b); return ys[ys.length >> 1];
+}
+// the first view: the stage's placements (their middle 96 %) from above at a slant, the map's way up
+function w3frame() {
+  const sc = W3.scene, r = W.st;
+  let cx, cz, span, cy;
+  if (sc.kind === "field") { cx = sc.center[0]; cz = sc.center[1]; span = W3CELL * (2 * sc.radius + 1); }
+  else {
+    const pts = r.points;
+    if (pts.length) {
+      const q = (a, f) => a[Math.min(a.length - 1, Math.max(0, Math.floor(f * (a.length - 1))))];
+      const xs = pts.map(p => p[0]).sort((a, b) => a - b), zs = pts.map(p => p[1]).sort((a, b) => a - b);
+      cx = (q(xs, .02) + q(xs, .98)) / 2; cz = (q(zs, .02) + q(zs, .98)) / 2;
+      span = Math.max(q(xs, .98) - q(xs, .02), q(zs, .98) - q(zs, .02), 2000);
+      cy = pts.map(p => p[2]).sort((a, b) => a - b)[pts.length >> 1];
+    } else {
+      const b = sc.bounds; cx = (b[0] + b[3]) / 2; cz = (b[2] + b[5]) / 2; span = Math.max(b[3] - b[0], b[5] - b[2], 2000);
+    }
+  }
+  if (cy === undefined) cy = w3groundY(cx, cz, span / 4);
+  W3.cam = { t: [cx, cy, cz], yaw: 0, pitch: 0.95, dist: span * 0.95 };
+}
+function w3eye() {
+  const c = W3.cam, cp = Math.cos(c.pitch);
+  return [c.t[0] + c.dist * cp * Math.sin(c.yaw), c.t[1] + c.dist * Math.sin(c.pitch), c.t[2] + c.dist * cp * Math.cos(c.yaw)];
+}
+function w3basis() {
+  const e = w3eye(), f = v3.norm(v3.sub(W3.cam.t, e)), r = v3.norm(v3.cross(f, [0, 1, 0]));
+  return { e, f, r, u: v3.cross(r, f) };
+}
+function w3matrix(Wd, Hd) {                           // projection x view, column-major
+  const { e, f, r, u } = w3basis(), d = W3.cam.dist, near = Math.max(5, d * 0.002), far = d * 40 + 60000;
+  const th = 1 / Math.tan(W3FOV / 2), a = Wd / Hd;
+  const V = [r[0], u[0], -f[0], 0, r[1], u[1], -f[1], 0, r[2], u[2], -f[2], 0, -v3.dot(r, e), -v3.dot(u, e), v3.dot(f, e), 1];
+  const P = [th / a, 0, 0, 0, 0, th, 0, 0, 0, 0, (far + near) / (near - far), -1, 0, 0, 2 * far * near / (near - far), 0];
+  const M = new Float32Array(16);
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = 0; for (let k = 0; k < 4; k++) s += P[k * 4 + j] * V[i * 4 + k]; M[i * 4 + j] = s; }
+  return M;
+}
+function w3project(x, y, z) {
+  const M = W3.M, c = W3.canvas;
+  if (!M) return null;
+  const w = M[3] * x + M[7] * y + M[11] * z + M[15];
+  if (w <= 0) return null;
+  return [((M[0] * x + M[4] * y + M[8] * z + M[12]) / w * 0.5 + 0.5) * c.clientWidth,
+          (0.5 - (M[1] * x + M[5] * y + M[9] * z + M[13]) / w * 0.5) * c.clientHeight];
+}
+// the first triangle a ray from the eye through a pixel meets: front faces of the shown collision; the walkable mesh
+// (either side) only when no collision is shown
+function w3ray(mx, my) {
+  if (!W3.cam) return null;
+  const c = W3.canvas, { e, f, r, u } = w3basis(), th = Math.tan(W3FOV / 2), a = c.clientWidth / c.clientHeight;
+  const nx = (mx / c.clientWidth) * 2 - 1, ny = 1 - (my / c.clientHeight) * 2;
+  const d = v3.norm([0, 1, 2].map(i => f[i] + r[i] * nx * th * a + u[i] * ny * th));
+  const solid = ["e", "h"].some(k => W3.layers[k] && W3.show[k]);
+  let best = Infinity;
+  for (const k of ["e", "h", "nav"]) {
+    const L = W3.layers[k];
+    if (!L || !W3.show[k] || (k === "nav" && solid)) continue;
+    const v = L.v, t = L.t, both = k === "nav";
+    for (let i = 0; i < t.length; i += 3) {
+      const A = t[i] * 3, B = t[i + 1] * 3, C = t[i + 2] * 3, ax = v[A], ay = v[A + 1], az = v[A + 2];
+      const e1x = v[B] - ax, e1y = v[B + 1] - ay, e1z = v[B + 2] - az, e2x = v[C] - ax, e2y = v[C + 1] - ay, e2z = v[C + 2] - az;
+      const px = d[1] * e2z - d[2] * e2y, py = d[2] * e2x - d[0] * e2z, pz = d[0] * e2y - d[1] * e2x;
+      const det = e1x * px + e1y * py + e1z * pz;          // > 0: the triangle faces the eye
+      if (both ? Math.abs(det) < 1e-9 : det < 1e-9) continue;
+      const inv = 1 / det, sx = e[0] - ax, sy = e[1] - ay, sz = e[2] - az, bu = (sx * px + sy * py + sz * pz) * inv;
+      if (bu < 0 || bu > 1) continue;
+      const qx = sy * e1z - sz * e1y, qy = sz * e1x - sx * e1z, qz = sx * e1y - sy * e1x, bv = (d[0] * qx + d[1] * qy + d[2] * qz) * inv;
+      if (bv < 0 || bu + bv > 1) continue;
+      const dist = (e2x * qx + e2y * qy + e2z * qz) * inv;
+      if (dist > 1 && dist < best) best = dist;
+    }
+  }
+  return best < Infinity ? [e[0] + d[0] * best, e[1] + d[1] * best, e[2] + d[2] * best] : null;
+}
+function w3nearest(mx, my, radius = 8) {
+  let best = null, bd = radius * radius;
+  for (const p of W3.marks) {
+    const s = w3project(p[0], p[2] + 60, p[1]);
+    if (!s) continue;
+    const d = (s[0] - mx) ** 2 + (s[1] - my) ** 2;
+    if (d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+function w3spot(p) {
+  W.spot = { xyz: p.map(Math.round) }; W.plan = null;
+  $("#espot").textContent = `[${W.spot.xyz.join(", ")}]  (the ground you clicked in 3D)`;
+  drawWorld();
+}
+function w3wire() {
+  const c = W3.canvas, at = e => { const b = c.getBoundingClientRect(); return [e.clientX - b.left, e.clientY - b.top]; };
+  c.addEventListener("contextmenu", e => e.preventDefault());
+  c.addEventListener("pointerdown", e => {
+    if (!W3.cam) return;
+    const pan = e.button !== 0 || e.shiftKey, [mx, my] = at(e);
+    W3.drag = { x: e.clientX, y: e.clientY, pan, button: e.button, yaw: W3.cam.yaw, pitch: W3.cam.pitch, t: W3.cam.t.slice(),
+                moved: false, mark: !pan && W.sel && W.sel[7] !== 2 && w3nearest(mx, my, 10) === W.sel };
+    c.setPointerCapture(e.pointerId);
+  });
+  c.addEventListener("pointermove", e => {
+    const tip = $("#w3tip"), d = W3.drag, [mx, my] = at(e);
+    if (d) {
+      const dx = e.clientX - d.x, dy = e.clientY - d.y;
+      if (Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+      if (d.moved) {
+        if (tip) tip.style.display = "none";
+        if (d.mark) { const h = w3ray(mx, my); if (h) W.dragTo = h; w3soon(true); return; }   // the selected one, on the ground under the pointer
+        if (d.pan) {                                   // move the point looked at, in the screen's plane
+          const { r, u } = w3basis(), k = 2 * W3.cam.dist * Math.tan(W3FOV / 2) / c.clientHeight;
+          W3.cam.t = [0, 1, 2].map(i => d.t[i] - r[i] * dx * k + u[i] * dy * k);
+        } else { W3.cam.yaw = d.yaw - dx * 0.006; W3.cam.pitch = Math.max(0.03, Math.min(1.553, d.pitch + dy * 0.006)); }
+        w3soon(); return;
+      }
+    }
+    if (!tip || !W.st) return;
+    const p = w3nearest(mx, my);
+    if (p) { tip.textContent = describePoint(p).text; tip.style.left = (mx + 14) + "px"; tip.style.top = (my + 10) + "px"; tip.style.display = "block"; }
+    else tip.style.display = "none";
+  });
+  c.addEventListener("pointerup", e => {
+    const d = W3.drag; W3.drag = null;
+    if (d && d.mark && d.moved) {                      // dropped where the pointer meets the collision: the walkable ground there
+      const to = W.dragTo; W.dragTo = null; w3soon(true);
+      if (to) tryGo(() => moveSel(to, true)); else toast("No ground there: drop it on the stage's collision", "warn");
+      return;
+    }
+    if (!d || d.moved || d.button !== 0 || !W.st) return;
+    const [mx, my] = at(e);
+    if (W.moving && W.sel) {
+      const h = w3ray(mx, my);
+      if (h) tryGo(() => moveSel(h, true)); else toast("No ground there: click the stage's collision", "warn");
+      return;
+    }
+    const p = w3nearest(mx, my);
+    if (p) { selectPoint(p); return; }
+    const h = w3ray(mx, my);
+    if (h) w3spot(h); else toast("No ground there: click the stage's collision", "warn");
+  });
+  c.addEventListener("pointerleave", () => { const tip = $("#w3tip"); if (tip) tip.style.display = "none"; });
+  c.addEventListener("dblclick", e => { const h = w3ray(...at(e)); if (h) { W3.cam.t = h; w3soon(); } });
+  c.addEventListener("wheel", e => {
+    e.preventDefault();
+    if (!W3.cam) return;
+    const f = e.deltaY < 0 ? 0.85 : 1 / 0.85;
+    if (f < 1) { const h = w3ray(...at(e)); if (h) W3.cam.t = W3.cam.t.map((v, i) => v + (h[i] - v) * (1 - f)); }   // toward the pointer
+    W3.cam.dist = Math.max(80, Math.min(3e6, W3.cam.dist * f));
+    w3soon();
+  }, { passive: false });
+  c.addEventListener("dragover", e => { if (e.dataTransfer.types.includes("text/x-riftstone-enemy")) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } });
+  c.addEventListener("drop", e => {
+    const id = e.dataTransfer.getData("text/x-riftstone-enemy");
+    if (!id || !W.st) return;
+    e.preventDefault();
+    const h = w3ray(...at(e));
+    if (!h) { toast("Drop it on the stage's ground", "warn"); return; }
+    $("#eenemy").value = id; W.name = id; w3spot(h);
+    busy($("#eplan"), () => encounterGo(true));
+  });
+  c.addEventListener("webglcontextlost", e => {
+    e.preventDefault(); W3.gl = null; W3.P = null;
+    w3msg("The graphics device was reset; the 3D map draws again when it is back.");
+  });
+  c.addEventListener("webglcontextrestored", () => { if (w3init()) { w3msg(""); w3soon(true); } });
+}
+function w3fill(set, pts, rgba) {
+  const gl = W3.gl, pos = new Float32Array(pts.length * 3), col = new Float32Array(pts.length * 4);
+  pts.forEach((p, i) => { pos.set(p.slice(0, 3), i * 3); col.set(p.length > 3 ? p.slice(3) : rgba, i * 4); });
+  gl.bindBuffer(gl.ARRAY_BUFFER, set.pos); gl.bufferData(gl.ARRAY_BUFFER, pos, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, set.col); gl.bufferData(gl.ARRAY_BUFFER, col, gl.DYNAMIC_DRAW);
+  set.n = pts.length;
+}
+const w3rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16) / 255);
+// what the map shows, in 3D: the shown placements (dimmed outside the highlighted group or enemy), the planned
+// encounter's spawn points, a planned dungeon, and the spot (a cross on the ground and a stem)
+function w3content() {
+  const sc = W3.scene, r = W.st, here = sc && r && sc.stage === r.stage;
+  W3.marks = [];
+  const marks = [];
+  if (here) {
+    const nameIx = W.name ? r.names.findIndex(n => n.id === W.name) : -1;
+    const h = sc.kind === "field" ? W3CELL * (sc.radius + 0.5) : Infinity;
+    for (const p of worldPoints()) {
+      if (sc.kind === "field" && (Math.abs(p[0] - sc.center[0]) > h || Math.abs(p[1] - sc.center[1]) > h)) continue;
+      const lay = r.layouts[p[3]], on = (!W.hl || (lay.type === W.hl.type && lay.number === W.hl.number)) && (nameIx < 0 || p[5] === nameIx);
+      marks.push(p[7] === 2 ? [p[0], p[2] + 60, p[1], ...w3rgb("#8d99a8"), on ? 0.45 : 0.15]      // removed by the mod
+                            : [p[0], p[2] + 60, p[1], ...w3rgb(p[7] === 1 ? "#ffffff" : WCOLOR[lay.type]), on ? 1 : 0.2]);
+      W3.marks.push(p);
+    }
+  }
+  w3fill(W3.sets.marks, marks);
+  const up = s => [s[0], s[1] + 60, s[2]];
+  const plan = here && W.plan && W.plan.stage === r.stage ? W.plan.spawn_points.map(up) : [];
+  w3fill(W3.sets.plan, plan, [1, 1, 1, 1]);
+  const dg = here && W.dungeon && W.dungeon.stage === r.stage ? W.dungeon : null;
+  w3fill(W3.sets.dung, dg ? dg.beats.flatMap(b => b.spawn_points.map(up)) : [], [0.886, 0.91, 0.941, 1]);
+  w3fill(W3.sets.doors, dg ? dg.doors.map(up) : [], [0.553, 0.6, 0.659, 1]);
+  const L = [], s = here && W.spot && W.spot.xyz;
+  if (s) { const [x, y, z] = s, a = 150; L.push(x - a, y, z, x + a, y, z, x, y, z - a, x, y, z + a, x, y, z, x, y + 300, z); }
+  const dt = here && W.sel && W.dragTo;                 // a placement being dragged: a stem where it will stand, a line from where it is
+  if (dt) { const [x, y, z] = dt; L.push(x, y, z, x, y + 300, z, W.sel[0], W.sel[2] + 60, W.sel[1], x, y + 60, z); }
+  const gl = W3.gl; gl.bindBuffer(gl.ARRAY_BUFFER, W3.lines.buf); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(L), gl.DYNAMIC_DRAW);
+  W3.lines.n = L.length / 3;
+  w3legend();
+}
+function w3soon(rebuild) {
+  if (rebuild) W3.rebuild = true;
+  if (!W3.frame) W3.frame = requestAnimationFrame(w3draw);
+}
+function w3draw() {
+  W3.frame = 0;
+  const gl = W3.gl, c = W3.canvas;
+  if (!gl || W.mode !== "3d" || !c.isConnected) return;
+  const dpr = window.devicePixelRatio || 1, Wd = c.clientWidth, Hd = c.clientHeight;
+  if (!Wd || !Hd) return;
+  if (c.width !== Math.round(Wd * dpr) || c.height !== Math.round(Hd * dpr)) {
+    c.width = W3.over.width = Math.round(Wd * dpr); c.height = W3.over.height = Math.round(Hd * dpr);
+  }
+  if (W3.rebuild) { W3.rebuild = false; w3content(); }
+  gl.viewport(0, 0, c.width, c.height);
+  gl.clearColor(0.047, 0.051, 0.075, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const g = W3.over.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, Wd, Hd);
+  if (!W3.cam || !W3.scene || !W.st || W3.scene.stage !== W.st.stage) { W3.M = null; return; }
+  const M = W3.M = w3matrix(Wd, Hd), e = w3eye(), d = W3.cam.dist;
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK); gl.disable(gl.BLEND);
+  const P = W3.P.mesh; gl.useProgram(P.p);
+  gl.uniformMatrix4fv(P.u.mvp, false, M); gl.uniform3fv(P.u.eye, e); gl.uniform3f(P.u.bg, 0.047, 0.051, 0.075);
+  gl.uniform2f(P.u.fog, d * 1.5, d * 9);
+  for (const k of ["e", "h"]) {
+    const L = W3.layers[k];
+    if (!L || !W3.show[k]) continue;
+    gl.uniform3fv(P.u.tint, k === "e" ? [1, 1, 1] : [0.8, 0.88, 1.08]);
+    if (k === "h") { gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(2, 2); }   // e wins where both lie
+    gl.bindVertexArray(L.vao); gl.drawElements(gl.TRIANGLES, L.t.length, gl.UNSIGNED_INT, 0);
+    gl.disable(gl.POLYGON_OFFSET_FILL);
+  }
+  const F = W3.P.flat; gl.useProgram(F.p); gl.uniformMatrix4fv(F.u.mvp, false, M);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.disable(gl.CULL_FACE);
+  const N = W3.layers.nav;
+  if (N && W3.show.nav) {                              // the walkable mesh: a tint just over the ground, and its edges
+    gl.depthMask(false); gl.uniform1f(F.u.lift, Math.max(6, d * 0.002));
+    gl.uniform4f(F.u.col, 0.5, 0.97, 1, 0.1); gl.bindVertexArray(N.vao); gl.drawElements(gl.TRIANGLES, N.t.length, gl.UNSIGNED_INT, 0);
+    gl.uniform4f(F.u.col, 0.5, 0.97, 1, 0.3); gl.bindVertexArray(N.evao); gl.drawElements(gl.LINES, N.edges.length, gl.UNSIGNED_INT, 0);
+    gl.depthMask(true);
+  }
+  if (W3.lines.n) {                                   // the spot: faint through walls, bright where it can be seen
+    gl.uniform1f(F.u.lift, Math.max(4, d * 0.001)); gl.bindVertexArray(W3.lines.vao);
+    gl.disable(gl.DEPTH_TEST); gl.uniform4f(F.u.col, 0.5, 0.97, 1, 0.35); gl.drawArrays(gl.LINES, 0, W3.lines.n);
+    gl.enable(gl.DEPTH_TEST); gl.uniform4f(F.u.col, 0.5, 0.97, 1, 1); gl.drawArrays(gl.LINES, 0, W3.lines.n);
+  }
+  const D = W3.P.dots; gl.useProgram(D.p); gl.uniformMatrix4fv(D.u.mvp, false, M);
+  for (const s of [W3.sets.marks, W3.sets.dung, W3.sets.doors, W3.sets.plan]) {   // markers: ghosts through walls, then the seen ones
+    if (!s.n) continue;
+    gl.bindVertexArray(s.vao); gl.uniform1f(D.u.size, s.size * dpr);
+    gl.disable(gl.DEPTH_TEST); gl.uniform1f(D.u.ghost, 0.25); gl.drawArrays(gl.POINTS, 0, s.n);
+    gl.enable(gl.DEPTH_TEST); gl.uniform1f(D.u.ghost, 1); gl.drawArrays(gl.POINTS, 0, s.n);
+  }
+  gl.bindVertexArray(null);
+  // on top, in 2D: the selected placement's ring, a planned dungeon's numbered places, the axes
+  if (W.sel) { const s = w3project(W.sel[0], W.sel[2] + 60, W.sel[1]); if (s) { g.strokeStyle = "#7ff8ff"; g.lineWidth = 2; g.beginPath(); g.arc(s[0], s[1], 9, 0, 7); g.stroke(); } }
+  const dg = W.dungeon && W.dungeon.stage === W.st.stage ? W.dungeon : null;
+  if (dg) {
+    g.font = "600 11px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+    g.textAlign = "center"; g.textBaseline = "middle";
+    dg.beats.forEach((b, i) => {
+      const s = w3project(b.at[0], b.at[1] + 250, b.at[2]); if (!s) return;
+      g.fillStyle = "rgba(8,8,12,.88)"; g.beginPath(); g.arc(s[0], s[1], 10, 0, 7); g.fill();
+      g.strokeStyle = "#e2e8f0"; g.lineWidth = 1.5; g.stroke(); g.fillStyle = "#ffffff"; g.fillText(String(i + 1), s[0], s[1] + 0.5);
+    });
+  }
+  const { r, u } = w3basis(), ox = 30, oy = Hd - 28;
+  g.font = "11px " + getComputedStyle(document.documentElement).getPropertyValue("--mono"); g.textAlign = "center"; g.textBaseline = "middle";
+  for (const [ax, name] of [[[1, 0, 0], "x"], [[0, 0, 1], "z"], [[0, 1, 0], "y"]]) {
+    const dx = v3.dot(ax, r) * 18, dy = -v3.dot(ax, u) * 18;
+    g.strokeStyle = "rgba(148,157,175,.7)"; g.lineWidth = 1.5; g.beginPath(); g.moveTo(ox, oy); g.lineTo(ox + dx, oy + dy); g.stroke();
+    g.fillStyle = "#949daf"; g.fillText(name, ox + dx * 1.45, oy + dy * 1.45);
+  }
+}
+function w3bar() {
+  const bar = $("#w3bar");
+  if (!bar) return;
+  const sc = W3.scene && W.st && W3.scene.stage === W.st.stage ? W3.scene : null;
+  const field = W.st && W.st.stage === 100;
+  bar.innerHTML = (sc ? ["e", "h", "nav"].filter(k => W3.layers[k]).map(k => `<button class="chip ${W3.show[k] ? "on" : ""}" data-l="${k}" title="${esc(W3TIP[k])}">${W3NAME[k]}<span class="sub">${(W3.layers[k].t.length / 3).toLocaleString()}</span></button>`).join("") : "")
+    + `<button class="chip" data-v="top" title="look straight down, X right and Z down as on the map">From above</button>`
+    + `<button class="chip" data-v="frame" title="back to the first view">Frame</button>`
+    + (field ? `<select class="input" id="w3rad" title="how many of the open field's 100 m cells"><option value="1" ${W3.radius === 1 ? "selected" : ""}>3 × 3 cells</option><option value="2" ${W3.radius === 2 ? "selected" : ""}>5 × 5 cells</option></select>
+       <button class="chip" data-v="here" title="read the cells around the point the view turns about">Cells around the centre</button>` : "");
+  bar.querySelectorAll("[data-l]").forEach(b => b.onclick = () => { W3.show[b.dataset.l] = !W3.show[b.dataset.l]; b.classList.toggle("on", W3.show[b.dataset.l]); w3soon(); });
+  bar.querySelectorAll("[data-v]").forEach(b => b.onclick = () => {
+    if (b.dataset.v === "here") { load3d(true); return; }
+    if (!W3.cam) return;
+    if (b.dataset.v === "top") { W3.cam.yaw = 0; W3.cam.pitch = 1.553; } else w3frame();
+    w3soon();
+  });
+  const rad = $("#w3rad");
+  if (rad) rad.onchange = () => { W3.radius = +rad.value; load3d(true); };
+}
+function w3info() {
+  const sc = W3.scene, el = $("#w3info");
+  if (!el || !sc || !W.st || sc.stage !== W.st.stage) return;
+  const tris = sc.layers.filter(l => l.key !== "nav").reduce((s, l) => s + l.triangles, 0);
+  const where = sc.kind === "field" ? `cells ${sc.cells.length} around ${String(sc.cell[0]).padStart(2, "0")}m${String(sc.cell[1]).padStart(2, "0")}n · ` : "";
+  el.textContent = `${where}${tris.toLocaleString()} collision triangles from your game${sc.collision_stage ? ` (stage ${sc.collision_stage}'s)` : ""}`
+    + `${sc.notes.length ? " · " + sc.notes.join(" · ") : ""}`;
+  el.title = el.textContent;
+}
+function w3legend() {
+  const el = $("#w3legend");
+  if (!el) return;
+  if (W.moving) { el.textContent = "Click the ground where it should stand (it stands on the walkable ground there) · Esc cancels"; return; }
+  el.textContent = `${W3.marks.length.toLocaleString()} placements shown · drag to turn, right-drag or Shift-drag to move, scroll to zoom toward the pointer, double-click to turn about a point · click a marker to see it and change it, drag the selected one along the ground to move it, the ground to put the encounter's spot there (at that ground's height)`;
+}
 
 /* ---------- files in and out of the browser ---------- */
 function saveDownload(r) {
@@ -1816,10 +2547,11 @@ function destPicker(id, pick, kind) {
       <option value="" ${cur === "" ? "selected" : ""}>+ a new, separate mod…</option></select>
     <input class="input" id="${id}-new" placeholder="new mod name" autocomplete="off" ${cur === "" ? "" : "hidden"}></div>`;
 }
+const DESTHOOK = {};            // id -> what else a new choice changes (the World tab's map shows the chosen mod)
 function wireDest(id) {
   const s = $("#" + id), n = $("#" + id + "-new");
   if (!s) return;
-  s.onchange = () => { S.dest[id] = s.value; n.hidden = s.value !== ""; if (!n.hidden) n.focus(); };
+  s.onchange = () => { S.dest[id] = s.value; n.hidden = s.value !== ""; if (!n.hidden) n.focus(); if (DESTHOOK[id]) DESTHOOK[id](); };
 }
 function destBody(id) {
   const s = $("#" + id);

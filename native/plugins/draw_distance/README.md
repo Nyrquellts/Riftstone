@@ -58,7 +58,8 @@ View Range NORMAL, FAR and FARTHEST:
 - `uEnemy::setup`'s distances and `uCharacterBase::checkMoveMode`, for monsters and human enemies;
 - `aStage::init`'s grass fade.
 
-There are seven profiles: the shipped ini, two others, clamped and unreadable values, every setting 0,
+There are eight profiles: the shipped ini, two others, clamped and unreadable values, the owner's own
+settings (objects x20 and never hidden, grass x3), every setting 0,
 `Enabled = 0`, and game code that differs by one byte (refused, nothing written). A second copy of the
 plugin refuses the patched code. `tools\test_all.cmd` runs it too. It reports a skip when the plugin
 isn't built or the game isn't found.
@@ -72,5 +73,6 @@ riftstone loader install
 riftstone loader plugin add native\plugins\draw_distance\out\draw_distance.asi
 ```
 
-The first `plugin add` also copies `draw_distance.ini`, and later updates keep the owner's edits.
+The first `plugin add` also copies `draw_distance.ini`; a later update keeps the owner's values and adds any
+setting new in the build with its default and comment.
 Removal: `riftstone loader plugin remove draw_distance.asi`.

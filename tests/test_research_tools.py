@@ -29,7 +29,14 @@ def load(name):
 
 lanes = load("lanes")
 doc_claims = load("doc_claims")
+run_unit = load("run_unit")
 HAVE_GIT = shutil.which("git") is not None
+
+
+def rmtree(path) -> None:
+    """A scratch repository's folder, gone: git writes its objects read-only, so ``shutil.rmtree(ignore_errors=True)``
+    leaves the folder, and every run of the tests adds one more to the temp folder."""
+    run_unit.remove_tree(Path(path))
 
 
 def run(cwd, *args):
@@ -75,7 +82,7 @@ class LanesTest(unittest.TestCase):
     def tearDown(self):
         lanes.REPO = self.saved
         subprocess.run(["git", "worktree", "remove", "--force", str(self.lane)], cwd=self.repo, capture_output=True)
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        rmtree(self.tmp)
 
     def survey(self):
         found, others = lanes.survey("main", 30)
@@ -144,7 +151,7 @@ class LaneCasesTest(unittest.TestCase):
 
     def tearDown(self):
         lanes.REPO = self.saved
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        rmtree(self.tmp)
 
     def lane(self, name: str, *how: str) -> Path:
         path = self.tmp / name
@@ -340,7 +347,7 @@ class DocClaimsTest(unittest.TestCase):
         self.online = doc_claims.Image(self.tmp / "online.exe")
 
     def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        rmtree(self.tmp)
 
     def page(self, name, text):
         p = self.tmp / name
@@ -411,7 +418,7 @@ class DocClaimsRunTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(rmtree, self.tmp)
         (self.tmp / "game.exe").write_bytes(pe_image(bytes.fromhex("558BEC83EC10"), b"Fatal error.\0", 0x100))
         # Online's image runs far past Dark Arisen's: .data at 0x02113000, a second .text at 0x0240F000
         (self.tmp / "online.exe").write_bytes(pe_sections([(b".text", 0x1000, 0x1000, bytes.fromhex("B899000000C3")),

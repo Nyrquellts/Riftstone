@@ -1,6 +1,6 @@
 // lod_harness_core -- runs the lod_tuner hook inside the real game code, without the game.
 //
-//   lod_stub.exe <DDDA.exe> <lod_tuner.asi> <on|farlod|flat|off>   (the stub loads this DLL and calls HarnessMain)
+//   lod_stub.exe <DDDA.exe> <lod_tuner.asi> <on|farlod|flat|slow|off>   (the stub loads this DLL and calls HarnessMain)
 //
 // Maps DDDA.exe's image at its fixed base (0x00400000) over the stub's image, loads the plugin (which
 // verifies and patches the mapped code), then:
@@ -16,8 +16,12 @@
 //   on     -- the shipped lod_tuner.ini; the game config says 2560x1440, CameraFov 0, ViewRange FARTHEST
 //   farlod -- the same with Farthest = lod: each of the ten ViewRange tests' FARTHEST branch now lands on the
 //             store that makes ViewRange the multiplier, and the cloth's LOD choice runs x3 at FARTHEST
-//   flat   -- Scale=3, PopPixels=0, Characters=1.5, ScreenHeight=1080, MaxDistance=100 (m)
+//   flat   -- Scale=3, PopPixels=0, Characters=1.5, ScreenHeight=1080, MaxDistance=100 (m), FadeSeconds=0
+//   slow   -- FadeSeconds = 9 (clamped to 5), everything else the defaults
 //   off    -- Enabled=0: nothing patched, the game's values reach the readers unchanged
+// Every profile also runs cInstancingDynamic's draw-list builder (0x01143160) on a fake object at several frame rates
+// on the plugin's test clock: with FadeSeconds a swap between levels takes that long at any frame rate, without it
+// (flat, off) 17 calls, a step a frame, as the game does.
 // Prints "pass"/"FAIL" lines and exits 0 when everything passed, 1 on a failure, 2 when the image
 // cannot be mapped here (reported as a skip by run_tests.py).
 #define WIN32_LEAN_AND_MEAN
@@ -258,6 +262,224 @@ void RunCases(const std::vector<Case>& cases) {
     }
 }
 
+// ---- instanced vegetation's cross-fade: the real draw-list builder on a fake object -------------
+// cInstancingDynamic's builder (0x01143160, thiscall, 5 arguments, ret 0x14) with: the object (LOD distances 0 / 10 /
+// 20 / 30 m at +0x08, no billboard level, mUseLodFade +0x26, its first cell +0x460, +0x464 set so every record is
+// tested), the view (fade bit +0x16A, camera +0x184, six planes that pass everything at [+0xCA0]), one cell with one
+// 48-byte record (instance 7, valid, alpha cap 15; its counters at +0x24..+0x27), the count, the per-level tally, -1
+// (levels by distance) and the draw list.  The real frustum test (0x00FF0E60) and the rest run as they are.
+uintptr_t JmpTarget(uintptr_t at);
+
+constexpr uintptr_t FADE_FN = 0x01143160, FADE_SET = 0x01143179, FADE_STEP = 0x01143353;
+const uint8_t FADE_SET_GAME[5] = {0xC6, 0x44, 0x24, 0x3B, 0x01};
+const uint8_t FADE_STEP_GAME[8] = {0x85, 0xDB, 0x75, 0x11, 0x0F, 0xB6, 0x46, 0x24};
+
+uint32_t g_fargs[5], g_espIn, g_espOut, g_keep[4];
+__declspec(naked) void CallFadeAsm() {
+    __asm {
+        push ebx
+        push esi
+        push edi
+        push ebp
+        mov ebx, 0x33333333
+        mov esi, 0x22222222
+        mov edi, 0x11111111
+        mov ebp, 0x44444444
+        mov g_espIn, esp
+        push dword ptr [g_fargs + 16]
+        push dword ptr [g_fargs + 12]
+        push dword ptr [g_fargs + 8]
+        push dword ptr [g_fargs + 4]
+        push dword ptr [g_fargs]
+        mov ecx, g_self
+        call dword ptr [g_fn]
+        mov g_espOut, esp
+        mov dword ptr [g_keep], ebx
+        mov dword ptr [g_keep + 4], esi
+        mov dword ptr [g_keep + 8], edi
+        mov dword ptr [g_keep + 12], ebp
+        pop ebp
+        pop edi
+        pop esi
+        pop ebx
+        ret
+    }
+}
+
+using ClockFn = void(__cdecl*)(long long);
+ClockFn g_clock;
+
+struct FadeWorld {
+    alignas(16) uint8_t inst[0x480] = {};
+    alignas(16) uint8_t view[0xD00] = {};
+    alignas(16) float planes[6][4] = {};
+    alignas(16) uint8_t cell[0x50] = {};
+    alignas(16) uint8_t rec[48] = {};
+    uint32_t out[16] = {};
+    uint16_t tally[32] = {};
+    uint32_t count = 0;
+    bool regsOk = true;
+    FadeWorld() {
+        *(float*)(inst + 0x0C) = 1000.0f;
+        *(float*)(inst + 0x10) = 2000.0f;
+        *(float*)(inst + 0x14) = 3000.0f;
+        inst[0x26] = 1;
+        *(uint32_t*)(inst + 0x460) = (uint32_t)(uintptr_t)cell;
+        inst[0x464] = 1;
+        view[0x16A] = 1;
+        for (auto& p : planes) p[3] = 1.0f;
+        *(uint32_t*)(view + 0xCA0) = (uint32_t)(uintptr_t)planes;
+        float* box = (float*)(cell + 0x20);
+        box[0] = box[1] = box[2] = -100000.0f;
+        box[4] = box[5] = box[6] = 100000.0f;
+        *(uint16_t*)(cell + 0x40) = 1;
+        *(uint32_t*)(cell + 0x44) = (uint32_t)(uintptr_t)rec;
+        float* r = (float*)rec;
+        r[4] = r[5] = r[6] = 100.0f;  // 0..1 m, its middle at (50, 50, 50) cm
+        *(uint32_t*)(rec + 0x20) = 7 | 0x10000 | 0x0F000000;
+    }
+    void camera(float d) {
+        *(float*)(view + 0x184) = 50.0f + d;
+        *(float*)(view + 0x188) = 50.0f;
+        *(float*)(view + 0x18C) = 50.0f;
+    }
+    uint32_t call(int32_t mode = -1) {
+        count = 0;
+        memset(out, 0, sizeof out);
+        memset(tally, 0, sizeof tally);
+        g_fargs[0] = (uint32_t)(uintptr_t)view;
+        g_fargs[1] = (uint32_t)(uintptr_t)&count;
+        g_fargs[2] = (uint32_t)(uintptr_t)tally;
+        g_fargs[3] = (uint32_t)mode;
+        g_fargs[4] = (uint32_t)(uintptr_t)out;
+        g_self = (uint32_t)(uintptr_t)inst;
+        g_fn = (uint32_t)FADE_FN;
+        CallFadeAsm();
+        regsOk &= g_espIn == g_espOut && g_keep[0] == 0x33333333 && g_keep[1] == 0x22222222 && g_keep[2] == 0x11111111 &&
+                  g_keep[3] == 0x44444444;
+        return count;
+    }
+    uint32_t level() const { return (*(const uint32_t*)(rec + 0x20) >> 18) & 0x3F; }
+    uint8_t c(int i) const { return rec[0x24 + i]; }
+    // The draw list holds instance 7 once for every level whose counter is above 0, at that alpha (cap 15).
+    bool listMatches() const {
+        uint32_t want = 0;
+        for (int i = 0; i < 4; i++) want += c(i) != 0;
+        if (count != want) return false;
+        bool seen[4] = {};
+        for (uint32_t k = 0; k < count; k++) {
+            uint32_t e = out[k], lvl = e >> 30, alpha = (e >> 16) & 0x3F;
+            if ((e & 0xFFFF) != 7 || seen[lvl] || alpha != (c((int)lvl) < 15 ? c((int)lvl) : 15u)) return false;
+            seen[lvl] = true;
+        }
+        return true;
+    }
+};
+
+struct Swap {
+    int calls = 0;
+    double seconds = 0;
+    uint32_t mostDrawn = 0;
+    bool list = true, pace = true, regs = true;
+};
+
+// The instance seen first at 5 m (level 0, counter 15), then at 15 m (level 1): calls fps apart on the test clock until
+// level 0's counter is 0 and level 1's 15.  Each call may move level 1's counter up by one or level 0's down by 8, not
+// both, never more.
+Swap RunSwap(double fps) {
+    FadeWorld w;
+    const long long t0 = 1000000;
+    w.camera(500.0f);
+    g_clock(t0);
+    w.call();
+    Swap s;
+    s.list &= w.level() == 0 && w.c(0) == 15 && w.c(1) == 0 && w.listMatches();
+    w.camera(1500.0f);
+    long long start = 0;
+    for (int i = 1; i <= 4000; i++) {
+        long long t = t0 + (long long)(i * 1e6 / fps + 0.5);
+        g_clock(t);
+        uint8_t a0 = w.c(0), a1 = w.c(1);
+        w.call();
+        if (i == 1) start = t;
+        int up = w.c(1) - a1, down = a0 - w.c(0);
+        s.pace &= w.level() == 1 && up >= 0 && down >= 0 && !(up && down) && up <= 1 && down <= 8;
+        s.list &= w.listMatches();
+        if (w.count > s.mostDrawn) s.mostDrawn = w.count;
+        if (w.c(0) == 0 && w.c(1) == 15) {
+            s.calls = i;
+            s.seconds = (double)(t - start) / 1e6;
+            break;
+        }
+    }
+    s.regs = w.regsOk;
+    return s;
+}
+
+bool FadePatched() {
+    return JmpTarget(FADE_SET) != 0 && JmpTarget(FADE_STEP) != 0 && *(const uint8_t*)(FADE_STEP + 5) == 0x90 &&
+           *(const uint8_t*)(FADE_STEP + 6) == 0x90 && *(const uint8_t*)(FADE_STEP + 7) == 0x90;
+}
+
+// fadeSeconds 0: the game's own fade, 17 calls a swap at any frame rate.  Otherwise a swap takes fadeSeconds (less
+// at most a step and a frame) when frames come faster than steps, and the game's 17 calls when they do not.
+void CheckFade(double fadeSeconds, const std::vector<double>& rates) {
+    if (fadeSeconds > 0)
+        Check(FadePatched(), "the fade flag's store (0x01143179) and the fade step (0x01143353) jump to the plugin");
+    else
+        Check(memcmp((const void*)FADE_SET, FADE_SET_GAME, 5) == 0 && memcmp((const void*)FADE_STEP, FADE_STEP_GAME, 8) == 0,
+              "the fade flag's store and the fade step are the game's own");
+    double step = fadeSeconds / 17.0;
+    for (double fps : rates) {
+        Swap s = RunSwap(fps);
+        bool ok;
+        char msg[300];
+        if (fadeSeconds <= 0 || 1.0 / fps >= step) {
+            ok = s.calls == 17;
+            _snprintf_s(msg, sizeof msg, _TRUNCATE, "%.0f fps: a swap takes %d calls (%.3f s), a step a frame as the game does",
+                        fps, s.calls, s.seconds);
+        } else {
+            ok = s.calls > 17 && s.seconds <= fadeSeconds + 1e-4 && s.seconds > fadeSeconds - step - 1.0 / fps - 1e-4;
+            _snprintf_s(msg, sizeof msg, _TRUNCATE, "%.0f fps: a swap takes %.3f s over %d calls (want %.2f s, less at most "
+                        "a step and a frame)", fps, s.seconds, s.calls, fadeSeconds);
+        }
+        Check(ok && s.pace, msg);
+        Check(s.list && s.mostDrawn == 2, "  every call draws the instance at each level still fading, at its alpha (both "
+                                          "levels while they cross)");
+        Check(s.regs, "  esp, ebx, esi, edi and ebp come back as the game's builder leaves them");
+    }
+
+    // The view without the fade bit, and an object with mUseLodFade 0: one entry at full alpha, counters left alone.
+    for (int which = 0; which < 2; which++) {
+        FadeWorld w;
+        w.camera(500.0f);
+        g_clock(5000000);
+        w.call();
+        w.camera(1500.0f);
+        if (which == 0) w.view[0x16A] = 0;
+        else w.inst[0x26] = 0;
+        g_clock(9000000);
+        uint32_t n = w.call();
+        uint32_t e = w.out[0];
+        Check(n == 1 && (e & 0xFFFF) == 7 && ((e >> 16) & 0x3F) == 15 && (e >> 30) == 1 && w.c(0) == 15 && w.c(1) == 0 &&
+                  w.regsOk,
+              which == 0 ? "a view without the fade bit: drawn once at level 1, full alpha, the counters as they were"
+                         : "an object with mUseLodFade 0: drawn once at level 1, full alpha, the counters as they were");
+    }
+
+    // A forced level (mode 1 = level 0) after a finished swap: the level stored is 0, the store kept edx (0) for it.
+    {
+        FadeWorld w;
+        w.camera(1500.0f);
+        g_clock(20000000);
+        w.call();
+        g_clock(30000000);
+        uint32_t n = w.call(1);
+        Check(n == 1 && w.level() == 0 && w.c(0) == 1 && w.c(1) == 15 && w.regsOk,
+              "a forced level 0 (mode 1): stored as level 0, its counter stepped to 1, one entry");
+    }
+}
+
 bool MapImage(const wchar_t* exe) {
     HANDLE f = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return printf("cannot open the exe\n"), false;
@@ -314,7 +536,7 @@ extern "C" __declspec(dllexport) void HarnessMain() {
 
 static int Run(int argc, wchar_t** argv) {
     if (argc < 4) {
-        printf("usage: lod_stub <DDDA.exe> <lod_tuner.asi> <on|farlod|flat|off>\n");
+        printf("usage: lod_stub <DDDA.exe> <lod_tuner.asi> <on|farlod|flat|slow|off>\n");
         return 1;
     }
     const std::wstring profile = argv[3];
@@ -329,7 +551,7 @@ static int Run(int argc, wchar_t** argv) {
     if (profile == L"off") {
         Check(memcmp((const void*)SITE, before, 7) == 0, "Enabled=0: rModel::load is left as it is");
     } else {
-        uintptr_t thunk = JmpTarget(SITE);
+        uintptr_t thunk = JmpTarget(SITE), fadeSet = JmpTarget(FADE_SET), fadeStep = JmpTarget(FADE_STEP);
         Check(thunk != 0 && *(const uint8_t*)(SITE + 5) == 0x90 && *(const uint8_t*)(SITE + 6) == 0x90,
               "the site is a jmp to the plugin's thunk");
         // A second copy of the plugin must see the patched site and leave it alone.
@@ -340,9 +562,13 @@ static int Run(int argc, wchar_t** argv) {
         wcscat_s(copy, L"_copy.asi");
         if (CopyFileW(argv[2], copy, FALSE)) {
             HMODULE second = LoadLibraryW(copy);
-            Check(second != nullptr && JmpTarget(SITE) == thunk, "a second copy refuses the patched site and changes nothing");
+            Check(second != nullptr && JmpTarget(SITE) == thunk && JmpTarget(FADE_SET) == fadeSet &&
+                      JmpTarget(FADE_STEP) == fadeStep,
+                  "a second copy refuses the patched site and changes nothing (the fade sites included)");
         }
     }
+    g_clock = plugin ? (ClockFn)GetProcAddress(plugin, "LodTunerTest_Clock") : nullptr;
+    Check(g_clock != nullptr, "the plugin exports its test clock");
     if (g_fails) return 1;
     PlaceCapture();
 
@@ -372,6 +598,8 @@ static int Run(int argc, wchar_t** argv) {
         CheckLevels(m, 6099, 10166, "draw-path LOD choice");
         CheckInstancing(m, 6099, 10166, "instanced vegetation");
         CheckFarBranches(false);
+        printf("instanced vegetation's cross-fade, the real builder on a fake object (FadeSeconds = 0.75)\n");
+        CheckFade(0.75, {20, 30, 60, 91, 144, 240});
     } else if (profile == L"farlod") {
         RunCases({
             {"small object (r 0.37 m, scenery), the pixel rule", "model\\om\\om5655\\model\\om5655", 0, 37.0f, 3000, 5000, 6099, 10166, {1}},
@@ -385,6 +613,8 @@ static int Run(int argc, wchar_t** argv) {
         Model e("model\\em\\e54\\e5400\\e5400", 60, 1244.0f, 1000, 3000);
         RunSite(e);
         CheckLevels(e, 1000, 3000, "cloth LOD choice (enemy)", true);
+        printf("instanced vegetation's cross-fade (FadeSeconds = 0.75)\n");
+        CheckFade(0.75, {91});
     } else if (profile == L"flat") {
         // Scale 3, PopPixels 0, Characters 1.5, cap 100 m = 10000 units.
         RunCases({
@@ -399,6 +629,12 @@ static int Run(int argc, wchar_t** argv) {
         RunSite(m);
         CheckLevels(m, 1500, 4500, "draw-path LOD choice (enemy)");
         CheckFarBranches(false);
+        printf("instanced vegetation's cross-fade, the game's own (FadeSeconds = 0)\n");
+        CheckFade(0, {30, 91, 150});
+    } else if (profile == L"slow") {
+        // FadeSeconds = 9 is clamped to 5; nothing else set.
+        printf("instanced vegetation's cross-fade (FadeSeconds = 9, clamped to 5)\n");
+        CheckFade(5.0, {91, 150});
     } else {
         RunCases({
             {"scenery untouched", "model\\om\\om5655\\model\\om5655", 0, 37.0f, 3000, 5000, 3000, 5000},
@@ -410,6 +646,8 @@ static int Run(int argc, wchar_t** argv) {
         CheckLevels(m, 3000, 5000, "draw-path LOD choice");
         CheckInstancing(m, 3000, 5000, "instanced vegetation");
         CheckFarBranches(false);
+        printf("instanced vegetation's cross-fade, the game's own\n");
+        CheckFade(0, {30, 91, 150});
     }
 
     printf(g_fails ? "\n%d check(s) FAILED\n" : "\nall checks passed\n", g_fails);

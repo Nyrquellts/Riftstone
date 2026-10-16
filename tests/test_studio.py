@@ -10,6 +10,7 @@ from pathlib import Path
 
 import helpers
 from riftstone import arc, studio, typemap, xfs
+from riftstone.errors import RiftError
 from riftstone.game import Game
 
 # the environment this module's classes set (a stand-in RIFTSTONE_HOME) is put back when it ends: a later
@@ -418,6 +419,22 @@ class BackdropTest(unittest.TestCase):
             b = self.studio.world_backdrop("100")
         self.assertEqual((b["kind"], b["size"]), ("cells", 10000))
         self.assertEqual(b["cells"], [[-200000, -100000], [20000, 60000]])         # one square a cell, other stages left out
+
+    def test_the_3d_map_reads_a_stage_and_a_few_field_cells(self):
+        """world/scene (scene.py): the stand-in's stage 424 has a navigation mesh and no collision; the open field
+        needs a point and at most RADIUS_MAX cells each way; a scene asked for again is not read again."""
+        sc = self.studio.world_scene("424")
+        self.assertEqual([ly["key"] for ly in sc["layers"]], ["nav"])
+        self.assertIn("stage 424 ships no collision", sc["notes"])
+        self.assertIs(self.studio.world_scene("st424"), sc)
+        self.assertIs(self.studio.api("GET", "world/scene", {"n": "424"}, {}), sc)
+        field = self.studio.api("GET", "world/scene", {"n": "100", "at": "35000,-75000", "radius": "2"}, {})
+        self.assertEqual((field["kind"], len(field["cells"]), field["layers"]), ("field", 25, []))
+        self.assertIs(self.studio.world_scene("100", "35001,-75001", "2"), field)   # the same cell, kept
+        for bad in ({"n": "100"}, {"n": "100", "at": "1,2", "radius": "3"}, {"n": "100", "at": "nan,1"},
+                    {"n": "100", "at": "1"}, {"n": "x"}):
+            with self.assertRaises(RiftError, msg=bad):
+                self.studio.api("GET", "world/scene", bad, {})
 
 
 if __name__ == "__main__":

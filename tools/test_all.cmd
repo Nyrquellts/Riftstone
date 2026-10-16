@@ -1,16 +1,15 @@
 @echo off
 rem The release gate: unit tests, loader harness, then the corpus proofs against the installed game.
-rem   tools\test_all.cmd           unit + loader + XFS/YAML/collision/text corpus (about 3 minutes)
+rem   tools\test_all.cmd           unit + loader + XFS/YAML/collision/text corpus (the unit modules and the corpus shards run in parallel)
 rem   tools\test_all.cmd full      also every archive rebuilt byte for byte (about 30 minutes)
 setlocal
 set "ROOT=%~dp0.."
 set "PY=py -3"
 where py >nul 2>nul || set "PY=python"
 set "PYTHONUTF8=1"
-pushd "%ROOT%\tests"
-rem discover, so a new test file can never be left out of the gate
-%PY% -B -m unittest discover -q -s . -p "test_*.py" || goto :fail
-popd
+rem every tests\test_*.py, one process per module and several at a time (what discover loads, found afresh each run,
+rem so a new test file can never be left out of the gate)
+%PY% -B "%ROOT%\tools\run_unit.py" || goto :fail
 rem game rules written in NYR-Lang: every module nyr.json lists must match what its .nyr source compiles to
 if not defined NYRC set "NYRC=<path>"
 if not exist "%NYRC%" (
@@ -53,6 +52,17 @@ rem code: every patched site, the constructor's and destructor's loops, the allo
 rem the pool_cap plugin (the game's eight memory pools sized from its ini, every refusal counted), inside the
 rem real DDDA.exe code: the pools built, filled to refusal, and the ragdoll setup refused at each of its arrays
 %PY% -B "%ROOT%\native\plugins\pool_cap\test\run_tests.py" || goto :fail
+rem the xp_scale plugin (experience from kills and quests, a flatter curve), inside the real DDDA.exe code: the
+rem game's sGameSys::addExp on a fake party through the patch and without it, and its level costs
+%PY% -B "%ROOT%\native\plugins\xp_scale\test\run_tests.py" || goto :fail
+rem the economy plugin (shop prices, gold and Rift Crystals, drop chances), inside the real DDDA.exe code: the
+rem game's table loader on the item list and drop sets read from the archives, its rolls, pickup, addGold and
+rem addRiftPoint through the patch and without it
+%PY% -B "%ROOT%\native\plugins\economy\test\run_tests.py" || goto :fail
+rem the vocation_stats plugin (a rest at an inn rebuilds the stats by the current vocation), inside the real
+rem DDDA.exe code: uInn's rest calls through the patch on a fake party, the game's setLevel, level-up and
+rem getNextExp with the level tables read from the archives
+%PY% -B "%ROOT%\native\plugins\vocation_stats\test\run_tests.py" || goto :fail
 rem Ninput, the native plugin host: its offline harnesses (hook arbiter, XInput proxy, display arbiter; no game)
 if exist "%ROOT%\native\ninput\out-msvc" (
   %PY% -B "%ROOT%\native\ninput\test\run_tests.py" || goto :fail
@@ -74,6 +84,14 @@ if exist "%ROOT%\native\clone_sync\out\clone_host.exe" (
 rem Standalone performance hosts: synthetic snapshots/offscreen rendering only.
 rem The combined runner reports missing components explicitly; build.py --test requires all.
 %PY% -B "%ROOT%\native\performance\test\run_tests.py" || goto :fail
+rem Riftstone Studio, the exe: its tables match the toolkit's rules, then the exe against the toolkit (rules, ini
+rem reads and writes, profiles, the command line on a stand-in folder, the selftest and the window, never shown)
+%PY% -B "%ROOT%\tools\gen_studio_catalog.py" --check || goto :fail
+if exist "%ROOT%\native\studio\out\RiftstoneStudio.exe" (
+  %PY% -B "%ROOT%\native\studio\test\run_tests.py" || goto :fail
+) else (
+  echo studio not built; run native\studio\build.cmd to include it
+)
 rem every byte and string the docs quote as evidence (`8B 81 ...` at `0x...`), against the exe itself
 %PY% -B "%ROOT%\tools\doc_claims.py" check || goto :fail
 if /i "%~1"=="full" (

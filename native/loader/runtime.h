@@ -17,7 +17,7 @@
 #include <windows.h>
 #include <stdint.h>
 
-#define RIFTSTONE_VERSION_A "1.0.5"             // the one version: the log, reports, the live page, the panel
+#define RIFTSTONE_VERSION_A "1.0.6"             // the one version: the log, reports, the live page, the panel
 #define RIFTSTONE_LOADER_VERSION L"" RIFTSTONE_VERSION_A
 
 // ---- loader.cpp -------------------------------------------------------------------------------
@@ -61,9 +61,19 @@ struct PluginInfo {
     HMODULE module;
     DWORD size;           // image size, for "is this address inside the plugin"
     int state;            // 1 loaded, 0 failed, -1 quarantined, -2 skipped (safe mode)
+    BOOL legacy;          // from riftstone\legacy (loaded before riftstone\plugins), not riftstone\plugins
 };
 extern PluginInfo g_pluginInfo[MAX_PLUGINS];
 extern int g_pluginCount;
+
+// ---- ledger.cpp: who changed the game's code and imports (riftstone\logs\patches.txt) ---------------
+void LedgerBegin();                             // a copy of the exe's code sections and import table
+// After a start-up step: what changed since the last step is kind's ("loader", "legacy", "plugin", "fixes",
+// "chain"), module the file name, name what the ledger calls it.
+void LedgerStep(const char* kind, const wchar_t* module, const wchar_t* name);
+void LedgerWrite();                             // patches.txt as it stands
+void LedgerStartLate();                         // the late scan ([loader] patch_ledger_seconds), then the copy is freed
+BOOL LedgerOwnerAt(const void* addr, wchar_t* out, size_t cap);   // who last changed the code at addr
 
 // ---- stability.cpp ----------------------------------------------------------------------------
 void StabilityStart();                          // before plugins: rotate reports, read the last session

@@ -1,7 +1,8 @@
 """Windows executables and DLLs (PE files), as far as Riftstone needs them.
 
-What the header says (the machine, DLL or program, IMAGE_FILE_LARGE_ADDRESS_AWARE), the names a DLL
-exports, and the header checksum Windows' CheckSumMappedFile computes.  Everything reads bytes and refuses
+What the header says (the machine, DLL or program, IMAGE_FILE_LARGE_ADDRESS_AWARE, the oldest Windows it
+says it runs on), the names a DLL exports, the functions it imports (:mod:`riftstone.winapi` checks them against
+Windows 10), and the header checksum Windows' CheckSumMappedFile computes.  Everything reads bytes and refuses
 what is not a PE file with a FormatError; :func:`with_large_address_aware` returns new bytes, and
 :func:`write_large_address_aware_copy` is the one function that writes a file: a copy, never the file it
 read.
@@ -101,7 +102,7 @@ def _offset(data: bytes, h: Header, rva: int, n: int = 1) -> int:
 def _cstr(data: bytes, off: int, limit: int = 512) -> str:
     end = data.find(b"\0", off, off + limit)
     if end < 0:
-        raise FormatError("pe", "an export name has no end", off)
+        raise FormatError("pe", "a name in the file has no end", off)
     return data[off:end].decode("ascii", "replace")
 
 
@@ -126,6 +127,66 @@ def exports(data: bytes) -> list[str]:
         return []
     at = _offset(data, h, table, 4 * names)
     return [_cstr(data, _offset(data, h, struct.unpack_from("<I", data, at + 4 * i)[0])) for i in range(names)]
+
+
+def _directory(data: bytes, h: Header, index: int) -> tuple[int, int]:
+    """(RVA, size) of data directory ``index``; (0, 0) when the header has none."""
+    first = 112 if h.pe32plus else 96
+    if h.optional_size < first:                     # a header cut before NumberOfRvaAndSizes has no directories
+        return 0, 0
+    count = struct.unpack_from("<I", data, h.optional_offset + first - 4)[0]
+    if index >= count or h.optional_size < first + 8 * (index + 1):
+        return 0, 0
+    return struct.unpack_from("<II", data, h.optional_offset + first + 8 * index)
+
+
+def _thunks(data: bytes, h: Header, rva: int, limit: int) -> list[str]:
+    """The names (or ``#ordinal``) of one DLL's import lookup table, up to its null entry; FormatError past
+    ``limit`` names (every DLL's together stay under ``_MAX_NAMES``)."""
+    width, flag = (8, 1 << 63) if h.pe32plus else (4, 1 << 31)
+    out = []
+    while True:
+        at = _offset(data, h, rva + width * len(out), width)
+        entry = int.from_bytes(data[at:at + width], "little")
+        if not entry:
+            return out
+        if len(out) >= limit:
+            raise FormatError("pe", "an import table has no end", at)
+        out.append(f"#{entry & 0xFFFF}" if entry & flag else _cstr(data, _offset(data, h, (entry & 0x7FFFFFFF) + 2)))
+
+
+def imports(data: bytes) -> dict[str, list[str]]:
+    """What a program or DLL needs Windows to give it before it runs: {DLL name as written: [function names,
+    ``#N`` for an ordinal]}, the import table's and the delay-load table's together (a delay-loaded DLL is
+    still needed the first time one of its functions is called)."""
+    h = header(data)
+    out: dict[str, list[str]] = {}
+    total = 0
+    for index, size, name_at, table_at in ((1, 20, 12, 0), (13, 32, 4, 16)):
+        rva, span = _directory(data, h, index)
+        if not rva or not span:
+            continue
+        for n in range(_MAX_NAMES):
+            at = _offset(data, h, rva + size * n, size)
+            if not any(data[at:at + size]):
+                break
+            name_rva = struct.unpack_from("<I", data, at + name_at)[0]
+            table = struct.unpack_from("<I", data, at + table_at)[0]
+            if index == 1 and not table:                     # no lookup table: the address table is it
+                table = struct.unpack_from("<I", data, at + 16)[0]
+            names = _thunks(data, h, table, _MAX_NAMES - total)
+            total += len(names)
+            out.setdefault(_cstr(data, _offset(data, h, name_rva)), []).extend(names)
+        else:
+            raise FormatError("pe", "an import directory has no end")
+    return out
+
+
+def required_os(data: bytes) -> tuple[int, int]:
+    """The (major, minor) subsystem version in the header: the oldest Windows the program says it runs on (Windows
+    refuses to load one newer than itself: 6.0 Vista, 6.1 7, 6.2 8, 6.3 8.1, 10.0 10 and 11)."""
+    h = header(data)
+    return struct.unpack_from("<HH", data, h.optional_offset + 48)
 
 
 def checksum(data: bytes) -> int:

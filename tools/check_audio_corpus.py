@@ -43,7 +43,7 @@ def main() -> int:
             failures.append({"name": str(path.relative_to(game.root)), "error": str(e)})
     print(f"SNGW: {counts['sngw_exact']}/{counts['sngw_seen']} exact, channels {dict(channels)}", flush=True)
     types = [typemap.BY_EXT[e] for e in ("spc", "srq", "stq", "srd")]
-    for resource in corpus.resources(game, types):
+    for resource in corpus.resources(game, types, indexed=False):
         ext = typemap.extension(resource.type_id)
         raw = resource.data
         counts[ext + "_seen"] += 1

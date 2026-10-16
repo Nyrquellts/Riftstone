@@ -293,7 +293,7 @@ def check(grammar: dict) -> Counter:
     res = Counter()
     lot_ddo.use_grammar(grammar)
     try:
-        for r in corpus.resources(find_game("ddo"), [typemap.type_for_extension("lot")], unique=True):
+        for r in corpus.resources(find_game("ddo"), [typemap.type_for_extension("lot")], unique=True, indexed=False):
             try:
                 ok = lot_ddo.build(lot_ddo.parse(r.data)) == r.data
             except Exception:  # noqa: BLE001 - counted

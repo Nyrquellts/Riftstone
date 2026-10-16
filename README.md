@@ -50,6 +50,16 @@ save backup are on); `Riftstone - Start Here.cmd` turns each one on when you wan
   is in front, the loader writes a report with every thread's state. 1.0.4 paused the game to write it and
   could freeze it for good (an alt-tab with ReShade); 1.0.5 writes it from a snapshot of the game, which
   pauses nothing.
+- **Gets along with other mods' `dinput8.dll`** (1.0.6) — another mod's `dinput8.dll` used to stand where the
+  loader goes. Start Here's fix renames it to `dinput8_chain.dll` and the loader starts it too, so both run.
+  Older mods' DLLs go in `riftstone\legacy`, and `riftstone\logs\patches.txt` names who changed which of the
+  game's code, so two mods over the same bytes, or a crash in changed code, point at a mod.
+- **Experience, economy and vocation stats** (1.0.6, off) — `xp_scale`: experience from kills and quests
+  times 0.1 to 2, and a flatter curve at high levels; `economy`: shop prices, gold, Rift Crystals and the
+  chance of drops, each multiplied; `vocation_stats`: a rest at an inn gives the Arisen and the main pawn the
+  stats their current vocation would have given them at every level.
+- **Smoother grass and trees** (1.0.6) — vegetation fades between its levels of detail over 0.75 seconds
+  instead of one step a frame (0.11 s at 150 fps, close to a pop).
 
 > **Honesty:** every plugin is verified in a test harness against the *real* game code; their *in-game
 > feel* is still being playtested. The file-format toolkit below, by contrast, is byte-for-byte proven
@@ -57,7 +67,8 @@ save backup are on); `Riftstone - Start Here.cmd` turns each one on when you wan
 > 2026-10-07). Of 1.0.4's: the collision guard has patched the game in play (its log); an Archydra, Chimeras
 > and Drakes loading together in a stage that never had them are proven in the test harness, not yet seen in
 > game. 1.0.5's reports are proven in the harness (24 of 24 written while a thread held the game's memory
-> lock, where 1.0.4 froze at 3 of 7), not yet in game.
+> lock, where 1.0.4 froze at 3 of 7), not yet in game. 1.0.6's features and the placement editor are proven in
+> their harnesses and tests, not yet in game.
 
 **2. A full modding toolkit (Studio)** — a local browser app (sends nothing anywhere), or the CLI:
 
@@ -69,6 +80,13 @@ save backup are on); `Riftstone - Start Here.cmd` turns each one on when you wan
 - Set out enemies you pasted on one spot in a shape (scatter, ring, camp, line, wedge, flank) on that
   ground, each facing the way the shape says, as far apart as the game spaces them (1.0.4). Or export mods
   as files to copy over the game's own, for your own game (to share a mod, make a package).
+- Change the game's own enemy placements on a **3D map** of the stage's real ground (1.0.6): pick one, drag it
+  (it stays on walkable ground), turn it, give it another enemy, resize it, make it tougher or delete it, and
+  undo any of it.
+- Edit your party in the save (1.0.6): copy your main pawn into the hired slots, or set any character's
+  level, vocation, stats and skills.
+- Studio also builds as one Windows program that needs no Python (`native/studio`, 1.0.6): features,
+  settings, overhaul profiles, graphics and live stats.
 - Add custom items (shops, recipes, drops); rebalance any enemy.
 - Port resources and body-matched monsters between Dark Arisen and DDO.
 - Share mods as **packages with no game data**: deltas and recipes that each player's Riftstone turns back
@@ -84,7 +102,8 @@ dyes, all generated from *your own* DDO files. See [docs/ddo-solo.md](docs/ddo-s
 ## Requirements
 
 - **Dragon's Dogma: Dark Arisen** (Steam, PC) — a legit copy. Please support the devs.
-- **Windows 10/11 (64-bit)** and the **Visual C++ 2015–2022 Redistributable (x86)**.
+- **Windows 10/11 (64-bit)**. No Visual C++ Redistributable is needed: the loader and plugins import only
+  functions Windows 7 already has, from Windows' own DLLs.
 - **Python 3.11+** — only for the toolkit/Studio; the player package needs no Python.
 
 ## Install (players)

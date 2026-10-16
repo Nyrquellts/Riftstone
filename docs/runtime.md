@@ -41,6 +41,8 @@ fixes eleven faults a review found in 0.3.2, each reproduced in the harness firs
 | Frame-rate ceiling | the options menu's "Variable" frame rate means `[fps] max_fps` (30..360) instead of 150 | off | DDDA 2364871 |
 | Shadow map size | `ShadowQuality=HIGH` draws sun shadows at `[render] shadow_map_size` (e.g. 4096) instead of 2048; spot and point shadows that make their own maps (the player's among them) get half; lights that `sShadow` lends maps to keep its size | off | DDDA 2364871 |
 | Pass-through | any other program in the folder that loads dinput8 (DDO's launcher does) gets DirectInput and nothing else | always | both |
+| **Legacy DLLs** | `riftstone\legacy\*.dll` / `*.asi`: an older mod's DLL (HardPlus, pawnlib, a 2016 dinput8 hook renamed) loaded by the loader before its own plugins, so it never needs the game folder's `dinput8.dll`; quarantined like a plugin, named as `legacy` in crash reports (below) | on (`[loader] legacy`) | both |
+| **Patch ledger** | `riftstone\logs\patches.txt`: which module changed which bytes of the game's code and import table, step by step through start-up and once more later; two modules over the same code bytes are a **conflict**, one import slot hooked by two a **chain**; a crash in changed code says whose change it is (below) | on (`[loader] patch_ledger`) | both |
 
 The loader pins itself in memory (the import table points into it), and a plugin that fails to load
 now logs why (a missing Visual C++ runtime is named as such).
@@ -58,7 +60,9 @@ Riftstone.cmd loader d3d9 add <DXVK release>   :: DXVK's x32 d3d9.dll into rifts
 Riftstone.cmd loader d3d9 [status|off]         :: what [d3d9] chain names; off: Windows' own Direct3D 9 again
 Riftstone.cmd laa [exe] [--copy out.exe]       :: large-address aware? --copy writes a copy with the flag set
 Riftstone.cmd doctor                   :: also: loader version, safe mode, quarantine, newest report, backups, live
-                                       :: stats, the exe's large-address flag, [d3d9] chain
+                                       :: stats, the exe's large-address flag, [d3d9] chain, legacy DLLs, the ledger
+Riftstone.cmd loader legacy add <dll>  :: an older mod's DLL into riftstone\legacy (list, remove <name>)
+Riftstone.cmd loader patches [--json]  :: the last session's patch ledger in words: who changed what, conflicts
 ```
 
 Studio's **Game** tab shows the same: a Live card (memory, frame-time graph, enemies, stage), a Last
@@ -642,6 +646,83 @@ it with the DDO toolkit: `ddon.cmd runtime install --yes` (the owner's step; `re
 hooks; if the client does not start with it, remove it. The DDO toolkit's `Play Solo.cmd` now also
 backs up the characters before and after each session and stops the server when the game closes
 (`<path>`).
+
+## Legacy DLLs and the patch ledger (1.0.6)
+
+The owner's plan named one master `dinput8.dll` that loads `Riftstone.ini`'s plugins and the older mods' DLLs
+(HardPlus, pawnlib, the 2016 dinput8 hooks) "without hook conflicts". Two hooks over the same bytes cannot both run,
+whatever loads them, so the loader does what can be done: it loads them all from one place, in a known order, and
+writes down exactly who changed what, so a conflict is a line in a file instead of a guess.
+
+**Legacy DLLs.** `riftstone\legacy\` holds DLLs written for other loaders. The loader loads every `*.dll` and `*.asi`
+there (in name order) *before* `riftstone\plugins`, so a Riftstone plugin that checks the game's bytes sees what the
+older mod left and refuses rather than writes over it. `Riftstone.cmd loader legacy add <file>` copies one in (with
+an `.ini` of the same name beside it, which such DLLs read from their own folder; a file named like a DLL Windows or
+the game loads, `dinput8.dll`, `d3d9.dll`, `xinput1_3.dll` and the like, is renamed `<name>_legacy.dll`, since the
+copy in `riftstone\legacy` must never be found in its place), `loader legacy remove <name>` takes one out, and
+`[loader] legacy = 0` stops the folder being read. A legacy DLL is a plugin to the stability layer: a fault inside
+it is reported as `fault in legacy DLL <name> (riftstone\legacy)`, the stack marks it `<- legacy <name>`, and two
+start-up crashes in it in a row quarantine it under the name `legacy\<name>` (`loader plugin release legacy\<name>`).
+A DLL that was itself a `dinput8.dll` proxy keeps its exports under the new name; whether one of them works from
+`riftstone\legacy` (it may look for the game's `dinput8.dll` and find the loader) is UNKNOWN until tried, and
+whatever it hooks is in the ledger.
+
+**The patch ledger** (`native/loader/ledger.cpp`). When the loader starts it copies every executable section of the
+game's exe and its import address table (data directory 12) into one buffer (DDDA.exe: 15.6 MB, freed after the
+late scan). After each step of start-up it compares the game with the copy, writes down every run of changed bytes
+(runs closer than 4 equal bytes are one change; an import slot is compared 4 bytes at a time) as that step's, and
+moves the copy on:
+
+1. the loader's own import hooks (`Riftstone loader (its import hooks)`);
+2. each DLL of `riftstone\legacy`, then each of `riftstone\plugins`, as it loads (`legacy\HardPlus.dll`);
+3. the loader's engine fixes (`Riftstone engine fixes`);
+4. a chained dinput8 (`[loader] chain`), when the game first asks for DirectInput.
+
+`[loader] patch_ledger_seconds` (default 60, 2..900) after start a thread compares once more: what changed since
+was done by code running later (a DLL's own thread, an injected overlay, the game itself), so each such change is
+named by where it leads: a written `E8`/`E9` call or jump, an `FF 15`/`FF 25` through a pointer, a `push imm32;
+ret`, following one hop through a trampoline that is in no module, to the module that holds the target
+(`late pawnlib.dll`). A change that leads nowhere known keeps the target `-`.
+
+Two different modules over the same code bytes are a **conflict**: the later one's bytes are what runs, and the
+earlier one's change survives only if the later one copied it into a trampoline of its own (`loader.log`:
+`ledger   CONFLICT at 0x... (N bytes): A changed bytes B had changed; A's are what runs`). An import slot two
+modules hooked is a **chain**, which is normally fine (the later one was handed the earlier one's function to call
+on). A module changing its own earlier change is neither.
+
+The file (`riftstone\logs\patches.txt`, tab-separated, CRLF, written through a `.tmp` file and renamed; once after
+start-up, again after a chained dinput8 and after the late scan):
+
+```
+game      <exe>      0x<base>
+region    <section>  0x<address>  <size>            .text, .bind ... (a second ".text" is ".text~2"), and "imports"
+owner     <n>  <kind>  <module or ->  <name>        kind: game loader legacy plugin fixes chain late
+range     0x<address>  <length>  <owner>  <region>  <leads to or ->  <first 16 bytes before>  <after>
+import    0x<slot>  <owner>  <dll!function>  <leads to or ->  <4 bytes before>  <after>
+conflict  0x<address>  <length>  <first owner>  <later owner>
+chain     0x<slot>  4  <first owner>  <later owner>
+late      <seconds>  <changes>
+end       <ranges>  <imports>  <conflicts>  <chains>  <dropped>
+```
+
+At most 4,096 changes, 160 owners and 256 overlaps are written; past that they are counted (`dropped`). The `end`
+line is written last, so a file without it (or whose counts disagree) was cut short; `Riftstone.cmd loader patches`
+says so. `src/riftstone/patchledger.py` reads it strictly (every field, every owner and region number; fuzz target
+`patch_ledger`), and `doctor` turns a conflict into a problem.
+
+A crash report whose fault is in changed code gets a line `patched by  <owner> (0x<address>, <n> bytes): the game's
+code there was changed (riftstone\logs\patches.txt)` (the last change over that byte), and `Riftstone.cmd crash`
+says it in words: the game did not stop in its own code but in a change a module made to it.
+
+The ledger only reads the game's memory; it writes nothing into it, and `[loader] patch_ledger = 0` switches it off
+(no copy, no file). Proof: the loader harness's `ledger` case (`native/loader/test/run_tests.py --only ledger`):
+a stand-in legacy DLL and plugin (`test/patch_plugin.cpp`) write jumps into a 256-byte code area of the stand-in
+game, two of them over the same bytes, the legacy one again from its own thread half a second later; the file names
+each change's owner and where it leads, the one conflict, the late change and the import chain, reads back through
+`patchledger` to the same ledger, a crash in a plugin's `ud2` names it in `patched by`, a legacy DLL that crashes
+twice is quarantined as `legacy\crash_plugin.asi` and released, and with the switch off no file is written.
+In game: UNKNOWN (what DDDA's SteamStub stub, Steam's overlay or an ENB change after start-up is what the first
+session's late lines will show).
 
 ## The "master plugin" plan, checked against the exe
 

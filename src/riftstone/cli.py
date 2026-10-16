@@ -1272,6 +1272,22 @@ def _doctor_runtime(game: Game, loader_installed: bool, running: bool = False) -
         off = [r["name"] for r in rows if not r["enabled"]]
         if rows:
             ui.ok(f"plugins on: {', '.join(on) or 'none'}" + (f"; off: {', '.join(off)}" if off else ""))
+        legacy = loader_mod.list_legacy(game)
+        if legacy:
+            ui.info(f"legacy DLLs (riftstone\\legacy, loaded before the plugins): {', '.join(legacy)}")
+        from . import patchledger
+        try:
+            led = patchledger.read(game.root)
+        except RiftError as e:
+            led = None
+            ui.warn(f"the last session's patch ledger could not be read: {e}")
+        if led is not None and led.conflicts:
+            problems += 1
+            ui.warn(f"patch ledger: {len(led.conflicts)} place(s) of the game's code changed by two modules, the later "
+                    "one's change running ('riftstone loader patches' names them)")
+        elif led is not None:
+            ui.ok(f"patch ledger: {len(patchledger.by_owner(led))} module(s) changed the game's code or imports, none "
+                  "the same bytes")
     st = runtime.runtime_state(game.root)
     if st["safe_mode"]:
         problems += 1
@@ -1369,6 +1385,38 @@ def cmd_plugins(args) -> int:
         else:
             ui.warn("type a number from the list, A, N, or just press Enter")
         print()
+
+
+def cmd_profile(args) -> int:
+    """riftstone profile: an overhaul profile (riftstone-profile/1) -- which features are on and the settings they
+    carry -- written from this game folder (export) or put into it (import; --dry-run shows what it would do).
+    Riftstone Studio, the exe, reads and writes the same files."""
+    from . import profiles
+
+    game = _game(args)
+    path = Path(args.file)
+    if args.action == "export":
+        profile = profiles.export(game, args.name or path.stem)
+        tmp = path.with_name(path.name + ".riftstone-tmp")
+        tmp.write_bytes(profiles.to_json(profile).encode("utf-8"))
+        os.replace(tmp, path)
+        values = sum(len(k) for s in profile["settings"].values() for k in s.values())
+        ui.ok(f"wrote {path}: {len(profile['features'])} features, {values} settings")
+        return 0
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        raise RiftError(f"cannot read {path}: {e.strerror or e}") from None
+    profile = profiles.parse(raw)
+    res = profiles.apply(game, profile, dry_run=args.dry_run)
+    verb = "would switch" if args.dry_run else "switched"
+    ui.ok(f"{profile['name']}: {verb} {res['switched']} features, {'would set' if args.dry_run else 'set'} "
+          f"{res['set']} settings, {res['unchanged']} already so")
+    for name, section, key, value in res["writes"]:
+        ui.info(f"{name} [{section}] {key} = {value}")
+    for line in res["skipped"]:
+        ui.warn("left out: " + line)
+    return 0
 
 
 def cmd_doctor(args) -> int:
@@ -3572,10 +3620,52 @@ def cmd_loader(args) -> int:
         quarantined = {q.lower() for q in st["quarantine"]}       # the loader keeps unusual names in lower case
         for p in s["plugins"]:
             ui.info(f"plugin: {p}" + ("  (QUARANTINED)" if p.lower() in quarantined else ""))
+        for p in s["legacy"]:
+            ui.info(f"legacy: {p}" + ("  (QUARANTINED)" if f"legacy\\{p}".lower() in quarantined else ""))
         for r in runtime.list_reports(game.state_dir / "logs")[:5]:
             ui.info(f"{r['kind']} report: {r['path']}")
         if s["log"]:
             ui.info(f"log: {s['log']}")
+        return 0
+    if args.action == "patches":
+        from . import patchledger
+        if args.plugin_action or args.file:
+            raise RiftError("'loader patches' takes no more words (--json gives the ledger as JSON)")
+        led = patchledger.read(game.root)
+        if led is None:
+            ui.warn(f"no patch ledger yet: the loader writes {game.state_dir / 'logs' / patchledger.FILE} each time the "
+                    "game starts ([loader] patch_ledger = 1)")
+            return 1
+        if args.json:
+            print(json.dumps(led.as_dict(), indent=1))
+            return 0
+        lines = patchledger.summary(led)
+        ui.ok(lines[0])
+        for line in lines[1:]:
+            (ui.warn if line.startswith("CONFLICT") else ui.info)(line)
+        return 0
+    if args.action == "legacy":
+        if args.plugin_action not in (None, "list", "add", "remove"):
+            raise RiftError(f"'loader legacy {args.plugin_action}': legacy takes list, add <file> or remove <name>")
+        if args.plugin_action in ("add", "remove") and not args.file:
+            raise RiftError(f"name the DLL: riftstone loader legacy {args.plugin_action} "
+                            + ("<.asi or .dll file>" if args.plugin_action == "add" else "<name>"))
+        if args.plugin_action in (None, "list"):
+            names = loader.list_legacy(game)
+            ui.ok(f"{len(names)} legacy DLL(s) in {loader.legacy_dir(game)} (loaded before riftstone\\plugins)")
+            for n in names:
+                ui.info(n)
+        elif args.plugin_action == "add":
+            name = loader.add_legacy(game, Path(args.file))
+            ui.ok(f"Added legacy DLL {name}: the loader brings it in before its plugins and writes down what it "
+                  "changes ('riftstone loader patches' after the game has started)")
+            if name != Path(args.file).name:
+                ui.info(f"kept as {name}: {Path(args.file).name} is the name of a module already in the game")
+            if not game.loader_installed():
+                ui.warn("the loader is not installed yet; run 'riftstone loader install' so it loads")
+        else:
+            loader.remove_legacy(game, args.file)
+            ui.ok(f"Removed legacy DLL {args.file}")
         return 0
     if args.action == "d3d9":
         return _loader_d3d9(game, args)
@@ -4158,6 +4248,8 @@ def cmd_saves(args) -> int:
         return _saves_knowledge(args, game, found, plugin_root)
     if args.action == "arisen":
         return _saves_arisen(args, game, found, plugin_root)
+    if args.action == "pawns":
+        return _saves_pawns(args, game, found, plugin_root)
 
     listed = saves.backups(plugin_root, account=args.account)
 
@@ -4234,15 +4326,17 @@ def cmd_saves(args) -> int:
     return 0
 
 
-def _saves_arisen(args, game, found, plugin_root) -> int:
-    """riftstone saves arisen [--level N --rank N --points N --hp N ... --skills all | --max] [--yes]: the Arisen's
-    level, vocation rank, discipline, stats and skills, in both copies of the player's data the save holds."""
-    from . import install, saves
+def _one_save(found):
     if not found:
         raise RiftError("no DDDA.sav found under Steam's userdata; pass --save <file>")
     if len(found) > 1:
         raise RiftError(f"saves of several accounts ({', '.join(a for a, _ in found)}); choose one with --account")
-    account, save = found[0]
+    return found[0]
+
+
+def _record_edit(args):
+    """The ArisenEdit the record options of `saves arisen` / `saves pawns set` ask for."""
+    from . import saves
     stats: dict[str, float] = {}
     if args.max:   # what the showcase save of 2026-10-06 got; the stats are round numbers, not the game's caps
         args.level, args.rank, args.points, args.skills = saves.LEVEL_MAX, saves.RANK_MAX, 999999, "all"
@@ -4262,9 +4356,13 @@ def _saves_arisen(args, game, found, plugin_root) -> int:
             stats[name] = float(value)
         except ValueError:
             raise RiftError(f"--stat {item}: {value!r} is not a number") from None
-    edit = saves.ArisenEdit(level=args.level, rank=args.rank, points=args.points, stats=stats,
+    return saves.ArisenEdit(level=args.level, rank=args.rank, points=args.points, stats=stats,
                             skills=args.skills == "all", vocation=args.vocation,
-                            weapons=tuple(w.upper() for w in args.weapons or ()))
+                            weapons=tuple(w.upper() for w in args.weapons or ()), job=args.job)
+
+
+def _skill_tables(game, edit):
+    from . import saves
     tables = None
     if game is not None and not game.is_ddo:
         try:
@@ -4276,6 +4374,32 @@ def _saves_arisen(args, game, found, plugin_root) -> int:
     elif edit.skills:
         raise RiftError("the skill tables are read from DDDA.exe, and Dark Arisen was not found "
                         "(pass --game \"C:\\path\\to\\DDDA\")")
+    return tables
+
+
+def _gear_rules(game):
+    """(item number -> mEnableEquipJob, item number -> English name) from the game's item list, else (None, None)."""
+    if game is None or game.is_ddo:
+        return None, None
+    from . import itl, items
+    idx = _index(game, quiet=True)
+    try:
+        lst = items.load_list(game, idx, None)[0]
+        listed = items.listing(game, idx)
+    except (OSError, RiftError) as e:
+        ui.warn(f"the item list could not be read ({e}); gear is not checked")
+        return None, None
+    jobs = {i: itl.BY_NAME["mEnableEquipJob"].get(r) for i, r in enumerate(lst.records)}
+    return jobs, {it.id: it.name for it in listed if it.name}
+
+
+def _saves_arisen(args, game, found, plugin_root) -> int:
+    """riftstone saves arisen [--level N --rank N --points N --hp N ... --skills all | --max] [--yes]: the Arisen's
+    level, vocation rank, discipline, stats and skills, in both copies of the player's data the save holds."""
+    from . import install, saves
+    account, save = _one_save(found)
+    edit = _record_edit(args)
+    tables = _skill_tables(game, edit)
     if edit.empty:
         seen = saves.arisen(save.read_bytes(), tables)
         if args.json:
@@ -4299,13 +4423,92 @@ def _saves_arisen(args, game, found, plugin_root) -> int:
         ui.warn(f"this changes the Arisen's record in {save}, in both copies of the player's data the save holds. "
                 "The save as it is now is kept as a copy first. Run again with --yes to do it.")
         return 1
+    jobs, names = _gear_rules(game) if edit.job is not None else (None, None)
     running = install.game_running(game) if game is not None else False
-    kept, n = saves.set_arisen_file(save, plugin_root, account, edit, tables, game_running=lambda: running)
+    kept, n = saves.set_arisen_file(save, plugin_root, account, edit, tables, game_running=lambda: running,
+                                    equip_jobs=jobs, names=names)
     if not n:
         ui.ok("nothing to change: the record already holds these values")
         return 0
     ui.ok(f"changed {n} values of the Arisen in {save}")
     ui.info(f"the save as it was is kept as {kept} ('riftstone saves restore' puts it back)")
+    ui.info("Not yet seen in game. If Steam reports a cloud conflict when the game starts, keep the files on this PC.")
+    return 0
+
+
+def _saves_pawns(args, game, found, plugin_root) -> int:
+    """riftstone saves pawns [list | clone [--slot 1|2] | set --who W ... | looks --from W --to W | guard] [--yes]:
+    the party in the save (docs/pawn-architect.md)."""
+    from . import install, pawns, saves
+    account, save = _one_save(found)
+    what = args.which or "list"
+    if what not in ("list", "clone", "set", "looks", "guard"):
+        raise RiftError(f"saves pawns {what}: list, clone, set, looks or guard")
+    data = save.read_bytes()
+    if what == "list":
+        seen = pawns.party(data)
+        if args.json:
+            print(json.dumps({"account": account, "save": str(save), "copies": seen}, indent=1))
+            return 0
+        for copy, rows in seen.items():
+            ui.ok(copy)
+            for r in rows:
+                owner = ""
+                if r["who"] != "arisen":
+                    owner = (", yours (a clone of the main pawn)" if r["clone"] else ", yours" if r["owner"] == "you"
+                             else f", {r['owner']}'s (Arisen level {r['owner_level']})")
+                ui.info(f"  {pawns.WHO_NAMES[r['who']]}: {r['name'] or '(no name)'}, level {r['level']}, "
+                        f"{r['vocation']} rank {r['rank']}, {r['gear']} of {saves.EQUIP_SLOTS} items worn{owner}")
+        ui.info("clone the main pawn into the hired slots:  riftstone saves pawns clone --yes   (close the game first)")
+        return 0
+    if what == "guard":
+        jobs, names = _gear_rules(game)
+        found_ = pawns.online_check(data, jobs, names)
+        if args.json:
+            print(json.dumps({"account": account, "save": str(save), "found": found_}, indent=1))
+            return 1 if found_ else 0
+        if not found_:
+            ui.ok("the party holds nothing the game itself would not have made")
+            return 0
+        for f in found_:
+            ui.warn(f)
+        ui.info("Riftstone hides nothing from the game's online checks. Before playing online, put the save a copy "
+                "kept from before these changes back ('riftstone saves list', 'riftstone saves restore N').")
+        return 1
+    if what == "clone":
+        slots = tuple(args.slot or ("1", "2"))
+        change = lambda d: pawns.clone_main(d, slots)
+        told = (f"this puts a copy of your main pawn into hired slot{'s' if len(slots) > 1 else ''} "
+                f"{' and '.join(slots)} of {save}, in both copies of the player's data, over the pawn there")
+    elif what == "looks":
+        if not args.from_ or not args.to:
+            raise RiftError("saves pawns looks --from WHO --to WHO (arisen, main, 1, 2)")
+        change = lambda d: pawns.copy_looks(d, args.from_, args.to)
+        told = (f"this gives {pawns.WHO_NAMES.get(args.to, args.to)} the looks of "
+                f"{pawns.WHO_NAMES.get(args.from_, args.from_)} in {save} (names stay)")
+    else:
+        who = args.who or "main"
+        edit = _record_edit(args)
+        if edit.empty:
+            raise RiftError("saves pawns set --who WHO with --level, --rank, --points, --job, a stat or --skills all")
+        tables = _skill_tables(game, edit)
+        jobs, names = _gear_rules(game) if edit.job is not None else (None, None)
+        change = lambda d: pawns.set_character(d, who, edit, tables, jobs, names)
+        told = f"this changes the record of {pawns.WHO_NAMES.get(who, who)} in {save}, in both copies"
+    change(data)   # refuses now what it would refuse with --yes
+    if not args.yes:
+        ui.warn(told + ". The save as it is now is kept as a copy first. Run again with --yes to do it.")
+        return 1
+    running = install.game_running(game) if game is not None else False
+    kept, n = saves.change_file(save, plugin_root, account, change, game_running=lambda: running)
+    if not n:
+        ui.ok("nothing to change: the save already holds this")
+        return 0
+    ui.ok(f"changed {n} {'records' if what == 'clone' else 'values'} in {save}")
+    ui.info(f"the save as it was is kept as {kept} ('riftstone saves restore' puts it back)")
+    if what == "clone":
+        ui.info("Before playing online: 'riftstone saves pawns guard' says what the party carries that the game "
+                "did not make.")
     ui.info("Not yet seen in game. If Steam reports a cloud conflict when the game starts, keep the files on this PC.")
     return 0
 
@@ -4912,17 +5115,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("action", nargs="?", choices=["list", "on", "off", "menu"],
                    help="list, on <name>, off <name> ('all' for every plugin), or menu (the default in a terminal)")
     p.add_argument("names", nargs="*", metavar="name", help="on / off: the plugins to switch")
+    p = add("profile", cmd_profile, "an overhaul profile: the features that are on and their settings, written to a "
+            "file (export) or put into the game folder (import)")
+    p.add_argument("action", choices=["export", "import"])
+    p.add_argument("file", help="the profile (.json)")
+    p.add_argument("--name", help="export: the profile's name (default: the file's name)")
+    p.add_argument("--dry-run", action="store_true", help="import: say what it would do, change nothing")
     p = add("doctor", cmd_doctor, "check the setup: game, build, loader, installed mods")
     p.add_argument("--verify", action="store_true", help="hash every original archive (takes a minute)")
     p = add("loader", cmd_loader, "the loader (overlay, crash reports, safe mode, plugins): status, install, remove, "
             "plugin, safe-mode")
-    p.add_argument("action", choices=["status", "install", "remove", "plugin", "safe-mode", "d3d9"])
+    p.add_argument("action", choices=["status", "install", "remove", "plugin", "legacy", "patches", "safe-mode",
+                                      "d3d9"])
     p.add_argument("plugin_action", nargs="?", choices=["list", "add", "remove", "release", "status", "off"],
                    help="with 'plugin': list (the default), add <file>, remove <name>, release <name> (from "
-                   "quarantine); with 'safe-mode': status (the default) or off; with 'd3d9': status (the default), add <DXVK release, folder "
+                   "quarantine); with 'legacy' (another mod's DLL, loaded before the plugins): list, add <file>, "
+                   "remove <name>; with 'safe-mode': status (the default) or off; with 'd3d9': status (the default), add <DXVK release, folder "
                    "or x32 d3d9.dll> (into riftstone\\dxvk, named in [d3d9] chain) or off")
     p.add_argument("file", nargs="?", help="the .asi/.dll to add, or the plugin name to remove or release; with "
                    "'d3d9 add': DXVK's release")
+    p.add_argument("--json", action="store_true", help="with 'patches': the patch ledger as JSON")
     p = add("portcrystals", cmd_portcrystals, "the portcrystals plugin's crystals past ten for your save: status, add a "
             "crystal anywhere (a stage and a spot, e.g. a tower's summit), remove one")
     p.add_argument("action", nargs="?", choices=["status", "add", "remove"], default="status")
@@ -4965,12 +5177,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mod", help="guard-mod: the mod folder to write (made if it is not a mod yet)")
     p.add_argument("--json", action="store_true", help="every item as JSON")
     p = add("saves", cmd_saves, "your save: list every copy of it (the loader's and the save_backup plugin's), "
-                                "copy it now, put a copy back, see and raise your main pawn's enemy knowledge, or see and set your "
-                                "Arisen's level, vocation rank, discipline, stats and skills", aliases=("save",))
-    p.add_argument("action", nargs="?", choices=["list", "backup", "restore", "knowledge", "arisen"], default="list")
+                                "copy it now, put a copy back, see and raise your main pawn's enemy knowledge, see and set your "
+                                "Arisen's level, vocation rank, discipline, stats and skills, or the party's pawns (clone "
+                                "the main pawn into the hired slots, set any pawn's record, copy looks)", aliases=("save",))
+    p.add_argument("action", nargs="?", choices=["list", "backup", "restore", "knowledge", "arisen", "pawns"],
+                   default="list")
     p.add_argument("which", nargs="?", help="restore: a copy's number from 'saves list' (1 = the account's newest) "
-                                            "or its name")
-    p.add_argument("--yes", action="store_true", help="with 'restore', 'knowledge --grant' or 'arisen': really do it")
+                                            "or its name; pawns: list (the default), clone, set, looks or guard")
+    p.add_argument("--yes", action="store_true", help="with 'restore', 'knowledge --grant', 'arisen' or "
+                                                      "'pawns clone/set/looks': really do it")
+    p.add_argument("--slot", action="append", choices=["1", "2"],
+                   help="pawns clone: the hired slot to fill (repeat for both; default both)")
+    p.add_argument("--who", choices=["arisen", "main", "1", "2"], help="pawns set: whose record (default main)")
+    p.add_argument("--from", dest="from_", choices=["arisen", "main", "1", "2"], help="pawns looks: whose looks")
+    p.add_argument("--to", choices=["arisen", "main", "1", "2"], help="pawns looks: who gets them")
+    p.add_argument("--job", type=int, help="arisen, pawns set: the vocation to take (1-9; a pawn 1, 2, 3, 7, 8 or 9); "
+                                           "refused while the gear does not allow it")
     p.add_argument("--grant", action="store_true", help="with 'knowledge': raise the main pawn's knowledge "
                                                         "counters to the game's top thresholds")
     p.add_argument("--account", help="the Steam account (its folder under Steam\\userdata) when there are several")

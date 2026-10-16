@@ -306,13 +306,10 @@ def census(game, idx, w: World, rebuild: bool = False) -> dict[int, dict[int, li
             for flag in flags:
                 _add(out, s, flag, what)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"schema": CENSUS_SCHEMA, "signature": sig, "built": time.time(),
-                                   "stages": {str(s): {str(f): v for f, v in sorted(fl.items())}
-                                              for s, fl in sorted(out.items())}}, ensure_ascii=False),
-                       encoding="utf-8")
-        tmp.replace(path)
+        from .index import write_cache
+        write_cache(path, json.dumps({"schema": CENSUS_SCHEMA, "signature": sig, "built": time.time(),
+                                      "stages": {str(s): {str(f): v for f, v in sorted(fl.items())}
+                                                 for s, fl in sorted(out.items())}}, ensure_ascii=False))
     except OSError:
         pass                        # the census is only a cache
     return out

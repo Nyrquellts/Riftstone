@@ -86,6 +86,7 @@ const Want PROFILES[] = {
     {"people", 0, 0, 4, 250, false, false, true},
     {"all", 8, 2, 6, 400, true, true, true},
     {"clamp", 20, 0, 1, 2000, false, false, true},
+    {"owner", 20, 3, 0, 0, true, false, true},   // the owner's draw_distance.ini (2026-10-16): objects at the most, never hidden
     {"zero", 0, 0, 0, 0, false, false, false},
     {"off", 0, 0, 0, 0, false, false, false},
     {"tampered", 0, 0, 0, 0, false, false, false},

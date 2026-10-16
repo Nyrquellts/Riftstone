@@ -196,9 +196,16 @@ then runs the game's own code on fake objects at NORMAL, FAR and FARTHEST: all o
 `uOmSetBase::after`; all of `setRestrictDrawAndMove` and `uOmSetBase::move`'s test with the Arisen
 inside, outside and 1.2 times the game's own radius away, and off the overworld; `uEnemy::setup`'s block
 for a 40 m kind, a never-frozen kind and a placement's own distance; the constructor's default and all
-of `checkMoveMode`; and the grass block, with `xmm0` still 1.0 after it. Seven profiles: the shipped
-ini, two others, clamped and unreadable values, every setting 0, `Enabled = 0`, and one byte of game
-code changed (refused, nothing written): 299 checks pass. `tools\test_all.cmd` runs it.
+of `checkMoveMode`; and the grass block, with `xmm0` still 1.0 after it. Eight profiles: the shipped
+ini, two others, clamped and unreadable values, the owner's own settings (objects x20 and never hidden,
+grass x3), every setting 0, `Enabled = 0`, and one byte of game code changed (refused, nothing written):
+351 checks pass. `tools\test_all.cmd` runs it.
+
+Loaded in the owner's game (2026-10-15 23:28, loader 1.0.3 and the plugin build before 1.0.5): at ViewRange
+FARTHEST with the owner's settings `draw_distance.log` lists the same 8 writes the `owner` profile checks
+(`0x0044D888`/`0x0044D88E`, `0x004387D0`/`0x004387D6`, `0x005038F6`/`0x005038FC`, `0x00C51F09`,
+`0x00C55499`), and the session ran 19 min 31 s at 91.1 fps on average with no crash. That is the game running the
+plugin, not what it shows; the 1.0.5 build (another binary from the same source) passes all 351 checks.
 
 **UNKNOWN until observed in game:** the frame rate and CPU cost of each setting; how the extra objects,
 grass and active enemies look; whether objects outside the loaded cells matter at high `Objects`; that

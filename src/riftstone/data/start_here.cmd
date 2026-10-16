@@ -3,11 +3,15 @@ rem ============================================================================
 rem  Riftstone - Start Here          Riftstone @VERSION@ for Dragon's Dogma: Dark Arisen
 rem
 rem  Double-click this file, in the game folder (the one with DDDA.exe). It needs no Python.
-rem    1  checks that Riftstone loaded in the game, and says what is wrong when it did not
+rem    1  checks that Riftstone loaded in the game, says what is wrong when it did not, and
+rem       fixes what it can (F): another mod's dinput8.dll, a missing or older loader
 rem    2  turns Riftstone's features (plugins) on and off, one at a time
 rem    3  opens the logs folder, to send to whoever is helping you
-rem  From a command line (for support):  "Riftstone - Start Here.cmd" check | list | on NAME | off NAME | logs
+rem  From a command line (for support):
+rem    "Riftstone - Start Here.cmd" check | fix | list | on NAME | off NAME | logs
 rem  Generated when the Riftstone zip was made; it changes nothing in the game's own files.
+rem  Every Windows program it runs is called by its full path in System32, so a PATH another
+rem  program changed (or emptied) does not stop it.
 rem ===========================================================================================
 setlocal EnableExtensions DisableDelayedExpansion
 title Riftstone - Start Here
@@ -18,18 +22,21 @@ set "RS=%GAME%riftstone"
 set "PLUGDIR=%RS%\plugins"
 set "OFFDIR=%RS%\plugins\off"
 set "LOGDIR=%RS%\logs"
+set "SPARE=%RS%\loader\dinput8.dll"
 set "KNOWN=@PLUGIN_NAMES@"
 set "KNOWNSP= %KNOWN% "
 set "CLI=0"
 if not "%~1"=="" set "CLI=1"
 rem The paths above were read while "!" is still an ordinary character, so a game folder with one in its name
 rem works. From here on a path is used as !X!, never %X%: a "!" would be eaten by %X%, a ")" (Program Files
-rem (x86)) would end a parenthesised block early, and a "&" would start another command.
+rem (x86)) would end a parenthesised block early, and a "&" would start another command. Nor is a path ever
+rem passed to "call": call reads its line a second time, and a "%" or "^" in the path would change.
 setlocal EnableDelayedExpansion
 
 if not exist "!GAME!DDDA.exe" goto :wrongplace
 call :upgrade
 if /i "%~1"=="check" goto :cli_check
+if /i "%~1"=="fix" goto :cli_fix
 if /i "%~1"=="list" goto :cli_list
 if /i "%~1"=="on" goto :cli_toggle
 if /i "%~1"=="off" goto :cli_toggle
@@ -53,6 +60,7 @@ exit /b 1
 echo.
 echo   Riftstone - Start Here.cmd            the menu
 echo   Riftstone - Start Here.cmd check      check the setup and print what it finds
+echo   Riftstone - Start Here.cmd fix        fix what the check marks F ^(another mod's dinput8.dll, the loader^)
 echo   Riftstone - Start Here.cmd list       the features and whether each is on
 echo   Riftstone - Start Here.cmd on NAME    turn a feature on  ^(NAME is in the list; "all" for every one^)
 echo   Riftstone - Start Here.cmd off NAME   turn a feature off
@@ -68,23 +76,31 @@ echo   ==============================================================
 echo    Riftstone - Start Here            Dragon's Dogma: Dark Arisen
 echo   ==============================================================
 echo.
-echo     1   Check that Riftstone is working
+echo     1   Check that Riftstone is working ^(and fix it^)
 echo     2   Choose features      ^(turn plugins on or off^)
 echo     3   Open the logs folder ^(to send if something goes wrong^)
 echo     4   Help
 echo     Q   Quit
 echo.
-choice /c 1234Q /n /m "   Press a key: "
-if errorlevel 5 goto :done
-if errorlevel 4 goto :help
-if errorlevel 3 goto :menu_logs
-if errorlevel 2 goto :features
-if errorlevel 1 goto :menu_check
-goto :menu
+call :ask 1234Q "   Press a key: "
+if "!ANSWER!"=="1" goto :menu_check
+if "!ANSWER!"=="2" goto :features
+if "!ANSWER!"=="3" goto :menu_logs
+if "!ANSWER!"=="4" goto :help
+goto :done
 
 :menu_check
 cls
 call :check
+echo.
+if not "!FIXABLE!"=="1" goto :menu_check_end
+call :ask FB "   Press F to fix what is marked F above, or B to go back: "
+if /i not "!ANSWER!"=="F" goto :menu
+echo.
+call :fix
+echo.
+echo   Start the game once, close it, then check again ^(option 1^).
+:menu_check_end
 echo.
 pause
 goto :menu
@@ -105,15 +121,36 @@ echo     They start OFF. Turn on the ones you want with option 2, then start the
 echo   * When the game starts you see a small "RUNNING" notice for a few seconds. That is the
 echo     proof Riftstone is in the game. It also says which key opens the diagnostics panel
 echo     ^(Insert unless you changed it in riftstone_loader.ini^).
-echo   * No notice? Run option 1. It says what is missing.
+echo   * No notice? Run option 1. It says what is missing, and F fixes what it can.
+echo   * Another mod uses dinput8.dll ^(DDDA Tweak, an ASI loader^)? Keep it: option 1, then F,
+echo     renames it dinput8_chain.dll and Riftstone starts it, so both work.
 echo   * To remove Riftstone: delete dinput8.dll, riftstone_loader.ini and the riftstone
-echo     folder from the game folder. The game is as it was.
+echo     folder from the game folder ^(and rename a dinput8_chain.dll back to dinput8.dll^).
+echo     The game is as it was.
 echo.
 echo   Help: the Riftstone page on Nexus Mods ^(comments^), or github.com/Nyrquellts/Riftstone
-echo   When you ask, send the two files option 3 shows: loader.log and the newest crash-*.txt.
+echo   When you ask, send the two files option 3 shows: loader.log and the newest crash-*.txt,
+echo   and what option 1 prints.
 echo.
 pause
 goto :menu
+
+rem -----------------------------------------------------------------------------------------
+rem :ask KEYS "PROMPT"  sets ANSWER to the key pressed, one of KEYS; with choice.exe, or typed and Enter when
+rem Windows has no choice.exe. Empty when nothing was answered (the input ended).
+:ask
+set "ANSWER="
+if not exist "%SYS%\choice.exe" goto :ask_typed
+"%SYS%\choice.exe" /c %~1 /n /m "%~2"
+if errorlevel 255 goto :ask_typed
+set /a "I=!errorlevel!-1"
+set "K=%~1"
+if !I! GEQ 0 if !I! LSS 9 for %%I in (!I!) do set "ANSWER=!K:~%%I,1!"
+exit /b 0
+:ask_typed
+set /p "ANSWER=%~2"
+if defined ANSWER set "ANSWER=!ANSWER:~0,1!"
+exit /b 0
 
 rem -----------------------------------------------------------------------------------------
 :features
@@ -231,6 +268,12 @@ set "RUNNING=0"
 "%SYS%\tasklist.exe" /fi "imagename eq DDDA.exe" 2>nul | "%SYS%\find.exe" /i "DDDA.exe" >nul && set "RUNNING=1"
 exit /b 0
 
+rem :isloader FILE  errorlevel 0 when FILE (a name in the game folder) is a Riftstone loader: it holds the
+rem loader's version tag. Takes a name, not a path (see the top of this file).
+:isloader
+"%SYS%\findstr.exe" /m /c:"RiftstoneLoaderVersion" "!GAME!%~1" >nul 2>&1
+exit /b
+
 rem :upgrade  a zip unzipped over an older Riftstone leaves the old copy of a feature in plugins\ (the one that
 rem runs) and the zip's fresh copy in plugins\off\. Put the fresh build where the old one is: it stays ON, and
 rem the player's own .ini stays. Nothing happens on a first install, or while the game is running.
@@ -260,7 +303,7 @@ if not exist "!LOGDIR!" (
   pause
   exit /b 1
 )
-start "" explorer "!LOGDIR!"
+start "" "%SystemRoot%\explorer.exe" "!LOGDIR!"
 exit /b 0
 
 :logs
@@ -279,86 +322,247 @@ exit /b %errorlevel%
 
 :cli_check
 call :check
+if "!FIXABLE!"=="1" echo   "Riftstone - Start Here.cmd" fix  fixes what is marked F.
 exit /b %BAD%
 
+:cli_fix
+call :fix
+exit /b %errorlevel%
+
 rem -----------------------------------------------------------------------------------------
-rem :check  what is where, and what the last game session's log says
+rem :fix  what the check marks F. Another mod's dinput8.dll becomes dinput8_chain.dll, which the loader starts
+rem (riftstone_loader.ini need not name it); a missing loader, or one of another build, is replaced by this zip's
+rem spare copy (riftstone\loader\dinput8.dll); a Riftstone loader kept as dinput8_chain.dll, which the loader never
+rem starts, is renamed aside. Nothing is deleted. Never while the game runs.
+:fix
+call :isrunning
+if "%RUNNING%"=="1" (
+  echo   The game is running. Close it first.
+  exit /b 2
+)
+set "FIXED=0"
+if not exist "!GAME!dinput8_chain.dll" goto :fix_main
+call :isloader dinput8_chain.dll
+if errorlevel 1 goto :fix_main
+move /y "!GAME!dinput8_chain.dll" "!GAME!dinput8_chain.dll.riftstone-old" >nul
+if errorlevel 1 (
+  echo   Could not rename dinput8_chain.dll. Is the game or another program using it?
+  exit /b 4
+)
+echo   dinput8_chain.dll was a Riftstone loader, not another mod's: it is now dinput8_chain.dll.riftstone-old.
+set "FIXED=1"
+:fix_main
+if exist "!SPARE!" goto :fix_have
+echo   riftstone\loader\dinput8.dll, this zip's spare copy of the loader, is not here: unzip the whole
+echo   Riftstone zip into the game folder again ^(keep your own dinput8.dll if Windows asks^), then fix again.
+exit /b 5
+:fix_have
+if not exist "!GAME!dinput8.dll" goto :fix_put
+call :isloader dinput8.dll
+if not errorlevel 1 goto :fix_ours
+if not exist "!GAME!dinput8_chain.dll" goto :fix_rename
+echo   The dinput8.dll here is another mod's, and a dinput8_chain.dll is here too, so neither can be
+echo   renamed safely. Move one of them out of the game folder, then fix again.
+exit /b 6
+:fix_rename
+move /y "!GAME!dinput8.dll" "!GAME!dinput8_chain.dll" >nul
+if errorlevel 1 (
+  echo   Could not rename dinput8.dll. Is the game or another program using it?
+  exit /b 4
+)
+echo   The other mod's dinput8.dll is now dinput8_chain.dll. Riftstone starts it, so it keeps working.
+goto :fix_put
+:fix_ours
+"%SYS%\fc.exe" /b "!SPARE!" "!GAME!dinput8.dll" >nul 2>&1
+if errorlevel 1 goto :fix_put
+if "!FIXED!"=="0" echo   Nothing to fix: dinput8.dll is already this zip's Riftstone loader.
+exit /b 0
+:fix_put
+copy /y "!SPARE!" "!GAME!dinput8.dll" >nul
+if errorlevel 1 (
+  echo   Could not copy the loader in. Is the game running, or did Windows Security take the file away?
+  exit /b 4
+)
+if not exist "!GAME!dinput8.dll" (
+  echo   The loader was copied in and is gone again: Windows Security probably took it. Open Windows
+  echo   Security, Virus and threat protection, Protection history.
+  exit /b 4
+)
+echo   dinput8.dll is now this zip's Riftstone loader.
+exit /b 0
+
+rem -----------------------------------------------------------------------------------------
+rem :check  what is where, and what the last game session's log says; FIXABLE=1 when :fix has something to do
 :check
 set "BAD=0"
+set "FIXABLE=0"
 echo.
-echo   Riftstone check
+echo   Riftstone check                       this file: Riftstone @VERSION@
 echo   Game folder: !GAME!
 echo.
 if not exist "!GAME!dinput8.dll" goto :c_nodll
-findstr /m /c:"RiftstoneLoaderVersion" "!GAME!dinput8.dll" >nul 2>&1
+call :isloader dinput8.dll
 if errorlevel 1 goto :c_otherdll
+if not exist "!SPARE!" goto :c_ours
+"%SYS%\fc.exe" /b "!SPARE!" "!GAME!dinput8.dll" >nul 2>&1
+if errorlevel 1 goto :c_olddll
+:c_ours
 echo   [OK]  dinput8.dll here is the Riftstone loader.
-goto :c_ini
+goto :c_chain
+:c_olddll
+echo   [X]   dinput8.dll here is a Riftstone loader, but not this zip's: an older one was kept when the
+echo         zip was unzipped, so this zip's features may not work with it.                       F fixes it.
+set /a BAD+=1
+set "FIXABLE=1"
+goto :c_chain
 :c_nodll
 echo   [X]   dinput8.dll is not in the game folder, so Riftstone cannot load.
-echo         Unzip everything from the Riftstone zip into the folder that has DDDA.exe.
+if exist "!SPARE!" (
+  echo         This zip's copy of it is in riftstone\loader.                                          F fixes it.
+  set "FIXABLE=1"
+) else (
+  echo         Unzip everything from the Riftstone zip into the folder that has DDDA.exe.
+)
+echo         Copied it and it is gone again? Windows Security may have taken it: open Windows Security,
+echo         Virus and threat protection, Protection history.
 set /a BAD+=1
-goto :c_ini
+goto :c_chain
 :c_otherdll
-echo   [X]   The dinput8.dll here is not Riftstone's; another mod uses that name.
-echo         Rename it dinput8_chain.dll, then copy Riftstone's dinput8.dll from the zip in beside
-echo         it. Open riftstone_loader.ini and, under [loader], change the line  chain =
-echo         to  chain = dinput8_chain.dll  and save: both keep working ^(the README has the steps^).
+echo   [X]   The dinput8.dll here is another mod's ^(DDDA Tweak, an ASI loader...^), so Riftstone cannot load.
+if exist "!GAME!dinput8_chain.dll" (
+  echo         A dinput8_chain.dll is here too: move one of the two out of the game folder, then check again.
+) else if exist "!SPARE!" (
+  echo         F renames it dinput8_chain.dll and puts Riftstone's loader in; Riftstone then starts the
+  echo         other mod too, so both keep working.                                                  F fixes it.
+  set "FIXABLE=1"
+) else (
+  echo         Rename it dinput8_chain.dll, then copy Riftstone's dinput8.dll from the zip in beside it:
+  echo         Riftstone starts the other mod too, so both keep working.
+)
 set /a BAD+=1
+:c_chain
+if not exist "!GAME!dinput8_chain.dll" goto :c_ini
+call :isloader dinput8_chain.dll
+if errorlevel 1 (
+  echo   [i]   dinput8_chain.dll is here: Riftstone's loader starts it, so that mod keeps working.
+) else (
+  echo   [X]   dinput8_chain.dll is a Riftstone loader, not another mod's: it is never started.     F fixes it.
+  set /a BAD+=1
+  set "FIXABLE=1"
+)
 :c_ini
 if exist "!GAME!riftstone_loader.ini" (echo   [OK]  riftstone_loader.ini is here.) else (
   echo   [X]   riftstone_loader.ini is missing: copy it from the Riftstone zip, next to DDDA.exe.
   set /a BAD+=1
 )
-if exist "!RS!" (echo   [OK]  the riftstone folder is here.) else (
+if not exist "!RS!" (
   echo   [X]   the riftstone folder is missing: copy it from the Riftstone zip, next to DDDA.exe.
+  set /a BAD+=1
+  goto :c_others
+)
+echo   [OK]  the riftstone folder is here.
+set "WT=!RS!\riftstone-write-test.tmp"
+(echo test>"!WT!") >nul 2>&1
+if exist "!WT!" (
+  del /q "!WT!" >nul 2>&1
+) else (
+  echo   [X]   Windows does not let you write in the riftstone folder, so Riftstone cannot write its log
+  echo         and option 2 cannot switch features. Run the game and this file as the Windows user that
+  echo         installed the game, or move the game to a library outside protected folders.
+  set /a BAD+=1
+)
+set "NON=0"
+set "NOFF=0"
+set "ONLIST="
+for %%P in (%KNOWN%) do (
+  if exist "!PLUGDIR!\%%P.asi" (
+    set /a NON+=1
+    set "ONLIST=!ONLIST! %%P"
+  ) else if exist "!OFFDIR!\%%P.asi" set /a NOFF+=1
+)
+if "!NON!"=="0" (
+  echo   [i]   Every Riftstone feature is OFF, so the game plays as it always did ^(Riftstone itself still
+  echo         runs: crash guards, crash reports^). Option 2 turns on the ones you want.
+) else (
+  echo   [i]   Features ON:!ONLIST!
+  if not "!NOFF!"=="0" echo         !NOFF! more are OFF: they change nothing in the game until option 2 turns them on.
+)
+:c_others
+for %%P in (%KNOWN%) do for %%D in ("" "scripts\" "plugins\") do if exist "!GAME!%%~D%%P.asi" (
+  echo   [X]   %%~D%%P.asi is outside riftstone\plugins: Riftstone never loads it there, but another ASI
+  echo         loader would, a second time. Delete that copy; Riftstone's own is in riftstone\plugins.
   set /a BAD+=1
 )
 for %%D in (d3d9 xinput1_3 winmm version dsound) do if exist "!GAME!%%D.dll" echo   [i]   %%D.dll is also here: another tool's; that is usually fine.
-if exist "!GAME!dinput8.dll.riftstone-off" echo   [i]   a dinput8.dll.riftstone-off file is here: Riftstone was switched off by hand.
+if exist "!GAME!riftstone_loader.dll" echo   [i]   riftstone_loader.dll is also here: the loader for other loaders. Only one Riftstone loader runs.
 echo.
 if not exist "!LOGDIR!\loader.log" goto :c_nolog
 rem loader.log holds one session (the last one moves to loader.prev.log), so it has one start line. findstr prints it
 rem as it is: a game folder named with "!" or "&" is in that line, and echoing it here would mangle or run it.
-findstr /r /c:"Riftstone loader [0-9]" "!LOGDIR!\loader.log" >nul 2>&1
+"%SYS%\findstr.exe" /r /c:"Riftstone loader [0-9]" "!LOGDIR!\loader.log" >nul 2>&1
 if errorlevel 1 goto :c_nostart
 <nul set /p "=  [OK]  The game started with Riftstone: "
-findstr /r /c:"Riftstone loader [0-9]" "!LOGDIR!\loader.log"
+"%SYS%\findstr.exe" /r /c:"Riftstone loader [0-9]" "!LOGDIR!\loader.log"
 goto :c_started
 :c_nostart
 echo   [i]   loader.log exists but has no start line yet.
 :c_started
 set "NPLUG=0"
-for /f %%N in ('findstr /r /c:"plugin   .* loaded at" "!LOGDIR!\loader.log" ^| "%SYS%\find.exe" /c /v ""') do set "NPLUG=%%N"
+rem for /f runs its command through "cmd /c", which drops the first and last quote of a line that starts with one;
+rem "type" first keeps the full paths' quotes whole.
+for /f %%N in ('type "!LOGDIR!\loader.log" ^| "%SYS%\findstr.exe" /r /c:"plugin   .* loaded at" ^| "%SYS%\find.exe" /c /v ""') do set "NPLUG=%%N"
 echo   [i]   Plugins that loaded last time: %NPLUG%   ^(option 2 turns them on and off^)
-findstr /r /c:"plugin   .* FAILED to load" "!LOGDIR!\loader.log" >nul 2>&1
+"%SYS%\findstr.exe" /r /c:"plugin   .* FAILED to load" "!LOGDIR!\loader.log" >nul 2>&1
 if not errorlevel 1 (
   echo   [X]   A plugin failed to load:
-  findstr /r /c:"plugin   .* FAILED to load" "!LOGDIR!\loader.log"
+  "%SYS%\findstr.exe" /r /c:"plugin   .* FAILED to load" "!LOGDIR!\loader.log"
   set /a BAD+=1
 )
-findstr /i /c:"safe mode" "!LOGDIR!\loader.log" >nul 2>&1
+"%SYS%\findstr.exe" /c:"chain    " "!LOGDIR!\loader.log" >nul 2>&1
+if errorlevel 1 goto :c_safe
+rem Every way the chain is not started ends its line with "using the system dinput8".
+"%SYS%\findstr.exe" /c:"using the system dinput8" "!LOGDIR!\loader.log" >nul 2>&1
+if errorlevel 1 (
+  echo   [OK]  Another mod's dinput8 started with Riftstone:
+) else (
+  echo   [X]   Another mod's dinput8 did not start:
+  set /a BAD+=1
+)
+"%SYS%\findstr.exe" /c:"chain    " "!LOGDIR!\loader.log"
+:c_safe
+"%SYS%\findstr.exe" /c:"another Riftstone loader is in the game" "!LOGDIR!\loader.log" >nul 2>&1
 if not errorlevel 1 (
-  echo   [X]   Safe mode was on: after two start-up crashes in a row the game starts without plugins
-  echo         until something changes. Send us loader.log and the newest crash-*.txt ^(option 3^).
+  echo   [X]   Two Riftstone loaders were in the game; keep one:
+  "%SYS%\findstr.exe" /c:"another Riftstone loader is in the game" "!LOGDIR!\loader.log"
   set /a BAD+=1
 )
-findstr /c:"last run ended in a crash" "!LOGDIR!\loader.log" >nul 2>&1
+rem "SAFE MODE:" (in capitals) is written only while safe mode is on; the words in small letters are also in the
+rem line saying it ended ("... since safe mode began; they are back on").
+"%SYS%\findstr.exe" /c:"SAFE MODE:" "!LOGDIR!\loader.log" >nul 2>&1
+if not errorlevel 1 (
+  echo   [X]   Safe mode was on: after two start-up crashes in a row the game started without plugins.
+  echo         Switching a feature with option 2 ends it. If it comes back, send us loader.log and the
+  echo         newest crash-*.txt ^(option 3^).
+  set /a BAD+=1
+)
+"%SYS%\findstr.exe" /c:"last run ended in a crash" "!LOGDIR!\loader.log" >nul 2>&1
 if not errorlevel 1 echo   [i]   The run before that ended in a crash; the report is in the logs folder.
-findstr /c:"shows the diagnostics panel" "!LOGDIR!\loader.log" >nul 2>&1
+"%SYS%\findstr.exe" /c:"shows the diagnostics panel" "!LOGDIR!\loader.log" >nul 2>&1
 if errorlevel 1 (
   echo   [i]   The panel was not announced in the log: it starts once the game's graphics are up.
 ) else (
-  for /f "usebackq delims=" %%L in (`findstr /c:"shows the diagnostics panel" "!LOGDIR!\loader.log"`) do echo   [OK]  %%L
+  for /f "usebackq delims=" %%L in (`type "!LOGDIR!\loader.log" ^| "%SYS%\findstr.exe" /c:"shows the diagnostics panel"`) do echo   [OK]  %%L
 )
-findstr /c:"startup banner shown" "!LOGDIR!\loader.log" >nul 2>&1
+"%SYS%\findstr.exe" /c:"startup banner shown" "!LOGDIR!\loader.log" >nul 2>&1
 if not errorlevel 1 echo   [OK]  The RUNNING notice was drawn in the game.
-findstr /c:"pressed with the game in front" "!LOGDIR!\loader.log" >nul 2>&1
+"%SYS%\findstr.exe" /c:"pressed with the game in front" "!LOGDIR!\loader.log" >nul 2>&1
 if not errorlevel 1 echo   [OK]  The panel key reached the game.
 goto :c_reports
 :c_nolog
 echo   [i]   No log yet: the game has not been started with Riftstone in this folder.
 echo         Start the game, wait for the title screen, close it, then run this check again.
+echo         Started it and still no log? Then Riftstone did not load: check that Steam starts the game
+echo         from this folder ^(Manage, Browse local files^) and Windows Security's Protection history.
 :c_reports
 set "NREP=0"
 for %%R in ("!LOGDIR!\crash-*.txt") do set /a NREP+=1

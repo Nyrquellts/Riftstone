@@ -722,6 +722,17 @@ class LoaderSettingsTest(unittest.TestCase):
         self.assertIn("; overlay", text)                               # the template's notes stay
         self.assertEqual(text.count("[loader]"), 1)
 
+    def test_owner_keys_keep_their_spelling(self):
+        """portcrystals.ini's [names] keys are a position's float bits in hex, written in capitals: an update keeps
+        them (and a section only the owner has) as the owner wrote them, not lower-cased."""
+        tmpl = "; slots\n[portcrystals]\nslots = 10\n\n[names]\n"
+        old = "[portcrystals]\nSlots = 15\n\n[names]\n44C06000,45747800,44C72000 = 277\n[My Own]\nKey = 1\n"
+        text = loader.merge_ini(tmpl, old)
+        self.assertIn("44C06000,45747800,44C72000 = 277", text)
+        self.assertIn("[My Own]\nKey = 1", text)
+        self.assertIn("slots = 15", text)                              # a key the template has: its spelling
+        self.assertEqual(loader._ini_values(text), loader._ini_values(old))
+
     def test_fresh_install_is_the_template(self):
         text = loader.merge_ini(self.TEMPLATE, "", {"loader": {"chain": ""}})
         self.assertEqual(loader._ini_values(text), loader._ini_values(self.TEMPLATE))

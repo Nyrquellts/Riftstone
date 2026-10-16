@@ -32,6 +32,7 @@
 
 #include "runtime.h"
 #include <unknwn.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -399,10 +400,56 @@ static void EnsureHooks(const wchar_t* when) {
     }
 }
 
+// True when the file holds the loader's version tag: a Riftstone loader (an older one, or a copy of this one).
+// Read, never loaded: a loader without the one-loader check (Init) would hook the game a second time.
+static BOOL IsRiftstoneLoaderFile(const wchar_t* path) {
+    HANDLE f = Real_CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    static const char tag[] = "RiftstoneLoaderVersion";
+    const DWORD len = sizeof tag - 1;
+    BOOL found = FALSE;
+    LARGE_INTEGER size;
+    if (GetFileSizeEx(f, &size) && size.QuadPart >= len && size.QuadPart <= (64 << 20)) {
+        DWORD n = (DWORD)size.QuadPart, got = 0;
+        char* buf = (char*)HeapAlloc(GetProcessHeap(), 0, n);
+        if (buf) {
+            if (ReadFile(f, buf, n, &got, NULL))
+                for (DWORD i = 0; i + len <= got && !found; i++)
+                    found = buf[i] == tag[0] && memcmp(buf + i, tag, len) == 0;
+            HeapFree(GetProcessHeap(), 0, buf);
+        }
+    }
+    CloseHandle(f);
+    return found;
+}
+
+// Another Riftstone loader in the game (the add-on behind a chained DDDA Tweak, a copy in riftstone\legacy),
+// named once in the log.  One with the one-loader check stands aside by itself (Init); an older one does not.
+static void NoteOtherLoaders() {
+    static HMODULE noted[8];
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W me = {sizeof me};
+    for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
+        typedef const char* (*Version_t)();
+        Version_t version = me.hModule == g_self ? NULL : (Version_t)GetProcAddress(me.hModule, "RiftstoneLoaderVersion");
+        if (!version) continue;
+        size_t i = 0;
+        while (i < _countof(noted) && noted[i] && noted[i] != me.hModule) i++;
+        if (i == _countof(noted) || noted[i]) continue;
+        noted[i] = me.hModule;
+        LogLine(L"loader   another Riftstone loader is in the game too: %s (%S). Keep one: one with this check stands "
+                L"aside by itself, an older one hooks the game a second time", me.szExePath, version());
+    }
+    CloseHandle(snap);
+}
+
 static DWORD WINAPI Watchdog(LPVOID) {
     for (unsigned i = 0;; i++) {
         Sleep(50);
         if (i < 400) EnsureHooks(L"during start-up");      // the first 20 seconds of the process
+        if (i < 400 && i % 20 == 19) NoteOtherLoaders();   // one another mod loads later, once a second
         if (!SessionWatchTick() && i >= 400) return 0;      // what closes the game (session.cpp)
     }
 }
@@ -418,19 +465,31 @@ static void DescribeError(DWORD err, wchar_t* out, DWORD cap) {
         if (*p == L'\r' || *p == L'\n') *p = L' ';
 }
 
-// Load native plugins from <game>\riftstone\plugins: *.asi and *.dll.  They hook the game
-// themselves from their own DllMain; Riftstone only brings them into the process, in name
-// order, and logs each result.  A plugin that fails to load is skipped, not fatal; one that
-// crashed the game's start-up twice is skipped until its file changes (stability.cpp).
-static void LoadPlugins() {
-    if (!g_plugins) {
-        LogLine(L"plugins  switched off in riftstone_loader.ini");
-        return;
+// The loader's own file name (dinput8.dll, or riftstone_loader.dll behind another proxy).
+static const wchar_t* SelfName() {
+    static wchar_t name[MAX_PATH];
+    if (!name[0]) {
+        wchar_t path[MAX_PATH];
+        GetModuleFileNameW(g_self, path, MAX_PATH);
+        const wchar_t* slash = wcsrchr(path, L'\\');
+        wcsncpy_s(name, MAX_PATH, slash ? slash + 1 : path, _TRUNCATE);
     }
+    return name;
+}
+
+// Load native DLLs from <game>\riftstone\<folder>: *.asi and *.dll.  They hook the game
+// themselves from their own DllMain; Riftstone only brings them into the process, in name
+// order, and logs each result.  A DLL that fails to load is skipped, not fatal; one that
+// crashed the game's start-up twice is skipped until its file changes (stability.cpp).
+// riftstone\legacy holds other people's DLLs (an old dinput8 hook renamed, HardPlus.dll, pawnlib.dll): loaded
+// first, so Riftstone's own plugins, which check every byte before they change it, find their changes and refuse
+// where they would overwrite them; the ledger (ledger.cpp) writes down what each one changed.
+static void LoadFolder(const wchar_t* folder, BOOL legacy) {
+    const wchar_t* what = legacy ? L"legacy " : L"plugin ";
     wchar_t dir[MAX_PATH];
-    _snwprintf_s(dir, _countof(dir), _TRUNCATE, L"%s\\plugins", g_stateDir);
+    _snwprintf_s(dir, _countof(dir), _TRUNCATE, L"%s\\%s", g_stateDir, folder);
     if (Real_GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) {
-        LogLine(L"plugins  %s absent (none to load)", dir);
+        LogLine(L"%-8s %s absent (none to load)", legacy ? L"legacy" : L"plugins", dir);
         return;
     }
     // Collect names first so load order is deterministic (FindFirstFile order is not).
@@ -456,14 +515,27 @@ static void LoadPlugins() {
         while (j >= 0 && _wcsicmp(names[j], key) > 0) { wcscpy_s(names[j + 1], MAX_PATH, names[j]); j--; }
         wcscpy_s(names[j + 1], MAX_PATH, key);
     }
-    LogLine(L"plugins  %d found in %s", n, dir);
+    LogLine(L"%-8s %d found in %s", legacy ? L"legacy" : L"plugins", n, dir);
     for (int i = 0; i < n; i++) {
-        wchar_t full[MAX_PATH];
+        if (g_pluginCount >= MAX_PLUGINS) {
+            LogLine(L"%s  %s and the rest not loaded: %d DLLs is the most the loader keeps", what, names[i], MAX_PLUGINS);
+            break;
+        }
+        wchar_t full[MAX_PATH], shown[MAX_PATH];
         _snwprintf_s(full, _countof(full), _TRUNCATE, L"%s\\%s", dir, names[i]);
+        _snwprintf_s(shown, _countof(shown), _TRUNCATE, L"%s\\%s", folder, names[i]);
         PluginInfo& p = g_pluginInfo[g_pluginCount++];
         wcscpy_s(p.name, MAX_PATH, names[i]);
-        if (!PluginAllowed(names[i], full)) {
+        p.legacy = legacy;
+        // Quarantine is kept by name: a legacy DLL's is "legacy\<name>", so it never shares a plugin's.
+        if (!PluginAllowed(legacy ? shown : names[i], full)) {
             p.state = SafeModeActive() ? -2 : -1;
+            continue;
+        }
+        if (IsRiftstoneLoaderFile(full)) {         // a loader copied in as a plugin would hook the game twice
+            p.state = 0;
+            LogLine(L"%s  %s FAILED to load: it is a Riftstone loader, not a plugin (two loaders would hook the game "
+                    L"twice); delete it", what, names[i]);
             continue;
         }
         HMODULE m = LoadLibraryW(full);
@@ -472,16 +544,27 @@ static void LoadPlugins() {
             p.state = 1;
             IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)m + ((IMAGE_DOS_HEADER*)m)->e_lfanew);
             p.size = nt->OptionalHeader.SizeOfImage;
-            LogLine(L"plugin   %s loaded at 0x%p", names[i], m);
+            LogLine(L"%s  %s loaded at 0x%p", what, names[i], m);
         } else {
             wchar_t why[256];
             DWORD err = GetLastError();
             DescribeError(err, why, _countof(why));
             p.state = 0;
-            LogLine(L"plugin   %s FAILED to load: %s%s", names[i], why,
+            LogLine(L"%s  %s FAILED to load: %s%s", what, names[i], why,
                     err == ERROR_MOD_NOT_FOUND ? L" (a DLL it needs is missing, e.g. a Visual C++ runtime)" : L"");
         }
+        LedgerStep(legacy ? "legacy" : "plugin", names[i], shown);
     }
+}
+
+static void LoadPlugins() {
+    if (!g_plugins) {
+        LogLine(L"plugins  switched off in riftstone_loader.ini");
+        return;
+    }
+    if (IniInt(L"loader", L"legacy", 1)) LoadFolder(L"legacy", TRUE);
+    else LogLine(L"legacy   switched off in riftstone_loader.ini (riftstone\\legacy is not loaded)");
+    LoadFolder(L"plugins", FALSE);
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +585,12 @@ static void OpenLog() {
     g_log = Real_CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS,
                              FILE_ATTRIBUTE_NORMAL, NULL);
 }
+
+#ifndef RIFTSTONE_NO_PROXY
+static void ChainStart();
+#else
+static void ChainStart() {}                    // the add-on build: the proxy in front of it has its own chain
+#endif
 
 static void Init() {
     InitializeCriticalSection(&g_hookLock);
@@ -539,6 +628,16 @@ static void Init() {
         // DirectInput through and touch nothing else, not even the game's log.
         return;
     }
+    // One Riftstone loader a game: a second one (the add-on behind a chained DDDA Tweak, a copy in
+    // riftstone\legacy) stands aside, as in another program, so nothing is hooked or loaded twice.  The first
+    // keeps the mark for the life of the process and names the second in its log (NoteOtherLoaders).
+    wchar_t mark[64];
+    _snwprintf_s(mark, _countof(mark), _TRUNCATE, L"Local\\RiftstoneLoader-%lu", GetCurrentProcessId());
+    HANDLE once = CreateEventW(NULL, TRUE, FALSE, mark);
+    if (once && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(once);
+        return;
+    }
     g_active = TRUE;
     CreateDirectoryW(g_stateDir, NULL);
     CreateDirectoryW(g_logDir, NULL);
@@ -561,6 +660,7 @@ static void Init() {
     if (!OverlayAllowed()) g_overlay = FALSE;
     LogLine(L"settings overlay=%d log_redirects=%d plugins=%d", g_overlay, g_logRedirects, g_plugins);
 
+    LedgerBegin();                             // before anything changes the game's code or imports
     HookImport("KERNEL32.dll", "CreateFileW", (void*)Hook_CreateFileW, (void**)&Real_CreateFileW);
     HookImport("KERNEL32.dll", "CreateFileA", (void*)Hook_CreateFileA, (void**)&Real_CreateFileA);
     HookImport("KERNEL32.dll", "GetFileAttributesW", (void*)Hook_GetFileAttributesW, (void**)&Real_GetFileAttributesW);
@@ -569,13 +669,19 @@ static void Init() {
     CrashFilterInstall();
     FixesInstallHooks();                       // window fixes
     LiveInstallHooks();                        // Direct3DCreate9 -> frame timing
+    LedgerStep("loader", SelfName(), L"Riftstone loader (its import hooks)");
 
     DWORD attrs = Real_GetFileAttributesW(g_overlayRoot);
     LogLine(L"overlay  %s %s", g_overlayRoot,
             !g_overlay ? L"off" : attrs != INVALID_FILE_ATTRIBUTES ? L"present" : L"absent (nothing to serve)");
     BackupSaves();                             // before the game reads its save
+    ChainStart();                              // another mod's dinput8, where the game would have loaded it
     LoadPlugins();
+    NoteOtherLoaders();
     FixesApplyPatches();                       // after plugins, so a plugin's own checks see the vanilla bytes
+    LedgerStep("fixes", SelfName(), L"Riftstone engine fixes");
+    LedgerWrite();
+    LedgerStartLate();
     LiveStart();
     HANDLE t = CreateThread(NULL, 0, Watchdog, NULL, 0, NULL);
     if (t) CloseHandle(t);
@@ -591,15 +697,38 @@ extern "C" __declspec(dllexport) const char* RiftstoneLoaderVersion() {
 typedef HRESULT(WINAPI* DirectInput8Create_t)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD version, REFIID riid, LPVOID* out, LPUNKNOWN outer);
 
-// The DirectInput8Create a chained dinput8 named in [loader] chain offers, or NULL.  One that is the loader
-// itself (chain = dinput8.dll, the proxy's own name) or leads back to it (an export forwarded to
-// dinput8.DirectInput8Create, which is this module) is refused: DirectInput8Create would call itself for ever.
+static DirectInput8Create_t g_chained = NULL;
+static BOOL g_chainTried = FALSE;
+
+// The DirectInput8Create a chained dinput8 offers, or NULL: the one [loader] chain names, else dinput8_chain.dll
+// beside the game (the name `loader install` and the README give another mod's dinput8.dll), so an ini replaced
+// by an update or by hand does not drop the other mod.  One that is the loader itself (chain = dinput8.dll, the
+// proxy's own name) or leads back to it (an export forwarded to dinput8.DirectInput8Create, which is this module)
+// is refused: DirectInput8Create would call itself for ever.  So is another Riftstone loader, read before it is
+// loaded.  Called once: at start-up in the game, so the other mod starts where it would have without Riftstone,
+// else at the first DirectInput8Create.
 static DirectInput8Create_t ChainedDirectInput() {
+    if (g_chainTried) return g_chained;
+    g_chainTried = TRUE;
     wchar_t chain[MAX_PATH] = L"";
     IniStr(L"loader", L"chain", L"", chain, MAX_PATH);
-    if (!chain[0]) return NULL;
+    BOOL named = chain[0] != 0;
+    if (!named) {
+        wchar_t beside[MAX_PATH];
+        _snwprintf_s(beside, _countof(beside), _TRUNCATE, L"%s\\dinput8_chain.dll", g_root);
+        DWORD attrs = Real_GetFileAttributesW(beside);
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return NULL;
+        wcscpy_s(chain, L"dinput8_chain.dll");
+    }
     wchar_t full[MAX_PATH];
     _snwprintf_s(full, _countof(full), _TRUNCATE, L"%s\\%s", g_root, chain);
+    if (!named) LogLine(L"chain    %s is beside the game and riftstone_loader.ini names no chain: chaining it", full);
+    if (GetModuleHandleW(full) != g_self && IsRiftstoneLoaderFile(full)) {
+        LogLine(L"chain    %s is another Riftstone loader, not another mod: not loaded (two loaders would hook the game "
+                L"twice); using the system dinput8. Delete it, or rename the other mod's dinput8.dll to that name",
+                full);
+        return NULL;
+    }
     HMODULE lib = LoadLibraryW(full);
     if (!lib) {
         LogLine(L"chain    %s could not be loaded; using the system dinput8", full);
@@ -613,14 +742,23 @@ static DirectInput8Create_t ChainedDirectInput() {
         return NULL;
     }
     LogLine(L"chain    %s %s", full, found ? L"loaded" : L"has no DirectInput8Create; using the system dinput8");
+    wchar_t shown[MAX_PATH];
+    _snwprintf_s(shown, _countof(shown), _TRUNCATE, L"chain %s", chain);
+    const wchar_t* base = wcsrchr(chain, L'\\');
+    LedgerStep("chain", base ? base + 1 : chain, shown);
+    LedgerWrite();
+    g_chained = found;
     return found;
 }
+
+static void ChainStart() { ChainedDirectInput(); }
 
 extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD version, REFIID riid, LPVOID* out, LPUNKNOWN outer) {
     static DirectInput8Create_t real = NULL;
     EnsureHooks(L"before input start-up");
+    if (g_active) NoteOtherLoaders();           // one another mod loaded since start-up
     if (!real) {
-        // A chained dinput8 (e.g. DDDA Tweak renamed to dinput8_tweak.dll) gets the call first.
+        // A chained dinput8 (e.g. DDDA Tweak renamed to dinput8_chain.dll) gets the call first.
         DirectInput8Create_t found = ChainedDirectInput();
         if (!found) {
             wchar_t sys[MAX_PATH];

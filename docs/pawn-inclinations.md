@@ -136,8 +136,9 @@ riftstone loader install
 riftstone loader plugin add native\plugins\inclination_lock\out\inclination_lock.asi
 ```
 
-`plugin add` also copies `inclination_lock.ini` the first time and keeps the owner's copy on later
-updates. Removal: `riftstone loader plugin remove inclination_lock.asi`.
+`plugin add` also copies `inclination_lock.ini` the first time; a later update keeps the owner's values
+and adds any setting new in the build with its default. Removal:
+`riftstone loader plugin remove inclination_lock.asi`.
 
 ## Not covered (leads)
 

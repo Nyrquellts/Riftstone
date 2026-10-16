@@ -83,11 +83,15 @@ NAV_OF = {402: 401, 421: 420, 423: 420, 424: 420, 425: 420, 431: 430, 435: 430, 
 STAGE_TABLE = 0x01530348    # u16[65] stage numbers; the row for stage number N is its index here
 STAGE_ROWS = 0x015303D0     # s16[65][11]; field 5 the merged collision's stage, field 6 the mesh's
 NAV_FIELD = 6
+COLLISION_FIELD = 5
 
 
-def stage_table(exe: bytes) -> dict:
+def stage_table(exe: bytes, field: int = NAV_FIELD) -> dict:
     """{stage: the stage whose navigation mesh it loads}, read from DDDA.exe's own tables (build 2364871:
-    STAGE_TABLE, STAGE_ROWS field NAV_FIELD) -- how ``NAV_OF`` is checked against the player's exe."""
+    STAGE_TABLE, STAGE_ROWS field NAV_FIELD) -- how ``NAV_OF`` is checked against the player's exe.  Another
+    ``field`` of the rows gives that column instead (``COLLISION_FIELD``: ``scene.COLLISION_OF``)."""
+    if not 0 <= field < 11:
+        raise RiftError("a stage row has 11 fields")
     if len(exe) < 0x200 or exe[:2] != b"MZ":
         raise RiftError("not a Windows executable")
     try:                        # headers that run past the end of the file are struct.errors, not a crash
@@ -112,7 +116,7 @@ def stage_table(exe: bytes) -> dict:
     out = {}
     for k, s in enumerate(stages):
         row = struct.unpack("<11h", read(STAGE_ROWS + 22 * k, 22))
-        out.setdefault(s, row[NAV_FIELD])
+        out.setdefault(s, row[field])
     return out
 
 

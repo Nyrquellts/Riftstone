@@ -585,9 +585,17 @@ class Studio:
         if route == "world" and method == "GET":
             return self.world_overview(self.world())
         if route == "world/stage" and method == "GET":
-            return self.world_stage(self.world(), q.get("n", ""))
+            return self.world_stage_of(q)
+        if route == "world/placement" and method == "GET":
+            return self.placement_info(q)
+        if route == "world/placement" and method == "POST":
+            return self.placement_edit(body)
+        if route == "world/undo" and method == "POST":
+            return self.placement_undo()
         if route == "world/backdrop" and method == "GET":
             return self.world_backdrop(q.get("n", ""))
+        if route == "world/scene" and method == "GET":
+            return self.world_scene(q.get("n", ""), q.get("at", ""), q.get("radius", ""))
         if route == "world/enemy" and method == "GET":
             w = self.world()
             em = w.find_enemy(str(q.get("q", "")))
@@ -788,34 +796,167 @@ class Studio:
                             for em, e in sorted(w.enemies.items()) if e["placements"]]}
 
     @staticmethod
-    def world_stage(w, n) -> dict:
-        """One stage for the map: its groups, its layouts and every placement as [x, z, y, layout, record,
-        name] (names and layouts by index, to keep the open field's 24,000 placements small)."""
+    def world_stage(w, n, held: dict | None = None, changed: dict | None = None) -> dict:
+        """One stage for the map: its groups, its layouts and every placement as [x, z, y, layout, record, name,
+        id, mark] (names and layouts by index, to keep the open field's 24,000 placements small).  ``held`` (engine
+        name -> Lot: the layouts a mod holds, spawnedit.stage_layouts) shows those as the mod has them: mark 0 is the
+        game's placement as it is, 1 one the mod moved, gave another enemy or added, 2 one the mod removed (record
+        -1, at the game's position, to put it back).  ``changed`` (spawnedit.changed) says which of a held layout's
+        records are not the game's own; without it a placement counts as changed when it moved or has another enemy."""
+        import math
+
+        from . import lot as lot_
         from .encounter import parse_stage
 
         s = parse_stage(n)
         st = w.stage(s)
-        layouts = sorted(name for name, lay in w.layouts.items() if lay["stage"] == s)
+        held = held or {}
+        layouts = sorted({name for name, lay in w.layouts.items() if lay["stage"] == s} | set(held))
         where = {name: i for i, name in enumerate(layouts)}
         names, name_ix, points = [], {}, []
+
+        def ix(em: str) -> int:
+            if em not in name_ix:
+                name_ix[em] = len(names)
+                names.append(em)
+            return name_ix[em]
+
+        game_at: dict[str, dict] = {}
         for p in w.placements:
             i = where.get(p[0])
-            if i is None or p[5] is None:
+            if i is None:
                 continue
-            if p[4] not in name_ix:
-                name_ix[p[4]] = len(names)
-                names.append(p[4])
-            points.append([p[5][0], p[5][2], p[5][1], i, p[1], name_ix[p[4]]])
+            if p[0] in held:
+                game_at.setdefault(p[0], {})[p[2]] = p
+                continue
+            if p[5] is not None:
+                points.append([p[5][0], p[5][2], p[5][1], i, p[1], ix(p[4]), p[2], 0])
+        for name_, lt in held.items():
+            i, mine = where[name_], game_at.get(name_, {})
+            for k, r in enumerate(lt.records):
+                pos = r.vec() if "mPosition" in r.fields else None
+                if pos is None or not all(math.isfinite(v) and abs(v) < 1e9 for v in pos):
+                    continue
+                em = r.name or ""
+                g = mine.get(r.id)
+                if changed is not None and name_ in changed:
+                    same = r.id not in changed[name_]
+                else:
+                    same = g is not None and g[4] == em and g[5] is not None and all(abs(a - b) < 0.5 for a, b in zip(g[5], pos))
+                points.append([pos[0], pos[2], pos[1], i, k, ix(em), r.id, 0 if same else 1])
+            have = {r.id for r in lt.records}
+            for rid, g in sorted(mine.items()):
+                if rid not in have and g[5] is not None:
+                    points.append([g[5][0], g[5][2], g[5][1], i, -1, ix(g[4]), rid, 2])
+
+        def info(n_: str) -> dict:
+            if n_ in w.layouts:
+                return {k: w.layouts[n_][k] for k in ("x", "z", "type", "number", "records")}
+            ln = lot_.parse_name(n_)
+            return {"x": ln.x, "z": ln.z, "type": ln.type, "number": ln.number, "records": len(held[n_].records)}
         typemap_ = {"e": "enemies", "n": "NPCs and hostile humans", "p": "objects", "t": "AI sensor targets"}
         groups = [{"type": g["type"], "number": g["number"], "dlc": g["dlc"], "units": g["units"],
                    "count_max": g["count_max"], "respawn": g["respawn"], "appear": g["appear"], "hours": g["hours"],
                    "link": g["link"], "cells": g["cells"]} for g in w.groups_of(s)]
         return {"stage": s, "rooms": st["rooms"], "types": typemap_,
                 "layouts": [{"name": n_, "path": fsmap.encode_name(n_.encode("latin-1"), typemap.BY_EXT["lot"]),
-                             **{k: w.layouts[n_][k] for k in ("x", "z", "type", "number", "records")}}
+                             **info(n_), "mod": n_ in held, "game": n_ in w.layouts}
                             for n_ in layouts],
                 "names": [{"id": nm, "name": w.enemies.get(nm, {}).get("name", "")} for nm in names],
                 "points": points, "groups": groups, "free": w.free_groups(s)[:5]}
+
+    def world_stage_of(self, q: dict) -> dict:
+        """world/stage: the stage as the game has it, or with ``mod`` as that mod has its layouts."""
+        from . import spawnedit
+        from .encounter import parse_stage
+
+        w = self.world()
+        name = q.get("mod", "")
+        if not name:
+            return dict(self.world_stage(w, q.get("n", "")), mod=None)
+        root = self.mod_root(name)
+        held = spawnedit.stage_layouts(root, parse_stage(q.get("n", "")))
+        diff = None
+        if held and self.game is not None and not self.game.is_ddo:
+            idx = self.open_index()
+            try:
+                diff = spawnedit.changed(self.game, idx, held)
+            finally:
+                idx.close()
+        return dict(self.world_stage(w, q.get("n", ""), held, diff), mod=root.name)
+
+    @staticmethod
+    def _whole(text, what: str) -> int:
+        if not isinstance(text, str) or not re.fullmatch(r"-?[0-9]{1,10}", text):
+            raise RiftError(f"{what} is a whole number")
+        return int(text)
+
+    def placement_info(self, q: dict) -> dict:
+        """world/placement: one placement for the map's inspector, as ``mod`` holds it (else as the game has it)."""
+        from . import spawnedit
+
+        game = self.need_game()
+        w = self.world()
+        root = self.mod_root(q["mod"]) if q.get("mod") else None
+        idx = self.open_index()
+        try:
+            return spawnedit.describe(game, idx, w, root, q.get("layout", ""), self._whole(q.get("number"), "number"),
+                                      self._whole(q.get("id"), "id"))
+        finally:
+            idx.close()
+
+    def placement_edit(self, body: dict) -> dict:
+        """world/placement POST: one change to a placement (spawnedit.edit), written into the chosen mod (a new
+        one is made for it, and taken away again when the change is refused); kept for world/undo."""
+        import shutil
+
+        from . import spawnedit, studiofiles
+
+        game = self.need_game()
+        if game.is_ddo:
+            raise RiftError("the map's placement editor is for Dark Arisen's layouts; Online's: riftstone spawns")
+        w = self.world()
+        root, new = studiofiles.destination(self, body, game.kind)
+        studiofiles.make_mod(self, root, new)
+        idx = self.open_index()
+        try:
+            ground = None
+            if body.get("op") == "move" and body.get("ground") is True:
+                ground = spawnedit.stage_ground(game, idx, spawnedit.layout_name(body.get("layout"))[1].stage, root)
+            ch = spawnedit.edit(game, idx, w, root, body, ground)
+        except BaseException:
+            if new is not None:
+                shutil.rmtree(root, ignore_errors=True)        # made by this call for this change only
+            raise
+        finally:
+            idx.close()
+        with self.lock:
+            stack = self.__dict__.setdefault("_spawn_undo", [])
+            stack.append({"mod": root.name, "layout": ch.layout, "op": ch.op, "id": body.get("id"), "files": ch.files})
+            del stack[:-spawnedit.UNDO_MAX]
+            depth = len(stack)
+        self.log("ok", f"Placement {body.get('id')} of {ch.layout}: {spawnedit.OP_WORDS[ch.op]} -> {root.name}")
+        return {"mod": root.name, "new_mod": new is not None, "layout": ch.layout, "op": ch.op, "id": body.get("id"),
+                "number": ch.number, "record": ch.record, "notes": ch.notes, "undo": depth,
+                "written": sorted({p.relative_to(root).as_posix() for p, _, _ in ch.files})}
+
+    def placement_undo(self) -> dict:
+        """world/undo: the last placement change put back, file by file, when none of its files changed since;
+        one that did is dropped from the list and said so."""
+        from . import spawnedit
+
+        with self.lock:
+            stack = self.__dict__.setdefault("_spawn_undo", [])
+            if not stack:
+                raise RiftError("nothing to undo")
+            top = stack.pop()
+            try:
+                spawnedit.undo(top["files"])
+            except RiftError as e:
+                raise RiftError(f"{e}; it is taken off the undo list") from None
+            depth = len(stack)
+        self.log("ok", f"Undone: placement {top['id']} of {top['layout']} ({spawnedit.OP_WORDS[top['op']]}) in {top['mod']}")
+        return {"mod": top["mod"], "layout": top["layout"], "op": top["op"], "id": top["id"], "undo": depth}
 
     def world_backdrop(self, n) -> dict:
         """The ground behind a stage's dots, seen from above: its navigation mesh (where the game's walkers can
@@ -851,6 +992,37 @@ class Studio:
                        "cells": [[10000 * z - 500000, 10000 * x - 500000] for x, z in cells]}
         with self.lock:
             cache[key] = out
+        return out
+
+    def world_scene(self, n, at="", radius="") -> dict:
+        """The stage in three dimensions for the 3D map (scene.py): its collision and navigation mesh in world
+        space; on the open field the cells around ``at`` (x,z), ``radius`` cells each way.  Read from the game; the
+        last few scenes are kept (one is 0.2..2 MB); nothing is written."""
+        from . import scene, terrain
+        from .encounter import parse_stage
+
+        s = parse_stage(n)
+        game = self.need_game()
+        a = scene.parse_at(at) if s == scene.FIELD else None
+        r = scene.parse_radius(radius) if s == scene.FIELD else 0
+        if s == scene.FIELD and a is None:
+            raise RiftError("the open field is shown a few cells at a time: say where (at=x,z)")
+        cell = terrain.cell_at(*a) if a is not None else None
+        key = (str(game.root).lower(), s, (cell.m, cell.n) if cell else None, r)
+        with self.lock:
+            cache = self.__dict__.setdefault("_scenes", {})
+            if key in cache:
+                cache[key] = cache.pop(key)          # most recently used last
+                return cache[key]
+        idx = self.open_index()
+        try:
+            out = scene.stage_scene(game, idx, s, a, r)
+        finally:
+            idx.close()
+        with self.lock:
+            cache[key] = out
+            while len(cache) > 6:
+                cache.pop(next(iter(cache)))
         return out
 
     def encounter(self, body: dict) -> dict:
@@ -903,6 +1075,14 @@ class Studio:
             if not isinstance(hours, str):
                 raise RiftError("hours is the first and the last whole hour, e.g. 4,19")
             hours = encounter.parse_hours(hours)
+        ground = body.get("ground")                       # None: on the walkable ground when the stage has it
+        if ground is not None and not isinstance(ground, bool):
+            raise RiftError("ground is true (on the walkable ground), false (at the spot's height) or null")
+        always = body.get("always")                       # the copied group's lot flag cleared
+        if always is None:
+            always = False
+        if not isinstance(always, bool):
+            raise RiftError("always is true or false")
         w = self.world()
         # a new mod is only created when the encounter is written; until then it plans against the game
         root, new = studiofiles.destination(self, body, game.kind)
@@ -910,7 +1090,7 @@ class Studio:
         try:
             enc = encounter.plan(game, idx, w, root, str(body.get("stage", "")), str(body.get("enemy", "")),
                                  num("count"), at, num("at_once"), num("spread", 250.0, float), num("group"), story,
-                                 like, skin, hours)
+                                 like, skin, hours, ground, always)
         finally:
             idx.close()
         gpl_key = (None, enc.gpl_name.encode("latin-1"), typemap.BY_EXT["gpl"])
@@ -926,7 +1106,8 @@ class Studio:
         out = {"stage": enc.stage, "enemy": enc.enemy, "enemy_name": enc.enemy_name, "total": enc.total,
                "points": enc.points, "at": list(enc.at), "group": enc.group, "template_group": enc.template_group,
                "template_distance": round(enc.template_distance), "layout": enc.layout_name, "cell": list(enc.cell),
-               "archives": enc.layout_archives, "horde": enc.horde, "notes": notes,
+               "archives": enc.layout_archives, "horde": enc.horde, "notes": notes, "ground": enc.ground,
+               "always": always,
                "spawn_points": [list(r.vec()) for r in lot.parse(enc.layout_data).records],
                "mod": root.name, "new_mod": new is not None, "like": like, "skin": skin, "written": [],
                "shared": [enc.gpl_name.replace("\\", "/") + ".gpl"], "clashes": clash,

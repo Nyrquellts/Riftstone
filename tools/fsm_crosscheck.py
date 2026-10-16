@@ -49,7 +49,7 @@ def main() -> int:
     t0 = time.time()
     counts = Counter()
     disagreements = []
-    for r in corpus.resources(game, [typemap.BY_EXT["fsm"]]):
+    for r in corpus.resources(game, [typemap.BY_EXT["fsm"]], indexed=False):
         counts["files"] += 1
         m = fsmcheck.read(xfs.parse(r.data))
         for lv in m.levels:

@@ -4,9 +4,11 @@
 
 lod_stub.exe maps DDDA.exe's image into its own process, lod_harness_core.dll loads the built plugin,
 which verifies and patches that copy, and then drives rModel::load's patched store and two of the
-game's LOD readers with fake models.  Four profiles: the shipped lod_tuner.ini against a stand-in
-game config.ini (2560x1440, ViewRange FARTHEST), the same with Farthest = lod (the ten ViewRange tests
-retargeted, the cloth's LOD run at FARTHEST), a flat multiplier with a low cap, and Enabled=0.
+game's LOD readers with fake models, and runs instanced vegetation's draw-list builder on a fake object at
+several frame rates on the plugin's test clock (how long a cross-fade between levels takes).  Five profiles:
+the shipped lod_tuner.ini against a stand-in game config.ini (2560x1440, ViewRange FARTHEST), the same with
+Farthest = lod (the ten ViewRange tests retargeted, the cloth's LOD run at FARTHEST), a flat multiplier with a
+low cap and the game's own fade, FadeSeconds past its limit, and Enabled=0.
 The plugin never sees the owner's real config.ini here: LOCALAPPDATA points at the temp folder.
 Needs native\\plugins\\lod_tuner\\build.cmd to have run; without the build or without the game it
 reports a skip.  Exit status 0 = passed or skipped, 1 = failed.
@@ -37,7 +39,9 @@ assert SHIPPED.count("Farthest = high") == 1, "the shipped lod_tuner.ini names F
 PROFILES = {
     "on": None,  # the shipped lod_tuner.ini
     "farlod": SHIPPED.replace("Farthest = high", "Farthest = lod"),
-    "flat": "[lod]\nEnabled = 1\nScale = 3\nPopPixels = 0\nCharacters = 1.5\nScreenHeight = 1080\nMaxDistance = 100\n",
+    "flat": "[lod]\nEnabled = 1\nScale = 3\nPopPixels = 0\nCharacters = 1.5\nScreenHeight = 1080\nMaxDistance = 100\n"
+            "FadeSeconds = 0\n",
+    "slow": "[lod]\nEnabled = 1\nFadeSeconds = 9\n",
     "off": "[lod]\nEnabled = 0\n",
 }
 

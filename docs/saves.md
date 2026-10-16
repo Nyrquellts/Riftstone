@@ -161,12 +161,12 @@ The Arisen's record is `mPl` (`cSAVE_DATA_PL`: `mEdit`, the looks, and `mParam`,
 `mPlayerDataBase`. The pawns beside it (`mCmc`, `cSAVE_DATA_CMC`) hold the same parameter block, and so do the
 copies under `mPlGameData`, `mNetGameData` and `mSystemData`, which the command never touches. Measured on this
 machine's save (2026-10-06, 26 parameter blocks; on it the base copy is older than the manual one: a level-137
-Magick Archer beside the manual copy's Warrior, and its main pawn two levels behind):
+Assassin beside the manual copy's Warrior, and its main pawn two levels behind):
 
 | Field | Type | What it holds |
 |---|---|---|
 | `mLevel` | u8 | the level (the game's cap is 200) |
-| `mJob` | u8 | the vocation: 1 Fighter, 2 Strider, 3 Mage, 4 Assassin, 5 Magick Archer, 6 Mystic Knight, 7 Warrior, 8 Ranger, 9 Sorcerer (the game's order; this save's pawns hold ranks only in 1-3 and 7-9, the six a pawn can take; 7 is its Warrior, 5 its earlier Magick Archer) |
+| `mJob` | u8 | the vocation: 1 Fighter, 2 Strider, 3 Mage, 4 Mystic Knight, 5 Assassin, 6 Magick Archer, 7 Warrior, 8 Ranger, 9 Sorcerer (the game's order: its vocation names `job_1`..`job_9` in `common_message_*.gmd`, its level tables' load order and the skill menu's rows below; this save's pawns hold ranks only in 1-3 and 7-9, the six a pawn can take; 7 is its Warrior, 5 its earlier Assassin) |
 | `mJobLevel` | u8 [10] | each vocation's rank, by number (entry 0 unused) |
 | `mJobExp`, `mJobNextExp` | u32 [10] | discipline earned in the vocation and what its next rank needs: 0 at rank 9 on all 47 rank-9 entries, never at a lower rank |
 | `mJobPoint` | s32 [10] | discipline points, one value in all ten entries |
@@ -200,18 +200,41 @@ discipline to 0, as the game has it), `--points`, `--hp` (the three HP fields), 
 palette's empty slots with the lowest unused numbers of its category, keeping the slots the player chose. `--max`
 is the showcase preset: level 200, rank 9, 999,999 discipline, HP 5500, stamina 4500 (`mStaminaLv` 3860), the
 four stats 999, every skill -- round numbers, not the game's measured caps. Both copies of the player's data get
-the same values; the vocation itself (`mJob`) is never changed, so a copy that holds another vocation keeps it.
-Only value text changes, written as the game writes it. It refuses while the game runs, on a save that does not
+the same values. The vocation itself (`mJob`) changes only with `--job N` (1-9), which is refused while the
+Arisen wears an item the new vocation cannot (the item list's `mEnableEquipJob`, `docs/formats.md`) and gives a
+vocation never taken its first rank's cost (`docs/pawn-architect.md`); without it a copy that holds another
+vocation keeps it. Only value text changes, written as the game writes it. It refuses while the game runs, on a save that does not
 check, and on a value the game would not write; the save as it was is kept as a copy first (`saves restore` puts
 it back).
 
 Measured on this machine's save (2026-10-06): `--max` changed 36 values of the base copy (the manual copy
 already held them), the result checks all the way through, both copies read back as asked and a second run
-changes nothing. The base copy's Magick Archer reports 15 of 20 dagger skills and 9 of 18 magick-bow skills
-learned, in step with its palettes.
+changes nothing. The base copy's Assassin reports 15 of 20 dagger skills and 9 of 18 bow skills learned, in
+step with its palettes.
+
+A vocation's weapons, whose palettes the command reads and fills, are the Inn's skill menu's: seven menu
+categories a vocation (`8B 04 8D 58 6D 51 01` at `0x006F80A1` reads `0x01516D58 + 4 x (7 x vocation + i)`) and
+each category's weapon bits (bit n = weapon category n). The Mystic Knight's row is categories 0, 3 and 6
+(`00 00 00 00 03 00 00 00 06 00 00 00 FF FF FF FF` at `0x01516DC8`), the Assassin's 0, 2, 5 and 7
+(`00 00 00 00 02 00 00 00 05 00 00 00 07 00 00 00` at `0x01516DE4`), the Magick Archer's 2, 3 and 8
+(`02 00 00 00 03 00 00 00 08 00 00 00 FF FF FF FF` at `0x01516E00`). Categories 0 to 9 are sword and mace,
+longsword and warhammer, daggers, staff, archistaff, shield, magick shield, shortbow, magick bow and longbow:
+`06 00 00 00 88 00 00 00 10 00 00 00 20 00 00 00` at `0x01516BD8`,
+`40 00 00 00 00 01 00 00 00 02 00 00 00 04 00 00` at `0x01516BE8`, `00 10 00 00 00 08 00 00` at `0x01516BF8`.
+So: Fighter sword, mace, shield; Strider daggers, shortbow; Mage staff; Mystic Knight sword, mace, staff,
+magick shield; Assassin sword, mace, daggers, shield, shortbow; Magick Archer daggers, staff, magick bow;
+Warrior longsword, warhammer; Ranger daggers, longbow; Sorcerer archistaff. Until 2026-10-13 the command
+numbered 4 to 6 as Assassin, Magick Archer, Mystic Knight, so it read and filled the wrong palettes for those
+three (the measurement above was then reported as a Magick Archer's daggers and magick bow; its bow skills are
+the shortbow's numbers, which the magick bow shares). This machine's save of 2026-10-13 holds an Assassin
+(`mJob` 5) in both copies with skills in the sword, mace, daggers, shield and shortbow palettes, and the sword
+and mace palettes equal (59 43 58), the menu's one category for both.
 
 **UNKNOWN until observed in game:** that the game shows the level, rank, discipline, stats and skills (it may
 recompute health and stamina from its own tables at load), and what Steam Cloud does with the edited file.
+
+The pawns' records, the main pawn cloned into the hired slots, any character's values and looks, and what the
+party holds that the game would not have made: `riftstone saves pawns`, `docs/pawn-architect.md`.
 
 ## Proof so far
 

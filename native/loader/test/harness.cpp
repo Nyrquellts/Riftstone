@@ -38,6 +38,8 @@
 //   d3d9         textures and buffers in every Direct3D pool, for the loader's pool counters (D3d9Mode below)
 //   d3d9mem <n>  n managed DXT5 textures of 2048x2048: the address space they cost under this Direct3D 9
 //   pressure <MB> commit that much, for the loader's memory pressure watch (PressureMode below)
+//   ledger <s>   waits s seconds (the patch ledger's late scan), while patch_legacy.dll and patch_plugin.asi
+//                have patched HarnessPatchArea; ledgercrash runs the ud2 patch_plugin.asi wrote there
 //
 // Built a second time as harness_ddda.exe (HARNESS_DDDA_LAYOUT): fixed at 0x400000 with DDDA.exe's
 // address range as its own image, where it lays out the bytes of exit_sites.h, a stand-in sApp and
@@ -48,10 +50,22 @@
 #include <dinput.h>
 #include <d3d9.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Bytes in the stand-in's code section that never run: test\patch_plugin.cpp's stand-ins for other mods' DLLs
+// patch them, as such a DLL patches the game's code, for the loader's patch ledger (run_tests.py test_ledger).
+#pragma section(".text$riftstone", read, execute)
+extern "C" __declspec(dllexport) __declspec(allocate(".text$riftstone")) unsigned char HarnessPatchArea[256] = {0xCC};
+
+// Runs the code at HarnessPatchArea + at, which Control Flow Guard would refuse (no function starts there) with a
+// fail-fast no crash filter sees; a game built without it would run it.
+static __declspec(guard(nocf)) __declspec(noinline) void RunPatchArea(int at) {
+    ((void (*)())(void*)(HarnessPatchArea + at))();
+}
 
 static void ReadAll(HANDLE h, char* out, DWORD cap) {
     DWORD got = 0;
@@ -1317,6 +1331,38 @@ static int PressureMode(const wchar_t* root, int targetMb) {
     return 0;
 }
 
+// Another mod's dinput8 chained by the loader (test\old_dinput8.cpp, under whatever name): its module, or NULL.
+static HMODULE FindOldDinput8(wchar_t* name, size_t cap) {
+    HMODULE found = NULL;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return NULL;
+    MODULEENTRY32W me = {sizeof me};
+    for (BOOL ok = Module32FirstW(snap, &me); ok && !found; ok = Module32NextW(snap, &me))
+        if (GetProcAddress(me.hModule, "OldDinput8_Calls")) {
+            found = me.hModule;
+            wcsncpy_s(name, cap, me.szModule, _TRUNCATE);
+        }
+    CloseHandle(snap);
+    return found;
+}
+
+// The modules loaded from the game's own folder or below it, by file name ("dinput8.dll,old_loader.dll").
+static void PrintFolderModules(const wchar_t* folder) {
+    size_t len = wcslen(folder);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W me = {sizeof me};
+    printf("folder-modules ");
+    const char* sep = "";
+    for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me))
+        if (me.hModule != GetModuleHandleW(NULL) && _wcsnicmp(me.szExePath, folder, len) == 0 && me.szExePath[len] == L'\\') {
+            printf("%s%ls", sep, me.szModule);
+            sep = ",";
+        }
+    printf("\n");
+    CloseHandle(snap);
+}
+
 int main(int argc, char** argv) {
     // A crash in a test never shows Windows' error box (run_tests.py sets the same for every stand-in).
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
@@ -1330,10 +1376,21 @@ int main(int argc, char** argv) {
         // The add-on build, loaded the way DDDA Tweak's "loadLibrary" setting would.
         printf("addon %s\n", LoadLibraryW(L"riftstone_loader.dll") ? "loaded" : "failed");
     }
+    // Another mod's dinput8 the loader chains: loaded before the game's first DirectInput8Create, as Windows loads
+    // a game's dinput8.dll before the game starts, and how many calls reached it.
+    wchar_t oldName[MAX_PATH] = L"none";
+    FindOldDinput8(oldName, MAX_PATH);
+    printf("old-dinput8-early %ls\n", oldName);
     IDirectInput8W* di = NULL;
     HRESULT hr = DirectInput8Create(GetModuleHandleW(NULL), DIRECTINPUT_VERSION, IID_IDirectInput8W, (void**)&di, NULL);
     printf("dinput %s\n", SUCCEEDED(hr) && di ? "ok" : "failed");
     if (di) di->Release();
+    if (HMODULE old = FindOldDinput8(oldName, MAX_PATH)) {
+        typedef LONG (*Calls_t)();
+        Calls_t calls = (Calls_t)GetProcAddress(old, "OldDinput8_Calls");
+        printf("old-dinput8 %ls %ld\n", oldName, calls ? calls() : -1L);
+    }
+    PrintFolderModules(exe);
     printf("pid %lu\n", GetCurrentProcessId());
     fflush(stdout);
 
@@ -1343,6 +1400,18 @@ int main(int argc, char** argv) {
         Sleep(400);
         CheckA("after-watchdog", "nativePC\\rom\\enemy\\em0100.arc");
         return 0;
+    }
+    if (strcmp(mode, "ledger") == 0) {
+        printf("area 0x%p\n", (void*)HarnessPatchArea);
+        fflush(stdout);
+        Sleep((DWORD)(argc > 2 ? atoi(argv[2]) : 3) * 1000);
+        return 0;
+    }
+    if (strcmp(mode, "ledgercrash") == 0) {
+        printf("area 0x%p\n", (void*)HarnessPatchArea);
+        fflush(stdout);
+        RunPatchArea(128);                                  // patch_plugin.asi's ud2: an illegal instruction
+        return 3;
     }
     if (strcmp(mode, "crash") == 0) {
         CheckA("before-crash", "nativePC\\rom\\enemy\\em0100.arc");

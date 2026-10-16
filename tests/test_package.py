@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import unittest
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import helpers  # noqa: F401 (sys.path)
@@ -38,7 +39,7 @@ def helpers_run(cli, argv) -> int:
 class PackageTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.TemporaryDirectory()
+        cls.tmp = tempfile.TemporaryDirectory(prefix="t")       # short: Windows paths end at 260 characters
         base = Path(cls.tmp.name)
         os.environ["RIFTSTONE_HOME"] = str(base / "home")
         cls.game = world_fixture.make(base / "game", extras=True)
@@ -315,6 +316,8 @@ class PackageTest(unittest.TestCase):
         with zipfile.ZipFile(out) as z:
             names = z.namelist()
             self.assertEqual(z.read("dinput8.dll"), (self.ldir / "dinput8.dll").read_bytes())
+            # Start Here's fix copies the spare in when dinput8.dll was skipped on unzip (another mod's was there)
+            self.assertEqual(z.read(package.SPARE_LOADER), (self.ldir / "dinput8.dll").read_bytes())
             # 1.0.3: Riftstone's own features start OFF (riftstone\plugins\off, where the loader never looks)
             self.assertEqual(z.read("riftstone/plugins/off/enemy_cap.asi"), b"MZ-fake-plugin")
             self.assertEqual(z.read("riftstone/plugins/off/enemy_cap.ini"), self.plugin.with_suffix(".ini").read_bytes())
@@ -325,6 +328,9 @@ class PackageTest(unittest.TestCase):
             self.assertNotIn("archives", readme)
             self.assertIn("feature enemy_cap.asi (off until you turn it on) -- More enemies active at once", readme)
             self.assertIn(package.START_HERE, readme)
+            self.assertIn("riftstone\\loader\\dinput8.dll -- a spare copy of the loader", readme)
+            self.assertIn("choose 1, then press F", readme)                 # another mod's dinput8.dll: no ini edit
+            self.assertNotIn("chain = dinput8_chain.dll", readme)
             self.assertEqual(json.loads(z.read("riftstone/package.json"))["plugins_off"], ["enemy_cap"])
             self.assertEqual(set(json.loads(z.read("riftstone/package.json"))["files"]),
                              set(names) - {"riftstone/package.json"})
@@ -467,7 +473,7 @@ class PackageTest(unittest.TestCase):
         (game / "dinput8.dll").write_bytes(b"MZ someone else's dinput8")
         r = run("check")
         self.assertEqual(r.returncode, 1, r.stdout)
-        self.assertIn("is not Riftstone's", r.stdout)
+        self.assertIn("The dinput8.dll here is another mod's", r.stdout)
         (game / "dinput8.dll").unlink()
         self.assertIn("dinput8.dll is not in the game folder", run("check").stdout)
         # not in the game folder: says so
@@ -595,6 +601,12 @@ class PackageTest(unittest.TestCase):
             r = run("off", "enemy_cap")
             self.assertEqual(r.returncode, 2, r.stdout)
             self.assertIn("The game is running", r.stdout)
+            (game / "dinput8.dll").write_bytes(b"MZ another mod's dinput8")    # nor does the fix touch the loader
+            r = run("fix")
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertIn("The game is running", r.stdout)
+            self.assertEqual((game / "dinput8.dll").read_bytes(), b"MZ another mod's dinput8")
+            self.assertFalse((game / "dinput8_chain.dll").exists())
             self.assertEqual((plugs / "enemy_cap.asi").read_bytes(), b"MZ the old build")
             self.assertEqual((spare / "enemy_cap.asi").read_bytes(), fresh)
         finally:
@@ -612,13 +624,18 @@ class PackageTest(unittest.TestCase):
         folders (it once failed in every one of them: "\\Steam was unexpected at this time")."""
         import subprocess
 
-        out = self.base / "paren" / "player.zip"
+        out = self.base / "p" / "player.zip"
         package.build_plugins([self.plugin], out, loader_dir=self.ldir)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        for parts in (("Program Files (x86)", "Steam", "steamapps", "common", "DDDA"),
-                      ("Games & More (x86)", "Steam Library", "steamapps", "common", "DDDA"),
-                      ("Games! Deluxe (x86)", "Steam^Library 100%", "steamapps", "common", "DDDA")):
-            game = self.base.joinpath("paren", *parts)
+        # The names keep every character that once broke the script ( ) & ! ^ % and a space, and are no longer than
+        # the run needs: the longest folder plus the files in it (riftstone\plugins\off\enemy_cap.asi) must fit in
+        # the 260 characters of a Windows path under whatever TEMP is (run_unit adds up to 12 characters to it).
+        folders = (("Program Files (x86)", "Steam", "steamapps", "common", "DDDA"),
+                  ("Games & Co (x86)", "Steam Library", "steamapps", "common", "DDDA"),
+                  ("Games! (x86)", "Steam^Library 100%", "steamapps", "common", "DDDA"))
+
+        def check_in(game):
+            """One folder, start to finish: its own game folder, so the three run side by side."""
             game.mkdir(parents=True)
             with zipfile.ZipFile(out) as z:
                 z.extractall(game)
@@ -633,78 +650,278 @@ class PackageTest(unittest.TestCase):
             def said(r):
                 return r.stdout + r.stderr
 
+            r = run("list")
+            self.assertEqual(r.returncode, 0, said(r))
+            self.assertIn("[off ]  Enemy cap", r.stdout)
+            self.assertIn("someone_elses", r.stdout, said(r))                          # the folder scan found it
+            self.assertIn("Not part of Riftstone", r.stdout)
+            r = run("on", "enemy_cap")
+            self.assertIn("enemy_cap is now on", r.stdout, said(r))
+            self.assertTrue((game / "riftstone/plugins/enemy_cap.asi").is_file())
+            self.assertTrue((game / "riftstone/plugins/enemy_cap.ini").is_file())
+            self.assertIn("enemy_cap is now off", run("off", "enemy_cap").stdout)
+            r = run("on", "nosuch")
+            self.assertEqual(r.returncode, 3, said(r))
+            self.assertIn("nosuch is not in " + str(game / "riftstone" / "plugins"), r.stdout)   # the folder, whole
+            self.assertIn("enemy_cap is now on", run("on", "all").stdout)
+            self.assertIn("enemy_cap is now off", run("off", "all").stdout)
+            # the double-click way in: no arguments, the menu, keys as a player types them (Enter is CR LF)
+            with tempfile.TemporaryFile() as keys, tempfile.TemporaryFile() as screen:
+                keys.write(b"2" + b"1\r\n" + b"\r\n" + b"\r\n" + b"Q")     # features, the first one, on, back, quit
+                keys.seek(0)
+                p = subprocess.Popen('cmd /s /c ""' + str(game / package.START_HERE) + '""', cwd=game, stdin=keys,
+                                     stdout=screen, stderr=subprocess.STDOUT, creationflags=flags)
+                try:
+                    p.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+                    self.fail("the menu did not finish")
+                screen.seek(0)
+                shown = screen.read().decode("oem", errors="replace")
+            self.assertIn("enemy_cap is now on", shown)
+            self.assertNotIn("incorrect", shown)
+            self.assertTrue((game / "riftstone/plugins/enemy_cap.asi").is_file())
+            self.assertIn("enemy_cap is now off", run("off", "enemy_cap").stdout)
+            logs = game / "riftstone" / "logs"
+            logs.mkdir(parents=True)
+            (logs / "loader.log").write_text(
+                f"09:54:57.505  Riftstone loader 1.0.3 in {game}\n"
+                "09:54:57.700  plugin   save_backup.asi loaded at 0x10000000\n"
+                "09:54:57.876  overlay  Insert shows the diagnostics panel (top-right, scale auto)\n"
+                "09:55:00.000  overlay  startup banner shown on the 1920x1080 back buffer at scale 1.00 (top-right)\n",
+                encoding="utf-8")
+            r = run("check")
+            self.assertEqual(r.returncode, 0, said(r))
+            self.assertIn("Game folder: " + str(game), r.stdout)                       # printed whole
+            self.assertIn("The game started with Riftstone: 09:54:57.505  Riftstone loader 1.0.3 in " + str(game), r.stdout)
+            self.assertIn("The RUNNING notice was drawn in the game.", r.stdout)
+            self.assertIn("Plugins that loaded last time: 1", r.stdout)
+            (logs / "loader.log").write_text(
+                f"09:54:57.505  Riftstone loader 1.0.3 in {game}\n"
+                "09:54:57.700  plugin   enemy_cap.asi FAILED to load (error 193)\n"
+                "09:54:57.800  SAFE MODE: two start-up crashes in a row\n", encoding="utf-8")
+            r = run("check")
+            self.assertEqual(r.returncode, 2, said(r))
+            self.assertIn("A plugin failed to load", r.stdout)
+            self.assertIn("Safe mode was on", r.stdout)
+            for text in (r.stdout, r.stderr):
+                self.assertNotIn("unexpected", text)
+                self.assertNotIn("not recognized", text)
+            # a zip unzipped over an older Riftstone: the old copy runs from plugins\, the zip's fresh one waits in off\
+            plugs, spare = game / "riftstone/plugins", game / "riftstone/plugins/off"
+            (plugs / "enemy_cap.asi").write_bytes(b"old build")
+            (plugs / "enemy_cap.ini").write_bytes(b"[cap]\r\nlimit = 41\r\n")           # the player's own setting
+            spare.mkdir(parents=True, exist_ok=True)
+            (spare / "enemy_cap.asi").write_bytes(b"fresh build")
+            (spare / "enemy_cap.ini").write_bytes(b"[cap]\r\nlimit = 30\r\n")           # the zip's default
+            r = run("list")
+            self.assertIn("Updated enemy_cap", r.stdout, said(r))
+            self.assertEqual((plugs / "enemy_cap.asi").read_bytes(), b"fresh build")
+            self.assertEqual((plugs / "enemy_cap.ini").read_bytes(), b"[cap]\r\nlimit = 41\r\n")
+            self.assertFalse((spare / "enemy_cap.asi").exists())
+            self.assertFalse((spare / "enemy_cap.ini").exists())
+            self.assertNotIn("Updated", run("list").stdout)                          # and once is enough
+
+        games = [self.base.joinpath("p", *parts) for parts in folders]
+        with ThreadPoolExecutor(max_workers=len(games)) as pool:       # a batch process each: ~20 s apiece in turn
+            futures = [pool.submit(check_in, game) for game in games]
+        for game, future in zip(games, futures):
             with self.subTest(folder=str(game)):
-                r = run("list")
-                self.assertEqual(r.returncode, 0, said(r))
-                self.assertIn("[off ]  Enemy cap", r.stdout)
-                self.assertIn("someone_elses", r.stdout, said(r))                          # the folder scan found it
-                self.assertIn("Not part of Riftstone", r.stdout)
-                r = run("on", "enemy_cap")
-                self.assertIn("enemy_cap is now on", r.stdout, said(r))
-                self.assertTrue((game / "riftstone/plugins/enemy_cap.asi").is_file())
-                self.assertTrue((game / "riftstone/plugins/enemy_cap.ini").is_file())
-                self.assertIn("enemy_cap is now off", run("off", "enemy_cap").stdout)
-                r = run("on", "nosuch")
-                self.assertEqual(r.returncode, 3, said(r))
-                self.assertIn("nosuch is not in " + str(game / "riftstone" / "plugins"), r.stdout)   # the folder, whole
-                self.assertIn("enemy_cap is now on", run("on", "all").stdout)
-                self.assertIn("enemy_cap is now off", run("off", "all").stdout)
-                # the double-click way in: no arguments, the menu, keys as a player types them (Enter is CR LF)
-                with tempfile.TemporaryFile() as keys, tempfile.TemporaryFile() as screen:
-                    keys.write(b"2" + b"1\r\n" + b"\r\n" + b"\r\n" + b"Q")     # features, the first one, on, back, quit
-                    keys.seek(0)
-                    p = subprocess.Popen('cmd /s /c ""' + str(game / package.START_HERE) + '""', cwd=game, stdin=keys,
-                                         stdout=screen, stderr=subprocess.STDOUT, creationflags=flags)
-                    try:
-                        p.wait(timeout=60)
-                    except subprocess.TimeoutExpired:
-                        subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
-                        self.fail("the menu did not finish")
-                    screen.seek(0)
-                    shown = screen.read().decode("oem", errors="replace")
-                self.assertIn("enemy_cap is now on", shown)
-                self.assertNotIn("incorrect", shown)
-                self.assertTrue((game / "riftstone/plugins/enemy_cap.asi").is_file())
-                self.assertIn("enemy_cap is now off", run("off", "enemy_cap").stdout)
-                logs = game / "riftstone" / "logs"
-                logs.mkdir(parents=True)
-                (logs / "loader.log").write_text(
-                    f"09:54:57.505  Riftstone loader 1.0.3 in {game}\n"
-                    "09:54:57.700  plugin   save_backup.asi loaded at 0x10000000\n"
-                    "09:54:57.876  overlay  Insert shows the diagnostics panel (top-right, scale auto)\n"
-                    "09:55:00.000  overlay  startup banner shown on the 1920x1080 back buffer at scale 1.00 (top-right)\n",
-                    encoding="utf-8")
-                r = run("check")
-                self.assertEqual(r.returncode, 0, said(r))
-                self.assertIn("Game folder: " + str(game), r.stdout)                       # printed whole
-                self.assertIn("The game started with Riftstone: 09:54:57.505  Riftstone loader 1.0.3 in " + str(game), r.stdout)
-                self.assertIn("The RUNNING notice was drawn in the game.", r.stdout)
-                self.assertIn("Plugins that loaded last time: 1", r.stdout)
-                (logs / "loader.log").write_text(
-                    f"09:54:57.505  Riftstone loader 1.0.3 in {game}\n"
-                    "09:54:57.700  plugin   enemy_cap.asi FAILED to load (error 193)\n"
-                    "09:54:57.800  SAFE MODE: two start-up crashes in a row\n", encoding="utf-8")
-                r = run("check")
-                self.assertEqual(r.returncode, 2, said(r))
-                self.assertIn("A plugin failed to load", r.stdout)
-                self.assertIn("Safe mode was on", r.stdout)
-                for text in (r.stdout, r.stderr):
-                    self.assertNotIn("unexpected", text)
-                    self.assertNotIn("not recognized", text)
-                # a zip unzipped over an older Riftstone: the old copy runs from plugins\, the zip's fresh one waits in off\
-                plugs, spare = game / "riftstone/plugins", game / "riftstone/plugins/off"
-                (plugs / "enemy_cap.asi").write_bytes(b"old build")
-                (plugs / "enemy_cap.ini").write_bytes(b"[cap]\r\nlimit = 41\r\n")           # the player's own setting
-                spare.mkdir(parents=True, exist_ok=True)
-                (spare / "enemy_cap.asi").write_bytes(b"fresh build")
-                (spare / "enemy_cap.ini").write_bytes(b"[cap]\r\nlimit = 30\r\n")           # the zip's default
-                r = run("list")
-                self.assertIn("Updated enemy_cap", r.stdout, said(r))
-                self.assertEqual((plugs / "enemy_cap.asi").read_bytes(), b"fresh build")
-                self.assertEqual((plugs / "enemy_cap.ini").read_bytes(), b"[cap]\r\nlimit = 41\r\n")
-                self.assertFalse((spare / "enemy_cap.asi").exists())
-                self.assertFalse((spare / "enemy_cap.ini").exists())
-                self.assertNotIn("Updated", run("list").stdout)                          # and once is enough
+                future.result()                                          # an assertion raised in its thread
+
+    def _start_here_game(self, *parts: str) -> Path:
+        """The player zip unzipped into a stand-in game folder under the test's folder."""
+        out = self.base.joinpath(parts[0], "player.zip")
+        if not out.exists():
+            package.build_plugins([self.plugin], out, loader_dir=self.ldir)
+        game = self.base.joinpath(*parts)
+        game.mkdir(parents=True)
+        with zipfile.ZipFile(out) as z:
+            z.extractall(game)
+        (game / "DDDA.exe").write_bytes(b"MZ")
+        return game
+
+    @staticmethod
+    def _start_here(game: Path, *args: str, env: dict | None = None, keys: bytes | None = None,
+                    script: str = package.START_HERE):
+        """Run Start Here as Explorer starts a double-clicked file (no arguments: the menu, fed ``keys``): its
+        return code and everything it printed."""
+        import subprocess
+        line = 'cmd /s /c ""' + str(game / script) + '"' + "".join(" " + a for a in args) + '"'
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        with tempfile.TemporaryFile() as given, tempfile.TemporaryFile() as screen:
+            given.write(keys or b"")
+            given.seek(0)
+            p = subprocess.Popen(line, cwd=game, stdin=given, stdout=screen, stderr=subprocess.STDOUT, env=env,
+                                 creationflags=flags)
+            try:
+                p.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+                raise AssertionError(f"Start Here {' '.join(args) or '(the menu)'} did not finish") from None
+            screen.seek(0)
+            return p.returncode, screen.read().decode("oem", errors="replace")
+
+    @unittest.skipUnless(os.name == "nt", "the Start Here script is a Windows batch file")
+    def test_start_here_fixes_another_mods_dinput8(self):
+        """A player with another mod's dinput8.dll (DDDA Tweak, an ASI loader) keeps it on unzip, so Riftstone never
+        loads: the check says so and its fix (F, or "fix") renames theirs dinput8_chain.dll, which the loader starts
+        with no ini edit, and copies in the zip's spare loader.  An older Riftstone loader kept on unzip, a missing
+        one and a Riftstone loader kept as the chain are fixed too; another mod's beside a chain is refused, nothing
+        is deleted.  In a folder named with ! ^ % & ( ) and spaces."""
+        game = self._start_here_game("fx", "G&s! (x86)", "Lib^ 100%", "DDDA")
+        ours = (self.ldir / "dinput8.dll").read_bytes()
+        theirs = b"MZ DDDA Tweak's dinput8"
+        dll, chain, aside = game / "dinput8.dll", game / "dinput8_chain.dll", game / "dinput8_chain.dll.riftstone-old"
+        self.assertEqual((game / package.SPARE_LOADER).read_bytes(), ours)
+        run = lambda *a: self._start_here(game, *a)                     # noqa: E731
+        dll.write_bytes(theirs)                                         # skipped on unzip: the other mod's stays
+        code, said = run("check")
+        self.assertEqual(code, 1, said)
+        self.assertIn("The dinput8.dll here is another mod's", said)
+        self.assertIn("F fixes it", said)
+        self.assertIn('"Riftstone - Start Here.cmd" fix  fixes what is marked F', said)
+        code, said = run("fix")
+        self.assertEqual(code, 0, said)
+        self.assertIn("The other mod's dinput8.dll is now dinput8_chain.dll", said)
+        self.assertEqual((dll.read_bytes(), chain.read_bytes()), (ours, theirs))
+        code, said = run("check")
+        self.assertEqual(code, 0, said)
+        self.assertIn("[i]   dinput8_chain.dll is here: Riftstone's loader starts it", said)
+        self.assertNotIn("F fixes", said)
+        code, said = run("fix")
+        self.assertEqual(code, 0, said)
+        self.assertIn("Nothing to fix", said)
+        # another mod's dinput8.dll with a dinput8_chain.dll beside it: neither is renamed
+        dll.write_bytes(theirs)
+        code, said = run("fix")
+        self.assertEqual(code, 6, said)
+        self.assertEqual((dll.read_bytes(), chain.read_bytes()), (theirs, theirs))
+        self.assertIn("move one of the two out of the game folder", run("check")[1])
+        # a Riftstone loader kept as the chain (the loader never starts it): renamed aside, not deleted
+        dll.write_bytes(ours)
+        chain.write_bytes(ours)
+        code, said = run("check")
+        self.assertEqual(code, 1, said)
+        self.assertIn("dinput8_chain.dll is a Riftstone loader, not another mod's", said)
+        code, said = run("fix")
+        self.assertEqual(code, 0, said)
+        self.assertFalse(chain.exists())
+        self.assertEqual(aside.read_bytes(), ours)
+        # an older Riftstone loader kept on unzip, then none at all: the spare goes in
+        dll.write_bytes(b"MZ-older-RiftstoneLoaderVersion-1.0.1")
+        code, said = run("check")
+        self.assertEqual(code, 1, said)
+        self.assertIn("is a Riftstone loader, but not this zip's", said)
+        self.assertIn("dinput8.dll is now this zip's Riftstone loader", run("fix")[1])
+        self.assertEqual(dll.read_bytes(), ours)
+        dll.unlink()
+        code, said = run("check")
+        self.assertEqual(code, 1, said)
+        self.assertIn("This zip's copy of it is in riftstone\\loader", said)
+        self.assertIn("Protection history", said)
+        self.assertEqual(run("fix")[0], 0)
+        self.assertEqual(dll.read_bytes(), ours)
+        # the double-click way: 1 checks, F fixes, a key for the pause, Q quits
+        dll.write_bytes(theirs)
+        code, said = self._start_here(game, keys=b"1" + b"F" + b"\r\n" + b"Q")
+        self.assertEqual(code, 0, said)
+        self.assertIn("Press F to fix what is marked F above", said)
+        self.assertIn("The other mod's dinput8.dll is now dinput8_chain.dll", said)
+        self.assertEqual((dll.read_bytes(), chain.read_bytes()), (ours, theirs))
+        # an older zip's files, with no spare: says what to do, changes nothing
+        (game / package.SPARE_LOADER).unlink()
+        dll.unlink()
+        code, said = run("fix")
+        self.assertEqual(code, 5, said)
+        self.assertIn("this zip's spare copy of the loader, is not here", said)
+        self.assertIn("Unzip everything from the Riftstone zip into the folder that has DDDA.exe", run("check")[1])
+        self.assertEqual(chain.read_bytes(), theirs)
+        for text in ("unexpected", "not recognized", "cannot find"):
+            self.assertNotIn(text, said)
+
+    @unittest.skipUnless(os.name == "nt", "the Start Here script is a Windows batch file")
+    def test_start_here_check_reads_the_log_as_the_loader_writes_it(self):
+        """What the check makes of loader.log's own lines (native/loader): the line saying safe mode ended is not
+        safe mode (the check once matched "safe mode" in any case and called a healthy game broken), a chained
+        mod that started or did not, two Riftstone loaders; and of the folder: which features are on, a copy of
+        one outside riftstone\\plugins (another ASI loader would load it a second time)."""
+        game = self._start_here_game("lg", "Program Files (x86)", "DDDA")
+        logs = game / "riftstone" / "logs"
+        logs.mkdir()
+        log = logs / "loader.log"
+        head = f"09:54:57.505  Riftstone loader 1.0.5 in {game}\n"
+
+        def check(*lines: str) -> tuple[int, str]:
+            log.write_text(head + "".join(f"09:54:58.000  {ln}\n" for ln in lines), encoding="utf-8")
+            return self._start_here(game, "check")
+
+        code, said = check()
+        self.assertEqual(code, 0, said)
+        self.assertIn("Every Riftstone feature is OFF", said)
+        self.assertIn("enemy_cap is now on", self._start_here(game, "on", "enemy_cap")[1])
+        self.assertIn("[i]   Features ON: enemy_cap", check()[1])
+        code, said = check("safe     mods or plugins changed since safe mode began; they are back on")
+        self.assertEqual(code, 0, said)
+        self.assertNotIn("Safe mode was on", said)
+        code, said = check("safe     SAFE MODE: the game crashed twice in a row while starting; this run has no plugins "
+                           "and no overlay. It ends when a mod or plugin changes, or: Riftstone.cmd loader safe-mode off")
+        self.assertEqual(code, 1, said)
+        self.assertIn("Safe mode was on", said)
+        self.assertIn("Switching a feature with option 2 ends it", said)
+        chained = f"{game}\\dinput8_chain.dll"
+        code, said = check(f"chain    {chained} is beside the game and riftstone_loader.ini names no chain: chaining it",
+                           f"chain    {chained} loaded")
+        self.assertEqual(code, 0, said)
+        self.assertIn("[OK]  Another mod's dinput8 started with Riftstone:", said)
+        self.assertIn(f"{chained} loaded", said)                        # the log's own line, path and all
+        for failed in (f"chain    {chained} could not be loaded; using the system dinput8",
+                       f"chain    {chained} is another Riftstone loader, not another mod: not loaded (two loaders would "
+                       "hook the game twice); using the system dinput8. Delete it, or rename the other mod's "
+                       "dinput8.dll to that name",
+                       f"chain    {chained} has no DirectInput8Create; using the system dinput8"):
+            code, said = check(failed)
+            self.assertEqual(code, 1, said)
+            self.assertIn("[X]   Another mod's dinput8 did not start:", said)
+        code, said = check(f"loader   another Riftstone loader is in the game too: {game}\\riftstone_loader.dll "
+                           "(1.0.1). Keep one: one with this check stands aside by itself, an older one hooks the game "
+                           "a second time")
+        self.assertEqual(code, 1, said)
+        self.assertIn("Two Riftstone loaders were in the game; keep one:", said)
+        (game / "scripts").mkdir()
+        (game / "scripts" / "enemy_cap.asi").write_bytes(b"MZ")
+        (game / "riftstone_loader.dll").write_bytes(b"MZ")
+        code, said = check()
+        self.assertEqual(code, 1, said)
+        self.assertIn("[X]   scripts\\enemy_cap.asi is outside riftstone\\plugins", said)
+        self.assertIn("[i]   riftstone_loader.dll is also here", said)
+        for text in ("unexpected", "not recognized"):
+            self.assertNotIn(text, said)
+
+    @unittest.skipUnless(os.name == "nt", "the Start Here script is a Windows batch file")
+    def test_start_here_needs_no_path_and_no_choice(self):
+        """Start Here calls Windows' programs by their full path: with PATH emptied (another program's installer
+        broke it) the menu and the check still work; a bare "choice" there once returned 9009, which the menu
+        read as Q, so it closed at once.  Without choice.exe (a copy of the script that looks for another name:
+        cmd.exe does not start with SystemRoot pointing elsewhere) the menu takes typed answers instead."""
+        game = self._start_here_game("np", "Program Files (x86)", "DDDA")
+        env = dict(os.environ, PATH="")
+        code, said = self._start_here(game, "check", env=env)
+        self.assertEqual(code, 0, said)
+        self.assertIn("[OK]  dinput8.dll here is the Riftstone loader.", said)
+        code, said = self._start_here(game, env=env, keys=b"1" + b"\r\n" + b"Q")
+        self.assertEqual(code, 0, said)
+        self.assertIn("Riftstone check", said)
+        self.assertNotIn("not recognized", said)
+        text = (game / package.START_HERE).read_bytes()
+        self.assertEqual(text.count(b"\\choice.exe"), 2)                 # the look and the call
+        (game / "no choice.cmd").write_bytes(text.replace(b"\\choice.exe", b"\\no-such-choice.exe"))
+        code, said = self._start_here(game, keys=b"2\r\n" + b"1\r\n" + b"\r\n" + b"\r\n" + b"Q\r\n",
+                                      script="no choice.cmd")
+        self.assertEqual(code, 0, said)
+        self.assertNotIn("not recognized", said)
+        self.assertIn("enemy_cap is now on", said)
+        self.assertTrue((game / "riftstone/plugins/enemy_cap.asi").is_file())
 
     def test_plugins_only_carries_ninput_switched_off(self):
         """Ninput (experimental) ships under optional\\ninput with its licences, never where the game would load it."""

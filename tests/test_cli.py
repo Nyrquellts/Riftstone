@@ -221,6 +221,53 @@ class LoaderPluginTest(StandIn):
         self.assertTrue((self.plugins / "a.asi").is_file())
         self.assertEqual(run("loader", "status", "--game", self.G)[0], 0)
 
+    def test_legacy_dlls(self):
+        legacy = self.game.state_dir / "legacy"
+        src = self.folder()
+        (src / "HardPlus.dll").write_bytes(b"MZ hard")
+        (src / "HardPlus.ini").write_text("[x]\nk = 1\n")
+        (src / "dinput8.dll").write_bytes(b"MZ old hook")
+        (src / "a.asi").write_bytes(b"MZ")
+        code, out = run("loader", "legacy", "add", str(src / "HardPlus.dll"), "--game", self.G)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((legacy / "HardPlus.dll").read_bytes(), b"MZ hard")
+        self.assertTrue((legacy / "HardPlus.ini").is_file())                     # its ini comes along
+        code, out = run("loader", "legacy", "add", str(src / "dinput8.dll"), "--game", self.G)
+        self.assertEqual(code, 0, out)
+        self.assertTrue((legacy / "dinput8_legacy.dll").is_file())              # never the loader's own name
+        self.assertIn("kept as dinput8_legacy.dll", out)
+        code, out = run("loader", "legacy", "add", str(src / "a.asi"), "--game", self.G)
+        self.assertEqual(code, 2, out)                                           # already a plugin: loaded once
+        code, out = run("loader", "legacy", "--game", self.G)
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 legacy DLL(s)", out)
+        self.assertIn("legacy: HardPlus.dll", run("loader", "status", "--game", self.G)[1])
+        for argv in (("add",), ("remove",), ("release", "x.dll"), ("remove", "..\\plugins\\a.asi")):
+            self.assertEqual(run("loader", "legacy", *argv, "--game", self.G)[0], 2, argv)
+        self.assertTrue((self.plugins / "a.asi").is_file())
+        code, out = run("loader", "legacy", "remove", "HardPlus.dll", "--game", self.G)
+        self.assertEqual(code, 0, out)
+        self.assertFalse((legacy / "HardPlus.dll").exists())
+
+    def test_patches(self):
+        import test_patchledger
+        logs = self.game.state_dir / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        ledger = logs / "patches.txt"
+        ledger.unlink(missing_ok=True)
+        self.assertEqual(run("loader", "patches", "--game", self.G)[0], 1)      # none yet
+        ledger.write_bytes(test_patchledger.SAMPLE.encode("utf-8"))
+        code, out = run("loader", "patches", "--game", self.G)
+        self.assertEqual(code, 0, out)
+        self.assertIn("CONFLICT at 0x01400002", out)
+        code, out, err = run_split("loader", "patches", "--json", "--game", self.G)
+        self.assertEqual((code, json.loads(out)["schema"], len(json.loads(out)["conflicts"])),
+                         (0, "riftstone-patches/1", 1))
+        self.assertEqual(run("loader", "patches", "list", "--game", self.G)[0], 2)
+        ledger.write_text("game\tDDDA.exe\n")
+        self.assertEqual(run("loader", "patches", "--game", self.G)[0], 2)      # a damaged file is refused
+        ledger.unlink()
+
 
 class ParamTest(Isolated):
     def setUp(self):

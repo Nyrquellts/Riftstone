@@ -73,5 +73,6 @@ riftstone loader install
 riftstone loader plugin add native\plugins\save_backup\out\save_backup.asi
 ```
 
-The first `plugin add` also copies `save_backup.ini`, and later updates keep the owner's edits.
+The first `plugin add` also copies `save_backup.ini`; a later update keeps the owner's values and adds any
+setting new in the build with its default and comment.
 Removal: `riftstone loader plugin remove save_backup.asi` (the copies stay where they are).

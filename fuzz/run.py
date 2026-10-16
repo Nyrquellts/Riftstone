@@ -142,8 +142,17 @@ def _synthetic() -> dict[str, list[bytes]]:
         {"route": "lot", "post": 1, "body": {"text": lot_text, "op": "remove", "number": 1}},
         {"route": "world"}, {"route": "world/stage", "q": {"n": "st424"}}, {"route": "world/backdrop", "q": {"n": "st424"}},
         {"route": "world/backdrop", "q": {"n": "100"}}, {"route": "world/backdrop", "q": {"n": "999"}}, {"route": "world/enemy", "q": {"q": "goblin"}},
+        {"route": "world/scene", "q": {"n": "st424"}}, {"route": "world/scene", "q": {"n": "100", "at": "35000,-75000", "radius": "2"}},
+        {"route": "world/scene", "q": {"n": "100", "at": "1,2", "radius": "9"}},
+        {"route": "world/stage", "q": {"n": "st424", "mod": "Fuzz"}},
+        {"route": "world/placement", "q": {"layout": "scr/st424/etc/st424_00m00n_e00.lot", "number": "0", "id": "0", "mod": "Fuzz"}},
+        {"route": "world/placement", "post": 1, "body": {"mod": "Fuzz", "op": "remove",
+                                                         "layout": "scr/st424/etc/st424_00m00n_e00.lot", "number": 0, "id": 0}},
+        {"route": "world/undo", "post": 1, "body": {}},
         {"route": "encounter", "post": 1, "body": {"mod": "Fuzz", "stage": 424, "enemy": "goblin", "count": 10,
                                                    "at": [0, 0, 0], "dry_run": True}},
+        {"route": "encounter", "post": 1, "body": {"mod": "Fuzz", "stage": 424, "enemy": "goblin", "count": 4,
+                                                   "at": [0, 0, 0], "ground": False, "always": True, "dry_run": True}},
         {"route": "encounter", "post": 1, "body": {"mod": "Fuzz", "stage": 424, "enemy": "chimera", "count": 2,
                                                    "at": "group:4", "hours": "20,3", "story": "post", "skin": "1,2",
                                                    "like": 4, "dry_run": True}})]
@@ -209,6 +218,8 @@ def _synthetic() -> dict[str, list[bytes]]:
                 % n) for n in (1, 2)],
             "save_knowledge": _knowledge_seeds(),
             "save_arisen": _arisen_seeds(),
+            "save_pawns": _pawn_seeds(),
+            "patch_ledger": _ledger_seeds(),
             "lot_ddo": _ddo_lot_seeds(), "lot_ddo_yaml": [_lot_ddo_yaml()],
             **_weather_camera_seeds(),
             "ddo_tables": [struct.pack("<II", 1, 1) + struct.pack("<4I", 1, 0, 1, 0x010100),
@@ -339,6 +350,9 @@ def _synthetic() -> dict[str, list[bytes]]:
                         helpers.cell_model(points=[(-4000.0, 1.0, 14000.0), (0.0, 0.0, 0.0)]),
                         helpers.cell_collision(), helpers.cell_collision(parts=2, two_level=True),
                         helpers.cell_collision(tree_kind=2)],
+            "scene": [helpers.cell_collision(), helpers.cell_collision(parts=2, two_level=True),
+                      helpers.cell_collision([(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (0.0, 0.0, 100.0), (2.0e7, 0.0, 0.0)]),
+                      b"35000,-75000|2", b"-499000,-499000|0", b"|", b"nan,1|1", b"1e7,-1e7|"],
             "png": _pngs, "studio_files": [json.dumps(c).encode() for c in _files_cases],
             "package": [json.dumps(c).encode() for c in (
                 {"files": [["archives/rom/enemy/em5200.arc/model/em/e52/e5200/s01/e5200_skin_BM.tex", "TEX\u0000new"]],
@@ -355,7 +369,11 @@ def _synthetic() -> dict[str, list[bytes]]:
                                                    pressure=1, pressure_episodes=2, va_used_peak=(4 << 30) - (300 << 20),
                                                    d3d_path="C:\\WINDOWS\\SYSTEM32\\d3d9.dll")],
             "pe": [helpers.pe_file(), helpers.pe_file(machine=0x8664, plus=True), helpers.pe_file(dll=False, laa=True),
-                   helpers.pe_file(exports=()), helpers.pe_file(exports=("Direct3DCreate9", "Direct3DCreate9Ex", "x"))],
+                   helpers.pe_file(exports=()), helpers.pe_file(exports=("Direct3DCreate9", "Direct3DCreate9Ex", "x")),
+                   helpers.pe_file(imports={"KERNEL32.dll": ["CreateFileW", 5], "USER32.dll": ["IsWindow"]},
+                                   delay={"USER32.dll": ["GetDpiForWindow"]}, subsystem=(6, 0)),
+                   helpers.pe_file(machine=0x8664, plus=True, imports={"KERNEL32.dll": ["Sleep", 7]},
+                                   subsystem=(10, 1))],
             "d3d9_source": _d3d9_sources(),
             "report": [test_runtime.CRASH.encode(), test_runtime.FATAL.encode(), test_runtime.HANG.encode(),
                        test_runtime.HANG_LOST.encode()],
@@ -368,6 +386,10 @@ def _synthetic() -> dict[str, list[bytes]]:
                 {"plugins": ["enemy_cap.asi"], "inis": {"enemy_cap.asi": "; enemy_cap -- more enemies\n[x]\n"},
                  "out": "Riftstone-Player.zip", "name": "Riftstone plugins"},
                 {"plugins": ["twin.asi", "twin.dll"], "inis": {"twin.asi": "[a]\n", "twin.dll": "[b]\n"}, "out": "t.zip"},
+                {"plugins": ["enemy_cap.asi", "other.asi"], "out": "w.zip",          # made: other.asi is not ours
+                 "imports": {"enemy_cap.asi": ["IsWindow"], "other.asi": ["GetDpiForWindow"]}},
+                {"plugins": ["enemy_cap.asi", "free_sprint.asi"], "out": "r.zip",    # refused: Windows 10 1607+
+                 "imports": {"enemy_cap.asi": ["IsWindow"], "free_sprint.asi": ["GetDpiForWindow"]}},
                 {"plugins": ["a.asi", "a.asi"], "out": "dup.zip"},
                 {"plugins": [], "out": "none.zip"},
                 {"plugins": ["dinput8.dll"], "out": "loader.zip"},
@@ -420,12 +442,30 @@ def _synthetic() -> dict[str, list[bytes]]:
                 b"rewrites\r\n370 = em5301\r\n[stage_enemies]\r\n#rows\n100 C: em0900",
                 "\ufeff[stage_enemies]\r\nEnabled = 1\r\n".encode("utf-16-le") + b"\n#rows\n370 D: em5301",
                 b"\xff\xfe[\x00s\x00\n#rows\n1 E: em1"],
+            "profile": [json.dumps(c, indent=2).encode() for c in (
+                {"schema": "riftstone-profile/1", "name": "Hordes", "made_with": "Riftstone 1.0.5",
+                 "features": {"enemy_cap": True, "free_sprint": True, "save_backup": False, "lod_tuner": True},
+                 "settings": {"enemy_cap": {"enemy_cap": {"slots": "64", "record": "1"}},
+                              "free_sprint": {"sprint": {"Mode": "always", "Who": "arisen"}},
+                              "save_backup": {"backup": {"Keep": "40", "Folder": "C:\\Windows"}},
+                              "loader": {"overlay": {"key": "f7"}, "fps": {"max_fps": "0"}}}},
+                {"schema": "riftstone-profile/1", "name": "Vanilla \u65e5\u672c",
+                 "features": {"enemy_cap": False, "Free_Sprint": False, "portcrystals": True},
+                 "settings": {"ENEMY_CAP": {"Enemy_Cap": {"SLOTS": " 12 "}}, "lod_tuner": {"lod": {"Enabled": "0"}}}},
+                {"schema": "riftstone-profile/1", "name": "x", "features": {}, "settings": {}})],
             "plugin_ini": [b"; enemy_cap -- more enemies\n[enemy_cap]\nslots = 30\nrecord = 1\n#set\nenemy_cap\0enemy_cap\0slots\x0048",
                            b"[lod]\n; on\nEnabled = 1\nPopPixels = 24\nScale = auto\n#set\nlod_tuner\0lod\0Scale\0auto",
+                           b"[lod]\nEnabled = 1\nFadeSeconds = 0.75\n#set\nlod_tuner\0lod\0FadeSeconds\x000",
                            b"[fps]\nmax_fps = 165\n[overlay]\nkey = F10\n#set\nloader\0overlay\0key\0f7",
                            b"[draw]\n; on\nEnabled = 1\nObjects = 3\nGrass = 3\nHumanEnemies = 0\n#set\ndraw_distance\0draw\0Objects\x002.5",
                            b"[draw]\nGrass = 3\nHumanEnemies = 0\n#set\ndraw_distance\0draw\0HumanEnemies\x00250",
                            b"[a]\nk=1\n[a]\nk=2\n#set\nx\0a\0k\0v",
+                           b"[shops]\r\n; times this\r\nBuy = 1.0\r\nSell = 1.25\r\n[drops]\r\nEnemies = 1.5\r\n"
+                           b"#set\neconomy\0shops\0Sell\x002.5",
+                           b"[gold]\nQuests = 1.5\nFound = 1.5\n[crystals]\nQuests = 1.5\n#set\neconomy\0crystals\0Quests\x0011",
+                           b"[vocation_stats]\r\n; current or off\r\nMode = current\r\nWho = party\r\n"
+                           b"#set\nvocation_stats\0vocation_stats\0Who\0Pawn",
+                           b"[vocation_stats]\nMode = current\n#set\nvocation_stats\0vocation_stats\0Mode\0sometimes",
                            # an ini as Windows reads it (runtime.ini_text): a value in the code page, a UTF-8
                            # mark hiding the first section, a CR CR, a form feed inside a line, a UTF-16 file
                            b"[backup]\r\nFolder = auto\r\n\n#set\nsave_backup\0backup\0Folder\0D:\\Spielst\xc3\xa4nde",
@@ -433,7 +473,16 @@ def _synthetic() -> dict[str, list[bytes]]:
                            b"[backup]\r\r\nKeep = 20\r\n\n#set\nsave_backup\0backup\0Keep\x0025",
                            b"[backup]\r\nKeep = 20\x0cjunk\nFolder = auto\x0b\r\n\n#set\nsave_backup\0backup\0Keep\x0025",
                            b"\xff\xfe" + "; save_backup\r\n[backup]\r\nFolder = D:\\Spielst\u00e4nde \u65e5\u672c\r\nKeep = 20\r\n"
-                           .encode("utf-16-le") + b"\n#set\nsave_backup\0backup\0Folder\0D:\\\xe6\x97\xa5\xe6\x9c\xac"]}
+                           .encode("utf-16-le") + b"\n#set\nsave_backup\0backup\0Folder\0D:\\\xe6\x97\xa5\xe6\x9c\xac"],
+             # the build's ini, "#owner", the owner's: a new key arriving, no owner's file, a key only the
+             # owner has, a section twice, a UTF-16 owner's file
+             "plugin_update": [b"[lod]\r\nPopPixels = 24\r\nFarthest = high\r\n\r\n; per swap\r\nFadeSeconds = 0.75\r\n"
+                               b"\n#owner\n[lod]\r\nPopPixels = 8\r\nFarthest = lod\r\n",
+                               b"[lod]\nPopPixels = 24\n",
+                               b"[a]\nk = 1\n[b]\nn = 2\n#owner\n[a]\nK = 5\nmine = yes\n[c]\nx = 1\n",
+                               b"[a]\nk = 1\n[a]\nk = 2\nj = 3\n#owner\n[a]\nk = 9\n",
+                               b"[backup]\r\nKeep = 20\r\nFolder = auto\r\n#owner\n\xff\xfe"
+                               + "[backup]\r\nFolder = D:\\\u65e5\u672c\r\n".encode("utf-16-le")]}
 
 
 def _fsmap_seeds(game=None) -> list[bytes]:
@@ -745,6 +794,23 @@ def _level_seeds() -> dict[str, list[bytes]]:
             {"at": [2500, 0, -9750], "enemy": "harpies", "count": 3, "ground": True},
             {"at": "group:7", "count": 31, "points": 31, "spread": 60, "ground": False},
             {"at": [8500, 650, 8500], "count": 4, "spread": 400})],
+        # the World tab's placement editor: every op, the ground, a stale record, a chain undone at the end
+        "spawnedit": [json.dumps(c).encode() for c in (
+            {"op": "move", "layout": "scr/st424/etc/st424_00m00n_e00.lot", "number": 1, "id": 1, "at": [500, 0, -9300],
+             "facing": 90, "ground": True},
+            {"op": "move", "layout": "scr\\st424\\etc\\st424_00m00n_e07", "number": 0, "id": 0, "at": [8500, 0, 8500],
+             "ground": True},
+            {"op": "enemy", "layout": "scr\\st424\\etc\\st424_00m00n_e00", "number": 2, "id": 2, "enemy": "hobgoblin"},
+            {"op": "set", "layout": "scr\\st424\\etc\\st424_00m00n_e00", "number": 0, "id": 0, "size": 2.5, "health": 4},
+            {"op": "remove", "layout": "scr\\st424\\etc\\st424_00m00n_e03", "number": 0, "id": 0},
+            {"op": "move", "layout": "scr\\st424\\etc\\st424_00m00n_e00", "number": 1, "id": 2, "at": [0, 0, 0]},
+            {"steps": [{"op": "remove", "layout": "scr\\st424\\etc\\st424_00m00n_e00", "number": 1, "id": 1},
+                       {"op": "restore", "layout": "scr\\st424\\etc\\st424_00m00n_e00", "id": 1},
+                       {"op": "set", "layout": "scr\\st424\\etc\\st424_00m00n_e00", "number": 2, "id": 2, "size": 0.5},
+                       {"op": "revert", "layout": "scr\\st424\\etc\\st424_00m00n_e00", "number": 2, "id": 2}]},
+            {"steps": [{"op": "enemy", "layout": "scr\\st424\\etc\\st424_00m00n_e03", "number": 1, "id": 1, "enemy": "harpies"},
+                       {"op": "move", "layout": "scr\\st424\\etc\\st424_00m00n_e03", "number": 1, "id": 1,
+                        "at": [2500, -350, -9600], "facing": -180}]})],
     }
 
 
@@ -756,6 +822,37 @@ def _knowledge_seeds() -> list[bytes]:
     part = make(main=2, frames=[float(g * 13 % 50) for g in range(saves.GROUPS)],
                 kills=[g % 9 for g in range(saves.GROUPS)], feats=[i % 4 for i in range(saves.FEAT_SLOTS)])
     return [saves.unpack(make()), saves.unpack(part)]
+
+
+def _pawn_seeds() -> list[bytes]:
+    """Save XML holding a party in both copies of the player's data (the unit tests' stand-in save), with and
+    without a hired pawn's gear marked as its slot's; trailing newlines vary the change the target picks (by the
+    input's CRC-32) until each of the three is among them."""
+    import zlib
+
+    from riftstone import saves
+
+    make = __import__("test_pawns").party_save
+    seeds = []
+    for base in (saves.unpack(make()), saves.unpack(make(hired_gear=False))):
+        picked = set()
+        for n in range(64):
+            xml = base + b"\n" * n
+            what = zlib.crc32(xml) & 0xFF
+            if what % 3 not in picked:
+                picked.add(what % 3)
+                seeds.append(xml)
+    return seeds
+
+
+def _ledger_seeds() -> list[bytes]:
+    """patches.txt as the loader writes it (the unit tests' sample: a conflict, a chain, a late change), cut short
+    before its end line, with a count of changes past what it keeps, and the smallest one the loader writes."""
+    sample = __import__("test_patchledger").SAMPLE
+    return [sample.encode(), sample.split("end\t")[0].encode(),
+            sample.replace("end\t4\t2\t1\t1\t0", "end\t4\t2\t1\t1\t9").encode(),
+            b"game\tDDDA.exe\t0x00400000\r\nregion\t.text\t0x00401000\t16498171\r\nowner\t0\tgame\tDDDA.exe\tthe game "
+            b"as loaded\r\nend\t0\t0\t0\t0\t0\r\n"]
 
 
 def _arisen_seeds() -> list[bytes]:
@@ -1117,7 +1214,9 @@ def replay(root: Path, slow: float = 3.0) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=60)
-    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    ap.add_argument("--workers", type=int, default=os.cpu_count() or 1,
+                    help="processes at a time, one core each (default: every core).  Each target runs its full "
+                         "--seconds, so a run takes ceil(jobs / workers) x seconds")
     # Every target by default: a fixed list here once left each target added later out of the release gate.
     ap.add_argument("--targets", default="", help="comma-separated (default: every target in targets.TARGETS)")
     ap.add_argument("--refresh-seeds", action="store_true")
@@ -1142,7 +1241,10 @@ def main() -> int:
     t0 = time.time()
     try:
         with mp.get_context("spawn").Pool(a.workers) as pool:
-            results = pool.map(worker, jobs)
+            # One job at a time to a worker: map's default chunks several jobs, which a worker then runs back to
+            # back (117 jobs on 24 workers: chunks of 2, six waves where ceil(117 / 24) = 5 will do).  The results
+            # are in job order either way.
+            results = pool.map(worker, jobs, chunksize=1)
     finally:
         # The pool terminates its workers, so their atexit cleanup never runs: remove their scratch here.
         _rmtree(tmp)
